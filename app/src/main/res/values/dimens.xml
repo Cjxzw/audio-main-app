@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="margin_sm">8dp</dimen>
+    <dimen name="margin_md">16dp</dimen>
+    <dimen name="margin_lg">24dp</dimen>
+    <dimen name="text_log">12sp</dimen>
+    <dimen name="text_status">16sp</dimen>
+    <dimen name="text_button">18sp</dimen>
+    <dimen name="voice_bar_height">24dp</dimen>
+    <dimen name="voice_bar_bar_width">3dp</dimen>
+    <dimen name="voice_bar_bar_gap">2dp</dimen>
+</resources>

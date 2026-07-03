@@ -1,0 +1,27 @@
+# Build outputs
+build/
+.gradle/
+.kotlin/
+/local.properties
+/.env
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Native libs（AAR 需手动下载放入）
+app/libs/
+
+# Native 模型（首次启动下载到设备）
+app/src/main/assets/models/
+*.onnx
+*.tar.bz2
+
+# Local scratch/extracted files
+aar_extract*/
+aar_tmp_classes/
+.uploads/
+logs/
+*.log
+*.apk

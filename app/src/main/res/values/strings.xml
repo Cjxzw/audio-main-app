@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">语音助手</string>
+    <string name="status_idle">未启动</string>
+    <string name="status_dormant">休眠中</string>
+    <string name="status_initializing">初始化中…</string>
+    <string name="status_listening">聆听中…</string>
+    <string name="status_failed">启动失败</string>
+    <string name="pending_zero">待汇报: 0</string>
+    <string name="btn_start">启动 Agent</string>
+    <string name="btn_stop">休眠 Agent</string>
+    <string name="btn_clear">清空日志</string>
+    <string name="chat_role_user">我</string>
+    <string name="chat_role_bot">小助</string>
+    <string name="chat_role_system">系统</string>
+    <string name="volume_label">录音音量:</string>
+</resources>
