@@ -18,8 +18,13 @@ class AudioRouteManager(context: Context) {
     @Volatile private var configured = false
     @Volatile private var detectedInput: AudioDeviceInfo? = null
     @Volatile private var detectedOutput: AudioDeviceInfo? = null
+    @Volatile private var previousMode: Int? = null
+    @Volatile private var communicationDeviceSet = false
+    @Volatile private var scoStarted = false
 
     fun configureForVoiceSession(): String {
+        prepareCommunicationRoute()
+
         val inputs = getDevices(AudioManager.GET_DEVICES_INPUTS)
         val outputs = getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val communicationOutputs = getCommunicationDevices()
@@ -31,12 +36,14 @@ class AudioRouteManager(context: Context) {
             .filter { it.isSink }
             .minByOrNull { outputPriority(it) }
 
+        applyCommunicationDevice(detectedOutput)
+
         configured = true
         val external = detectedInput?.isPreferredExternalInput() == true ||
             detectedOutput?.isPreferredExternalOutput() == true
         val summary = "候选输入=${deviceLabel(detectedInput)}，候选输出=${deviceLabel(detectedOutput)}"
         Timber.i(
-            "AudioRoute diagnostics: system default routing is respected; $summary; " +
+            "AudioRoute diagnostics: external routing preferred; $summary; " +
                 "inputs=${inputs.joinToString { deviceLabel(it) }}; " +
                 "outputs=${outputs.joinToString { deviceLabel(it) }}; " +
                 "communication=${communicationOutputs.joinToString { deviceLabel(it) }}"
@@ -54,11 +61,23 @@ class AudioRouteManager(context: Context) {
     }
 
     fun preferredAudioSource(): Int {
-        return MediaRecorder.AudioSource.VOICE_RECOGNITION
+        return if (detectedInput?.isPreferredExternalInput() == true) {
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        } else {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        }
     }
 
     fun applyInputRouting(record: AudioRecord) {
-        Timber.i("AudioRoute: AudioRecord uses system default input route")
+        val target = detectedInput
+        if (target == null) {
+            Timber.i("AudioRoute: no preferred input device; AudioRecord uses system default input route")
+            return
+        }
+        val ok = runCatching { record.setPreferredDevice(target) }
+            .onFailure { Timber.w(it, "AudioRoute: AudioRecord setPreferredDevice failed target=${deviceLabel(target)}") }
+            .getOrDefault(false)
+        Timber.i("AudioRoute: AudioRecord setPreferredDevice target=${deviceLabel(target)} ok=$ok")
     }
 
     fun logRecordRoute(record: AudioRecord, label: String) {
@@ -75,14 +94,78 @@ class AudioRouteManager(context: Context) {
     }
 
     fun release() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && communicationDeviceSet) {
+            runCatching { audioManager.clearCommunicationDevice() }
+                .onFailure { Timber.w(it, "AudioRoute: clearCommunicationDevice failed") }
+        }
+        if (scoStarted) {
+            @Suppress("DEPRECATION")
+            runCatching { audioManager.stopBluetoothSco() }
+                .onFailure { Timber.w(it, "AudioRoute: stopBluetoothSco failed") }
+        }
+        previousMode?.let { oldMode ->
+            runCatching { audioManager.mode = oldMode }
+                .onFailure { Timber.w(it, "AudioRoute: restore audio mode failed") }
+        }
         configured = false
         detectedInput = null
         detectedOutput = null
+        previousMode = null
+        communicationDeviceSet = false
+        scoStarted = false
         Timber.i("AudioRoute released")
     }
 
     private fun applyOutputRouting(routing: AudioRouting, owner: String) {
-        Timber.i("AudioRoute: $owner uses system default output route")
+        val target = detectedOutput
+        if (target == null) {
+            Timber.i("AudioRoute: no preferred output device; $owner uses system default output route")
+            return
+        }
+        val ok = runCatching { routing.setPreferredDevice(target) }
+            .onFailure { Timber.w(it, "AudioRoute: $owner setPreferredDevice failed target=${deviceLabel(target)}") }
+            .getOrDefault(false)
+        Timber.i("AudioRoute: $owner setPreferredDevice target=${deviceLabel(target)} ok=$ok")
+    }
+
+    private fun prepareCommunicationRoute() {
+        if (previousMode == null) {
+            previousMode = audioManager.mode
+        }
+        runCatching {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        }.onFailure {
+            Timber.w(it, "AudioRoute: set MODE_IN_COMMUNICATION failed")
+        }
+    }
+
+    private fun applyCommunicationDevice(device: AudioDeviceInfo?) {
+        if (device == null || !device.isPreferredExternalOutput()) {
+            Timber.i("AudioRoute: no external communication output selected")
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val ok = runCatching { audioManager.setCommunicationDevice(device) }
+                .onFailure { Timber.w(it, "AudioRoute: setCommunicationDevice failed target=${deviceLabel(device)}") }
+                .getOrDefault(false)
+            communicationDeviceSet = ok
+            Timber.i("AudioRoute: setCommunicationDevice target=${deviceLabel(device)} ok=$ok")
+            return
+        }
+
+        if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            @Suppress("DEPRECATION")
+            runCatching {
+                audioManager.startBluetoothSco()
+                audioManager.isBluetoothScoOn = true
+            }.onSuccess {
+                scoStarted = true
+                Timber.i("AudioRoute: startBluetoothSco requested")
+            }.onFailure {
+                Timber.w(it, "AudioRoute: startBluetoothSco failed")
+            }
+        }
     }
 
     private fun getDevices(flags: Int): Array<AudioDeviceInfo> {

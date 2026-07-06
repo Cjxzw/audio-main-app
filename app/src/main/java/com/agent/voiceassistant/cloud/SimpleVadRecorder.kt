@@ -232,7 +232,8 @@ class SimpleVadRecorder(
     }
 
     private fun audioSources(): List<Int> = buildList {
-        add(routeManager?.preferredAudioSource() ?: MediaRecorder.AudioSource.VOICE_RECOGNITION)
+        add(routeManager?.preferredAudioSource() ?: MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+        add(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
         add(MediaRecorder.AudioSource.VOICE_RECOGNITION)
         add(MediaRecorder.AudioSource.MIC)
         add(MediaRecorder.AudioSource.DEFAULT)
