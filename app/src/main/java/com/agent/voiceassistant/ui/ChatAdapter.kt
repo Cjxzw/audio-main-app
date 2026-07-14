@@ -18,6 +18,12 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
     private val messages = mutableListOf<ChatMessage>()
     private val maxMessages = 100
 
+    fun setMessages(items: List<ChatMessage>) {
+        messages.clear()
+        messages.addAll(items.takeLast(maxMessages))
+        notifyDataSetChanged()
+    }
+
     fun addMessage(msg: ChatMessage) {
         messages.add(msg)
         if (messages.size > maxMessages) {

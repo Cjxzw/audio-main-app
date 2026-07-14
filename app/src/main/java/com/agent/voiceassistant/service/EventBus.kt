@@ -8,7 +8,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 object EventBus {
 
     private val _logs = MutableSharedFlow<ServiceLog>(
-        replay = 50,
+        replay = 30,
         extraBufferCapacity = 64
     )
     val logs: SharedFlow<ServiceLog> = _logs.asSharedFlow()
@@ -37,6 +37,12 @@ object EventBus {
     )
     val chatMessages: SharedFlow<ChatMessage> = _chatMessages.asSharedFlow()
 
+    private val _chatResets = MutableSharedFlow<List<ChatMessage>>(
+        replay = 0,
+        extraBufferCapacity = 8
+    )
+    val chatResets: SharedFlow<List<ChatMessage>> = _chatResets.asSharedFlow()
+
     fun emitLog(message: String) {
         _logs.tryEmit(ServiceLog(System.currentTimeMillis(), message))
     }
@@ -55,6 +61,10 @@ object EventBus {
 
     fun emitChatMessage(msg: ChatMessage) {
         _chatMessages.tryEmit(msg)
+    }
+
+    fun emitChatReset(messages: List<ChatMessage>) {
+        _chatResets.tryEmit(messages)
     }
 }
 

@@ -72,7 +72,7 @@
         android:padding="@dimen/margin_sm"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/btnToggle">
+        app:layout_constraintBottom_toTopOf="@id/llTextInput">
 
         <TextView
             android:id="@+id/tvLog"
@@ -83,6 +83,37 @@
             android:textColor="@color/black"
             android:textIsSelectable="true" />
     </ScrollView>
+
+    <LinearLayout
+        android:id="@+id/llTextInput"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/margin_sm"
+        android:layout_marginBottom="@dimen/margin_sm"
+        android:orientation="horizontal"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/btnToggle">
+
+        <EditText
+            android:id="@+id/etTextInput"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:hint="@string/text_input_hint"
+            android:singleLine="true"
+            android:imeOptions="actionSend"
+            android:inputType="textCapSentences|textMultiLine"
+            android:paddingHorizontal="@dimen/margin_sm"
+            android:textSize="15sp" />
+
+        <Button
+            android:id="@+id/btnSendText"
+            android:layout_width="88dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="@dimen/margin_sm"
+            android:text="@string/btn_send_text" />
+    </LinearLayout>
 
     <Button
         android:id="@+id/btnToggle"
