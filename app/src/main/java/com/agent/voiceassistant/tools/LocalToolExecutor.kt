@@ -16,6 +16,7 @@ class LocalToolExecutor(
     private val locationProvider: LocationProvider,
     private val weatherClient: WeatherClient = WeatherClient(),
     private val webSearchClient: MimoWebSearchClient = MimoWebSearchClient(LLMConfig.auto()),
+    private val executionEnv: AndroidExecutionEnv? = null,
 ) {
 
     data class ToolResult(
@@ -33,6 +34,10 @@ class LocalToolExecutor(
             "location.refresh", "location.get_current" -> refreshLocation()
             "weather.get_current", "weather.current" -> currentWeather(action.payload)
             "web.search", "websearch", "web_search" -> webSearch(action.payload)
+            "read" -> readFile(action.payload)
+            "write" -> writeFile(action.payload)
+            "exec" -> execCommand(action.payload)
+            "http_request" -> httpRequest(action.payload)
             else -> ToolResult(
                 actionType = action.actionType,
                 displayText = "未知本地工具：${action.actionType}",
@@ -189,6 +194,136 @@ class LocalToolExecutor(
             shouldAskLlm = true,
         )
     }
+
+    private fun readFile(payload: JsonObject): ToolResult {
+        val path = payload.string("path")
+            ?: return invalidArguments("read", "缺少 path 字段")
+        val env = executionEnv ?: return unavailable("read")
+        return runCatching {
+            env.read(
+                path = path,
+                offset = payload.int("offset") ?: 1,
+                limit = payload.int("limit") ?: 200,
+            )
+        }.fold(
+            onSuccess = { result ->
+                ToolResult(
+                    actionType = "read",
+                    displayText = "读取 ${result.path}",
+                    contextText = buildString {
+                        appendLine("文件：${result.path}")
+                        appendLine("行：${result.startLine}-${result.endLine}/${result.totalLines}")
+                        append(result.content)
+                        if (result.truncated) append("\n[输出已截断，可调整 offset/limit 继续读取]")
+                    },
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("read", "读取失败", error) },
+        )
+    }
+
+    private fun writeFile(payload: JsonObject): ToolResult {
+        val path = payload.string("path")
+            ?: return invalidArguments("write", "缺少 path 字段")
+        val content = (payload["content"] as? JsonPrimitive)?.contentOrNull
+            ?: return invalidArguments("write", "缺少 content 字段")
+        val env = executionEnv ?: return unavailable("write")
+        return runCatching {
+            env.write(path, content, payload.string("mode") ?: "overwrite")
+        }.fold(
+            onSuccess = { result ->
+                ToolResult(
+                    actionType = "write",
+                    displayText = "写入 ${result.path}",
+                    contextText = "写入成功：${result.path}，${result.bytesWritten} 字节，模式 ${result.mode}。",
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("write", "写入失败", error) },
+        )
+    }
+
+    private suspend fun execCommand(payload: JsonObject): ToolResult {
+        val command = (payload["command"] as? JsonPrimitive)?.contentOrNull?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: return invalidArguments("exec", "缺少 command 字段")
+        val env = executionEnv ?: return unavailable("exec")
+        return runCatching {
+            env.exec(command, payload.int("timeout_seconds") ?: 30)
+        }.fold(
+            onSuccess = { result ->
+                val status = when {
+                    result.timedOut -> "超时"
+                    result.exitCode == 0 -> "完成"
+                    else -> "退出码 ${result.exitCode}"
+                }
+                ToolResult(
+                    actionType = "exec",
+                    displayText = "执行命令：$status",
+                    contextText = buildString {
+                        appendLine("命令：${result.command}")
+                        appendLine("状态：$status")
+                        append(result.output.ifBlank { "[无输出]" })
+                        if (result.truncated) append("\n[输出已截断]")
+                    },
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("exec", "命令执行失败", error) },
+        )
+    }
+
+    private suspend fun httpRequest(payload: JsonObject): ToolResult {
+        val url = payload.string("url")
+            ?: return invalidArguments("http_request", "缺少 url 字段")
+        val env = executionEnv ?: return unavailable("http_request")
+        return runCatching {
+            env.httpRequest(
+                method = payload.string("method") ?: "GET",
+                url = url,
+                body = (payload["body"] as? JsonPrimitive)?.contentOrNull,
+                contentType = payload.string("content_type"),
+                credentialProfile = payload.string("credential_profile"),
+            )
+        }.fold(
+            onSuccess = { result ->
+                ToolResult(
+                    actionType = "http_request",
+                    displayText = "HTTP ${result.status}：${url.take(80)}",
+                    contextText = buildString {
+                        appendLine("HTTP 状态：${result.status}")
+                        result.contentType?.let { appendLine("Content-Type: $it") }
+                        append(result.body.ifBlank { "[空响应]" })
+                        if (result.truncated) append("\n[响应已截断]")
+                    },
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("http_request", "HTTP 请求失败", error) },
+        )
+    }
+
+    private fun invalidArguments(actionType: String, detail: String) = ToolResult(
+        actionType = actionType,
+        displayText = "$actionType 调用失败：$detail",
+        contextText = "$actionType 调用失败：$detail。",
+        shouldAskLlm = true,
+    )
+
+    private fun unavailable(actionType: String) = ToolResult(
+        actionType = actionType,
+        displayText = "$actionType 暂不可用",
+        contextText = "Android 执行环境尚未初始化，无法执行 $actionType。",
+        shouldAskLlm = true,
+    )
+
+    private fun failed(actionType: String, label: String, error: Throwable) = ToolResult(
+        actionType = actionType,
+        displayText = "$label：${error.message ?: error.javaClass.simpleName}",
+        contextText = "$label：${error.message ?: error.javaClass.simpleName}",
+        shouldAskLlm = true,
+    )
 
     private fun locationContext(location: com.agent.voiceassistant.data.StoredLocation): String {
         val accuracy = location.accuracyMeters?.let { "精度约 ${it.toInt()} 米。" }.orEmpty()

@@ -14,10 +14,9 @@
 }
 
 # ==================== 工具注解保护 ====================
--keep @dev.langchain4j.agent.tool.Tool class * { *; }
+-keepattributes RuntimeVisibleAnnotations,RuntimeInvisibleAnnotations,RuntimeVisibleParameterAnnotations,RuntimeInvisibleParameterAnnotations,MethodParameters
 -keepclassmembers class * {
-    @dev.langchain4j.agent.tool.P *;
-    @dev.langchain4j.agent.tool.P(<fields>) *;
+    @dev.langchain4j.agent.tool.Tool <methods>;
 }
 
 # ==================== AI Services 动态代理 ====================
@@ -53,6 +52,7 @@
 -dontwarn okhttp3.**
 -dontwarn okio.**
 -dontwarn javax.annotation.**
+-dontwarn org.osgi.framework.BundleActivator
 
 # ==================== 构建配置 ====================
 -keep class com.agent.voiceassistant.BuildConfig { *; }

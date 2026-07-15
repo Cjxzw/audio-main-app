@@ -1,5 +1,6 @@
 package com.agent.voiceassistant.telecom
 
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.net.Uri
@@ -47,6 +48,7 @@ class AssistantTelecomSession(context: Context) {
         }.getOrDefault(false)
     }
 
+    @SuppressLint("MissingPermission")
     fun beginListening(): Boolean {
         if (!register()) return false
         if (AssistantTelecomRegistry.hasLiveConnection()) {

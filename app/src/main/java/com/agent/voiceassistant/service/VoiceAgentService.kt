@@ -1,5 +1,6 @@
 package com.agent.voiceassistant.service
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -28,6 +29,10 @@ import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.ReasoningPolicy
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.buildMainSystemPrompt
+import com.agent.voiceassistant.agent.runtime.AgentEvent
+import com.agent.voiceassistant.agent.runtime.AgentLoop
+import com.agent.voiceassistant.agent.runtime.MainAgentHarness
+import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.cloud.CloudSpeechClient
@@ -36,6 +41,7 @@ import com.agent.voiceassistant.cloud.SimpleVadRecorder
 import com.agent.voiceassistant.cloud.StreamingSpeechExtractor
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.tools.LocalToolExecutor
+import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.LocationProvider
 import com.agent.voiceassistant.tools.MainToolRegistry
 import com.agent.voiceassistant.telecom.AssistantTelecomSession
@@ -78,20 +84,6 @@ import java.util.Locale
 import java.util.UUID
 
 class VoiceAgentService : Service() {
-
-    private data class StreamedModelTurn(
-        val completion: CloudSpeechClient.ChatCompletion,
-        val streamedSpeech: Boolean,
-    )
-
-    private sealed interface AgentLoopOutcome {
-        data class Completed(
-            val finalText: String,
-            val playedSpeech: Boolean,
-        ) : AgentLoopOutcome
-
-        data class Escalate(val reason: String) : AgentLoopOutcome
-    }
 
     companion object {
         private const val CHANNEL_ID = "voice_agent_channel"
@@ -193,6 +185,9 @@ class VoiceAgentService : Service() {
     private lateinit var store: ConversationStore
     private lateinit var locationProvider: LocationProvider
     private lateinit var toolRegistry: MainToolRegistry
+    private lateinit var executionEnv: AndroidExecutionEnv
+    private lateinit var skillRegistry: SkillRegistry
+    private val agentHarness = MainAgentHarness()
     private lateinit var earcons: EarconPlayer
     private lateinit var telecomSession: AssistantTelecomSession
     private var dormant = true
@@ -205,7 +200,15 @@ class VoiceAgentService : Service() {
         DiagLog.i("service.create", "pid=${android.os.Process.myPid()}", showInUi = true)
         store = ConversationStore(this)
         locationProvider = LocationProvider(this)
-        toolRegistry = MainToolRegistry(LocalToolExecutor(store, locationProvider))
+        executionEnv = AndroidExecutionEnv(this)
+        skillRegistry = SkillRegistry(executionEnv.skillsRoot)
+        toolRegistry = MainToolRegistry(
+            LocalToolExecutor(
+                store = store,
+                locationProvider = locationProvider,
+                executionEnv = executionEnv,
+            ),
+        )
         earcons = EarconPlayer { routeManager }
         telecomSession = AssistantTelecomSession(this)
         telecomSession.register()
@@ -342,6 +345,7 @@ class VoiceAgentService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private suspend fun runConversationLoop() {
         while (coroutineContext.isActive && !dormant) {
             try {
@@ -397,8 +401,8 @@ class VoiceAgentService : Service() {
                         allowReasoningEscalation = true,
                     )
                     when (fastOutcome) {
-                        is AgentLoopOutcome.Completed -> fastOutcome
-                        is AgentLoopOutcome.Escalate -> runDeepReasoningTurn(client, fastOutcome.reason)
+                        is AgentLoop.Outcome.Completed -> fastOutcome
+                        is AgentLoop.Outcome.Escalate -> runDeepReasoningTurn(client, fastOutcome.reason)
                     }
                 }
                 if (ENABLE_PLAYBACK_DONE_EARCON && outcome.playedSpeech) {
@@ -422,7 +426,7 @@ class VoiceAgentService : Service() {
     private suspend fun runDeepReasoningTurn(
         client: CloudSpeechClient,
         reason: String,
-    ): AgentLoopOutcome.Completed = coroutineScope {
+    ): AgentLoop.Outcome.Completed = coroutineScope {
         val status = "开启深度思考"
         emitToolStatus(status)
         emitLog("$status: $reason")
@@ -446,10 +450,10 @@ class VoiceAgentService : Service() {
         )
         acknowledgementJob.await()
         when (outcome) {
-            is AgentLoopOutcome.Completed -> outcome.copy(
+            is AgentLoop.Outcome.Completed -> outcome.copy(
                 playedSpeech = outcome.playedSpeech || acknowledgement.isNotBlank(),
             )
-            is AgentLoopOutcome.Escalate -> error("深度思考模式不能再次升级")
+            is AgentLoop.Outcome.Escalate -> error("深度思考模式不能再次升级")
         }
     }
 
@@ -460,79 +464,103 @@ class VoiceAgentService : Service() {
         maxModelCalls: Int,
         allowReasoningEscalation: Boolean,
         beforeSpeech: suspend () -> Unit = {},
-    ): AgentLoopOutcome {
-        val workingMessages = messages.toMutableList()
-        var playedSpeech = false
-        val completedToolCallIds = mutableSetOf<String>()
-        var previousToolBatchSignature: String? = null
+    ): AgentLoop.Outcome {
+        val loop = AgentLoop(
+            runtime = object : AgentLoop.Runtime {
+                override fun toolDefinitions(allowReasoningEscalation: Boolean) =
+                    toolRegistry.definitions(
+                        profile = MainToolRegistry.Profile.STANDALONE,
+                        allowReasoningEscalation = allowReasoningEscalation,
+                    )
 
-        repeat(maxModelCalls) { step ->
-            val request = CloudSpeechClient.ChatRequest(
-                messages = workingMessages,
-                tools = toolRegistry.definitions(
-                    profile = MainToolRegistry.Profile.STANDALONE,
-                    allowReasoningEscalation = allowReasoningEscalation && step == 0,
-                ),
+                override suspend fun modelTurn(
+                    request: CloudSpeechClient.ChatRequest,
+                    beforeSpeech: suspend () -> Unit,
+                    onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
+                ): AgentLoop.ModelTurn = streamModelTurn(client, request, beforeSpeech, onStreamEvent)
+
+                override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) =
+                    normalizeLegacyMessage(message)
+
+                override fun isReasoningEscalation(call: CloudSpeechClient.ToolCall) =
+                    toolRegistry.isReasoningEscalation(call)
+
+                override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
+                    toolRegistry.reasoningEscalationReason(call)
+
+                override fun toolDisplayName(toolName: String) = toolRegistry.displayName(toolName)
+
+                override suspend fun executeTool(call: CloudSpeechClient.ToolCall) =
+                    executeToolCall(client, call)
+
+                override fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String) =
+                    blockedToolCall(call, reason)
+
+                override suspend fun finishAssistant(
+                    message: CloudSpeechClient.LlmMessage,
+                    streamedSpeech: Boolean,
+                ): Boolean {
+                    val finalText = message.content.orEmpty().trim()
+                    store.addMessage("assistant", finalText)
+                    EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, finalText))
+                    emitLog("助手: $finalText")
+                    if (!streamedSpeech) {
+                        beforeSpeech()
+                        speakAssistantText(client, finalText)
+                        return true
+                    }
+                    return false
+                }
+            },
+            eventSink = ::onAgentEvent,
+        )
+        return agentHarness.run(
+            loop,
+            AgentLoop.Config(
+                messages = messages,
                 thinkingMode = thinkingMode,
+                maxModelCalls = maxModelCalls,
+                allowReasoningEscalation = allowReasoningEscalation,
                 maxCompletionTokens = if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
                     DEEP_MAX_COMPLETION_TOKENS
                 } else {
                     FAST_MAX_COMPLETION_TOKENS
                 },
-            )
-            val streamed = streamModelTurn(client, request, beforeSpeech)
-            playedSpeech = playedSpeech || streamed.streamedSpeech
-            val assistant = normalizeLegacyMessage(streamed.completion.message)
-            val escalation = assistant.toolCalls.firstOrNull(toolRegistry::isReasoningEscalation)
-            if (escalation != null) {
-                if (!allowReasoningEscalation || step != 0) {
-                    error("本回合深度思考升级请求无效")
-                }
-                val reason = toolRegistry.reasoningEscalationReason(escalation)
-                return AgentLoopOutcome.Escalate(reason)
-            }
+                beforeSpeech = beforeSpeech,
+            ),
+        )
+    }
 
-            if (assistant.toolCalls.isEmpty()) {
-                val finalText = assistant.content.orEmpty().trim()
-                if (finalText.isBlank()) {
-                    error("模型未返回正文或工具调用")
-                }
-                store.addMessage("assistant", finalText)
-                EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, finalText))
-                emitLog("助手: $finalText")
-                if (!streamed.streamedSpeech) {
-                    beforeSpeech()
-                    speakAssistantText(client, finalText)
-                    playedSpeech = true
-                }
-                return AgentLoopOutcome.Completed(finalText, playedSpeech)
-            }
-
-            workingMessages += assistant
-            val batchSignature = assistant.toolCalls.joinToString("|") { call ->
-                "${call.name}:${call.arguments.trim()}"
-            }
-            val repeatedBatch = batchSignature == previousToolBatchSignature
-            previousToolBatchSignature = batchSignature
-            for (call in assistant.toolCalls) {
-                val toolMessage = when {
-                    !completedToolCallIds.add(call.id) -> blockedToolCall(
-                        call,
-                        "重复的 tool_call_id，调用未再次执行。请基于已有结果继续。",
-                    )
-                    repeatedBatch -> blockedToolCall(
-                        call,
-                        "检测到连续重复工具调用，调用已停止。请改变参数或直接总结已有结果。",
-                    )
-                    else -> executeToolCall(client, call)
-                }
-                workingMessages += toolMessage
-            }
-            updateNotification(
-                if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) "深入思考中..." else "整理结果...",
+    private fun onAgentEvent(event: AgentEvent) {
+        when (event) {
+            is AgentEvent.AgentStarted -> DiagLog.i("agent.loop.started", "turn=${event.turnId}")
+            is AgentEvent.TurnStarted -> DiagLog.i(
+                "agent.turn.started",
+                "turn=${event.turnId} thinking=${event.thinkingMode}",
             )
+            is AgentEvent.ToolStarted -> DiagLog.i(
+                "agent.tool.started",
+                "turn=${event.turnId} id=${event.call.id} name=${event.call.name}",
+            )
+            is AgentEvent.ToolFinished -> DiagLog.i(
+                "agent.tool.finished",
+                "turn=${event.turnId} id=${event.call.id} blocked=${event.blocked}",
+            )
+            is AgentEvent.TurnFinished -> DiagLog.i(
+                "agent.turn.finished",
+                "turn=${event.turnId} chars=${event.finalText.length}",
+            )
+            is AgentEvent.AgentFailed -> DiagLog.w(
+                "agent.loop.failed",
+                "turn=${event.turnId} error=${event.error}",
+            )
+            is AgentEvent.AgentFinished,
+            is AgentEvent.ContentDelta,
+            is AgentEvent.MessageFinished,
+            is AgentEvent.MessageStarted,
+            is AgentEvent.ReasoningDelta,
+            is AgentEvent.ToolProgress -> Unit
         }
-        error("Agent 工具调用超过本回合上限")
     }
 
     private suspend fun executeToolCall(
@@ -604,7 +632,8 @@ class VoiceAgentService : Service() {
         client: CloudSpeechClient,
         request: CloudSpeechClient.ChatRequest,
         beforeSpeech: suspend () -> Unit,
-    ): StreamedModelTurn = coroutineScope {
+        onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
+    ): AgentLoop.ModelTurn = coroutineScope {
         val extractor = StreamingSpeechExtractor()
         val segmenter = SpeechSegmenter()
         val ttsQueue = Channel<String>(Channel.UNLIMITED)
@@ -637,6 +666,7 @@ class VoiceAgentService : Service() {
 
         try {
             val completion = client.streamChat(request) { event ->
+                onStreamEvent(event)
                 when (event) {
                     is CloudSpeechClient.ChatStreamEvent.ReasoningDelta -> {
                         if (!reasoningStarted) {
@@ -678,7 +708,7 @@ class VoiceAgentService : Service() {
             )
             ttsQueue.close()
             playbackJob.join()
-            return@coroutineScope StreamedModelTurn(completion, streamedSpeech)
+            return@coroutineScope AgentLoop.ModelTurn(completion, streamedSpeech)
         } finally {
             ttsQueue.close()
         }
@@ -695,6 +725,12 @@ class VoiceAgentService : Service() {
             )
             append("\n\n本地上下文：\n")
             append(store.contextSummary())
+            append("\n\nAgent 虚拟文件系统：\n")
+            append(executionEnv.virtualRootSummary())
+            append("\n\nSkill 索引：\n")
+            append(skillRegistry.promptSummary())
+            append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
+            append(executionEnv.credentialProfileSummary())
         }
         add(CloudSpeechClient.LlmMessage("system", system))
         addAll(store.llmHistory(MAX_HISTORY_MESSAGES))

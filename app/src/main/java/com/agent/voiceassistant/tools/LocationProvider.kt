@@ -25,6 +25,7 @@ import kotlin.coroutines.resume
 
 class LocationProvider(private val context: Context) {
 
+    @SuppressLint("MissingPermission")
     suspend fun currentLocation(
         timeoutMs: Long = 5_000L,
         forceFresh: Boolean = false,

@@ -1,0 +1,413 @@
+package com.agent.voiceassistant.tools
+
+import android.content.Context
+import android.util.Base64
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
+import java.io.IOException
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+
+class AndroidExecutionEnv(
+    context: Context,
+    private val credentialStore: CredentialProfileStore = CredentialProfileStore(context),
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(45, TimeUnit.SECONDS)
+        .build(),
+) {
+    data class ReadResult(
+        val path: String,
+        val content: String,
+        val startLine: Int,
+        val endLine: Int,
+        val totalLines: Int,
+        val truncated: Boolean,
+    )
+
+    data class WriteResult(val path: String, val bytesWritten: Int, val mode: String)
+
+    data class ExecResult(
+        val command: String,
+        val exitCode: Int?,
+        val output: String,
+        val timedOut: Boolean,
+        val truncated: Boolean,
+    )
+
+    data class HttpResult(
+        val status: Int,
+        val contentType: String?,
+        val body: String,
+        val truncated: Boolean,
+    )
+
+    private val appContext = context.applicationContext
+    private val runtimeRoot = File(appContext.filesDir, "agent-runtime")
+    val sourceRoot = File(runtimeRoot, "source")
+    val logsRoot = File(runtimeRoot, "logs")
+    val workspaceRoot = File(runtimeRoot, "workspace")
+    val skillsRoot = File(runtimeRoot, "skills")
+    private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot, skillsRoot)
+
+    init {
+        listOf(runtimeRoot, logsRoot, workspaceRoot, skillsRoot).forEach(File::mkdirs)
+        installAssetTree("source", sourceRoot, marker = fingerprintAssetTree("source"))
+        installBundledSkills()
+    }
+
+    fun read(path: String, offset: Int = 1, limit: Int = DEFAULT_READ_LINES): ReadResult {
+        require(offset >= 1) { "offset 必须从 1 开始" }
+        require(limit in 1..MAX_READ_LINES) { "limit 必须在 1..$MAX_READ_LINES 之间" }
+        val file = pathResolver.resolve(path, write = false)
+        require(file.isFile) { "文件不存在：$path" }
+        require(file.length() <= MAX_READ_FILE_BYTES) { "文件过大，不能直接读取：$path" }
+        val text = file.readText(Charsets.UTF_8)
+        require(!text.contains('\u0000')) { "暂不支持读取二进制文件：$path" }
+        val lines = text.lines()
+        val selected = lines.drop(offset - 1).take(limit)
+        val content = selected.joinToString("\n")
+            .let { if (it.length > MAX_READ_OUTPUT_CHARS) it.take(MAX_READ_OUTPUT_CHARS) else it }
+        val endLine = if (selected.isEmpty()) offset - 1 else offset + selected.size - 1
+        return ReadResult(
+            path = pathResolver.normalize(path),
+            content = content,
+            startLine = offset,
+            endLine = endLine,
+            totalLines = lines.size,
+            truncated = endLine < lines.size || selected.joinToString("\n").length > content.length,
+        )
+    }
+
+    fun write(path: String, content: String, mode: String = "overwrite"): WriteResult {
+        require(content.toByteArray().size <= MAX_WRITE_BYTES) { "单次写入不能超过 $MAX_WRITE_BYTES 字节" }
+        val file = pathResolver.resolve(path, write = true)
+        file.parentFile?.mkdirs()
+        when (mode.lowercase()) {
+            "overwrite" -> file.writeText(content, Charsets.UTF_8)
+            "append" -> file.appendText(content, Charsets.UTF_8)
+            "create" -> {
+                require(file.createNewFile()) { "文件已存在：$path" }
+                file.writeText(content, Charsets.UTF_8)
+            }
+            else -> error("不支持的写入模式：$mode")
+        }
+        return WriteResult(pathResolver.normalize(path), content.toByteArray().size, mode.lowercase())
+    }
+
+    suspend fun exec(command: String, timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS): ExecResult {
+        require(command.isNotBlank()) { "command 不能为空" }
+        require(command.length <= MAX_COMMAND_CHARS) { "command 过长" }
+        val timeout = timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS)
+        return withContext(Dispatchers.IO) {
+            val shell = if (File("/system/bin/sh").exists()) "/system/bin/sh" else "/bin/sh"
+            val process = ProcessBuilder(shell, "-lc", command)
+                .directory(workspaceRoot)
+                .redirectErrorStream(true)
+                .apply {
+                    environment()["SOURCE_ROOT"] = sourceRoot.absolutePath
+                    environment()["LOGS_ROOT"] = logsRoot.absolutePath
+                    environment()["WORKSPACE_ROOT"] = workspaceRoot.absolutePath
+                    environment()["SKILLS_ROOT"] = skillsRoot.absolutePath
+                }
+                .start()
+            try {
+                coroutineScope {
+                    val output = async(Dispatchers.IO) { readProcessOutput(process) }
+                    val completed = withTimeoutOrNull(timeout * 1_000L) {
+                        while (process.isAlive) delay(40)
+                        true
+                    } ?: false
+                    if (!completed) process.destroyForcibly()
+                    val captured = output.await()
+                    ExecResult(
+                        command = command,
+                        exitCode = if (completed) process.exitValue() else null,
+                        output = captured.first,
+                        timedOut = !completed,
+                        truncated = captured.second,
+                    )
+                }
+            } finally {
+                if (process.isAlive) process.destroyForcibly()
+            }
+        }
+    }
+
+    suspend fun httpRequest(
+        method: String,
+        url: String,
+        body: String? = null,
+        contentType: String? = null,
+        credentialProfile: String? = null,
+    ): HttpResult = withContext(Dispatchers.IO) {
+        val resolvedUrl = credentialProfile
+            ?.takeIf(String::isNotBlank)
+            ?.let { credentialStore.resolveUrl(it, url) }
+            ?: url
+        require(resolvedUrl.startsWith("https://") || resolvedUrl.startsWith("http://")) {
+            "只允许 http 或 https URL"
+        }
+        val normalizedMethod = method.uppercase()
+        require(normalizedMethod in HTTP_METHODS) { "不支持的 HTTP 方法：$method" }
+        val requestBody = when {
+            normalizedMethod in setOf("POST", "PUT", "PATCH") ->
+                body.orEmpty().toRequestBody((contentType ?: "application/json; charset=utf-8").toMediaTypeOrNull())
+            body != null -> body.toRequestBody(contentType?.toMediaTypeOrNull())
+            else -> null
+        }
+        val builder = Request.Builder().url(resolvedUrl).method(normalizedMethod, requestBody)
+        credentialProfile?.takeIf(String::isNotBlank)?.let { profile ->
+            credentialStore.headers(profile).forEach(builder::addHeader)
+        }
+        httpClient.newCall(builder.build()).execute().use { response ->
+            val responseBody = response.body
+            val source = responseBody?.source()
+            val bytes = source?.readByteArray(MAX_HTTP_BODY_BYTES + 1L) ?: ByteArray(0)
+            val truncated = bytes.size > MAX_HTTP_BODY_BYTES
+            val kept = if (truncated) bytes.copyOf(MAX_HTTP_BODY_BYTES) else bytes
+            HttpResult(
+                status = response.code,
+                contentType = responseBody?.contentType()?.toString(),
+                body = kept.toString(Charsets.UTF_8),
+                truncated = truncated,
+            )
+        }
+    }
+
+    fun virtualRootSummary(): String = buildString {
+        appendLine("/source：随 APK 构建的只读源码快照")
+        appendLine("/logs：应用轮转日志，只读")
+        appendLine("/workspace：Agent 可读写工作区")
+        append("/skills：已安装 Skill")
+    }
+
+    fun credentialProfileSummary(): String {
+        val profiles = credentialStore.availableProfiles()
+        if (profiles.isEmpty()) return "当前没有可用凭据 profile。"
+        return profiles.joinToString("\n") { profile ->
+            val base = profile.baseUrl?.let { "，基础地址 $it" }.orEmpty()
+            "- ${profile.name}$base"
+        }
+    }
+
+    private fun installAssetTree(assetPath: String, target: File, marker: String) {
+        val markerFile = File(target, ".installed-version")
+        if (markerFile.readTextOrNull() == marker) return
+        makeWritable(target)
+        target.deleteRecursively()
+        target.mkdirs()
+        copyAssetTree(assetPath, target)
+        markerFile.writeText(marker)
+        if (target == sourceRoot) makeReadOnly(target)
+    }
+
+    private fun installBundledSkills() {
+        val markerFile = File(skillsRoot, ".bundled-version")
+        val manifestFile = File(skillsRoot, ".bundled-skills")
+        val marker = fingerprintAssetTree("skills")
+        if (markerFile.readTextOrNull() == marker) return
+
+        val previousNames = manifestFile.readLinesOrEmpty().filter(String::isNotBlank).toSet()
+        val bundledNames = appContext.assets.list("skills").orEmpty().toSet()
+        (previousNames - bundledNames).forEach { name ->
+            File(skillsRoot, name).apply {
+                makeWritable(this)
+                deleteRecursively()
+            }
+        }
+        bundledNames.forEach { name ->
+            val target = File(skillsRoot, name)
+            makeWritable(target)
+            target.deleteRecursively()
+            copyAssetTree("skills/$name", target)
+        }
+        manifestFile.writeText(bundledNames.sorted().joinToString("\n"))
+        markerFile.writeText(marker)
+    }
+
+    private fun copyAssetTree(assetPath: String, target: File) {
+        val children = appContext.assets.list(assetPath).orEmpty()
+        if (children.isEmpty()) {
+            runCatching {
+                appContext.assets.open(assetPath).use { input ->
+                    target.parentFile?.mkdirs()
+                    target.outputStream().use(input::copyTo)
+                }
+            }
+            return
+        }
+        target.mkdirs()
+        children.forEach { child -> copyAssetTree("$assetPath/$child", File(target, child)) }
+    }
+
+    private fun fingerprintAssetTree(assetPath: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        fun visit(path: String) {
+            val children = appContext.assets.list(path).orEmpty().sorted()
+            if (children.isEmpty()) {
+                digest.update(path.toByteArray())
+                runCatching {
+                    appContext.assets.open(path).use { input ->
+                        val buffer = ByteArray(8_192)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            digest.update(buffer, 0, count)
+                        }
+                    }
+                }
+                return
+            }
+            children.forEach { child -> visit("$path/$child") }
+        }
+        visit(assetPath)
+        return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+    }
+
+    private fun makeReadOnly(file: File) {
+        if (file.isDirectory) file.listFiles().orEmpty().forEach(::makeReadOnly)
+        file.setWritable(false, false)
+    }
+
+    private fun makeWritable(file: File) {
+        if (!file.exists()) return
+        file.setWritable(true, true)
+        if (file.isDirectory) file.listFiles().orEmpty().forEach(::makeWritable)
+    }
+
+    private fun readProcessOutput(process: Process): Pair<String, Boolean> {
+        val output = StringBuilder()
+        var truncated = false
+        process.inputStream.bufferedReader().useLines { lines ->
+            lines.forEach { line ->
+                if (output.length + line.length + 1 <= MAX_EXEC_OUTPUT_CHARS) {
+                    output.appendLine(line)
+                } else {
+                    truncated = true
+                }
+            }
+        }
+        return output.toString().trimEnd() to truncated
+    }
+
+    private fun File.readTextOrNull(): String? = runCatching { readText() }.getOrNull()
+    private fun File.readLinesOrEmpty(): List<String> = runCatching { readLines() }.getOrDefault(emptyList())
+
+    companion object {
+        private const val DEFAULT_READ_LINES = 200
+        private const val MAX_READ_LINES = 1_000
+        private const val MAX_READ_FILE_BYTES = 2L * 1024 * 1024
+        private const val MAX_READ_OUTPUT_CHARS = 40_000
+        private const val MAX_WRITE_BYTES = 512 * 1024
+        private const val DEFAULT_EXEC_TIMEOUT_SECONDS = 30
+        private const val MAX_EXEC_TIMEOUT_SECONDS = 120
+        private const val MAX_COMMAND_CHARS = 8_000
+        private const val MAX_EXEC_OUTPUT_CHARS = 40_000
+        private const val MAX_HTTP_BODY_BYTES = 512 * 1024
+        private val HTTP_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+    }
+}
+
+class CredentialProfileStore(context: Context) {
+    data class Profile(val name: String, val baseUrl: String?)
+
+    private val preferences = context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+
+    fun putHeaders(profile: String, headers: Map<String, String>) {
+        require(profile.matches(Regex("[a-zA-Z0-9._-]{1,64}"))) { "凭据配置名称无效" }
+        headers.forEach { (name, value) ->
+            require(name.matches(Regex("[A-Za-z0-9-]{1,80}"))) { "HTTP Header 名称无效" }
+            require(!value.contains('\r') && !value.contains('\n')) { "HTTP Header 值不能换行" }
+        }
+        val plaintext = headers.entries.joinToString("\n") { (name, value) -> "$name:$value" }
+        preferences.edit().putString(profile, encrypt(plaintext)).apply()
+    }
+
+    fun putBasic(profile: String, username: String, password: String, baseUrl: String? = null) {
+        val token = Base64.encodeToString("$username:$password".toByteArray(), Base64.NO_WRAP)
+        putHeaders(profile, mapOf("Authorization" to "Basic $token"))
+        preferences.edit().putString(baseUrlKey(profile), baseUrl?.trimEnd('/')).apply()
+    }
+
+    fun headers(profile: String): Map<String, String> {
+        val encrypted = preferences.getString(profile, null)
+            ?: throw IOException("凭据配置不存在：$profile")
+        return decrypt(encrypted).lineSequence()
+            .mapNotNull { line ->
+                val index = line.indexOf(':')
+                if (index <= 0) null else line.substring(0, index) to line.substring(index + 1)
+            }
+            .toMap()
+    }
+
+    fun resolveUrl(profile: String, url: String): String {
+        if (url.startsWith("https://") || url.startsWith("http://")) return url
+        val baseUrl = preferences.getString(baseUrlKey(profile), null)
+            ?.takeIf(String::isNotBlank)
+            ?: throw IOException("凭据配置 $profile 没有基础地址，必须传入完整 URL")
+        return "${baseUrl.trimEnd('/')}/${url.trimStart('/')}"
+    }
+
+    fun availableProfiles(): List<Profile> = preferences.all.keys
+        .filterNot { it.endsWith(BASE_URL_SUFFIX) }
+        .sorted()
+        .map { name -> Profile(name, preferences.getString(baseUrlKey(name), null)) }
+
+    private fun encrypt(plaintext: String): String {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        val ciphertext = cipher.doFinal(plaintext.toByteArray())
+        return Base64.encodeToString(cipher.iv + ciphertext, Base64.NO_WRAP)
+    }
+
+    private fun decrypt(payload: String): String {
+        val bytes = Base64.decode(payload, Base64.NO_WRAP)
+        require(bytes.size > IV_BYTES) { "凭据密文损坏" }
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, IV_BYTES)))
+        return cipher.doFinal(bytes.copyOfRange(IV_BYTES, bytes.size)).toString(Charsets.UTF_8)
+    }
+
+    private fun key(): SecretKey {
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        val generator = KeyGenerator.getInstance("AES", "AndroidKeyStore")
+        generator.init(
+            android.security.keystore.KeyGenParameterSpec.Builder(
+                KEY_ALIAS,
+                android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or
+                    android.security.keystore.KeyProperties.PURPOSE_DECRYPT,
+            )
+                .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build(),
+        )
+        return generator.generateKey()
+    }
+
+    private fun baseUrlKey(profile: String) = "$profile$BASE_URL_SUFFIX"
+
+    private companion object {
+        private const val PREFERENCES = "credential-profiles"
+        private const val KEY_ALIAS = "main-agent-credential-profiles"
+        private const val TRANSFORMATION = "AES/GCM/NoPadding"
+        private const val IV_BYTES = 12
+        private const val BASE_URL_SUFFIX = ".base_url"
+    }
+}

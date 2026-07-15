@@ -13,7 +13,10 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 使用 MiMo 云端流式 TTS 按句播放回复。
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
-- 支持记忆、定位、天气和网络搜索工具。
+- AgentLoop 已从语音 Service 抽离；Harness 提供串行回合、取消、`steer`/`followUp` 队列和统一事件。
+- 支持记忆、定位、天气、网络搜索、文件读写、Shell 和通用 HTTP 工具。
+- APK 自动携带不含密钥的源码快照，Agent 可读取源码与轮转日志进行交叉诊断。
+- 支持 Agent Skills 渐进加载：上下文只注入 Skill 名称、描述和路径，匹配任务后再读取全文。
 - 会话与本地记忆持久化，支持 `/new` 开启新话题。
 - 每个用户回合默认关闭深度思考；模型或用户可为当前回合升级一次，下一回合自动恢复关闭。
 - 使用 `MediaSessionCompat` 接收播放/暂停类控制，作为唤醒和休眠入口。
@@ -38,6 +41,8 @@ LLM_API_KEY=你的 API Key
 LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 LLM_MODEL=mimo-v2.5
 ```
+
+调试构建附带 Gitea Skill，但不会把 Gitea 凭据编译进 APK。Skill 只有在后续设置界面或 Hub 为 Android Keystore 配置 `gitea` profile 后才会执行认证请求；Release 构建默认不打包该 Skill。
 
 仓库中提供 `.env.example` 作为模板。不要提交 `.env` 或 `local.properties`。
 
@@ -81,13 +86,14 @@ adb install -r app\build\outputs\apk\debug\app-debug-ort1171.apk
 
 ```text
 app/src/main/java/com/agent/voiceassistant/
-├── service/VoiceAgentService.kt        # 当前主运行循环、唤醒休眠、TTS 播放
+├── service/VoiceAgentService.kt        # Android 生命周期、语音采集和 TTS 播放
 ├── cloud/CloudSpeechClient.kt          # MiMo ASR / LLM / TTS 调用
 ├── cloud/SimpleVadRecorder.kt          # 轻量录音端点检测与 WAV 生成
 ├── audio/AudioRouteManager.kt          # 外部音频设备选择、路由和释放
 ├── ui/                                # 主界面、聊天列表、音量条
+├── agent/runtime/                     # Harness、AgentLoop、事件和 Skill 索引
 ├── agent/                             # Agent 提示词、逐回合推理策略和旧兼容封装
-├── tools/                             # 原生工具注册表和本地工具执行器
+├── tools/                             # 工具注册、Android 执行环境与虚拟文件系统
 ├── pipeline/                          # 早期管线骨架，目前不是主路径
 └── report/                            # 主动汇报相关早期模型
 ```
@@ -99,10 +105,32 @@ app/src/main/java/com/agent/voiceassistant/
 - 语音打断和完整用户状态机尚未实现。
 - 自管理 Telecom 与第三方 VoIP 的蓝牙路由兼容性仍需受控实机验证。
 - 延迟已有关键埋点，但仍需持续采集实机数据调优。
+- `/source` 和 `/logs` 的只读限制由虚拟文件工具强制执行；`exec` 仍拥有 Android App UID 沙箱内的完整权限，不能把它当作独立安全沙箱。
+
+## Agent 执行环境
+
+模型看到四个稳定虚拟根：
+
+```text
+/source      随 APK 构建的只读源码快照
+/logs        最多四份、每份 512 KiB 的轮转日志
+/workspace   Agent 可读写工作区
+/skills      已安装的 Skill
+```
+
+核心工具：
+
+- `read(path, offset?, limit?)`
+- `write(path, content, mode?)`，只允许写 `/workspace`
+- `exec(command, timeout_seconds?)`，默认 30 秒、最大 120 秒
+- `http_request(method, url, body?, credential_profile?)`
+
+`exec` 默认工作目录是 `/workspace` 对应的物理目录，并提供 `SOURCE_ROOT`、`LOGS_ROOT`、`WORKSPACE_ROOT`、`SKILLS_ROOT` 环境变量。命令有超时和输出上限，不支持交互式或长期驻留任务。
+
+凭据 profile 只把名称和可公开的基础地址注入上下文。指定 profile 后，`http_request` 可使用 `/api/...` 相对路径；认证 Header 在本地拼接，不会返回模型。
 
 ## 下一步
 
-- 增加受目录权限约束的本地文件工具和 Gitea 协同工具；`exec` 先采用受限能力。
 - 按枢卫协议实现 Hub 工具 Profile 和任务派发。
 - 接入后台任务结果同步与主动汇报。
 - 完善耳机/音频眼镜使用场景下的唤醒、休眠、打断和状态机。

@@ -32,6 +32,45 @@ val envProps = Properties().apply {
 fun llmProp(key: String, default: String): String =
     envProps.getProperty(key) ?: localProps.getProperty(key) ?: default
 
+val gitCommit = providers.exec {
+    workingDir(rootProject.projectDir)
+    commandLine("git", "rev-parse", "--short=12", "HEAD")
+}.standardOutput.asText.map(String::trim).getOrElse("unknown")
+
+val generatedAgentAssets = layout.buildDirectory.dir("generated/agentAssets")
+val generateAgentAssets by tasks.registering(Sync::class) {
+    into(generatedAgentAssets)
+    from(rootProject.projectDir) {
+        include(
+            "README.md",
+            "开发日志.md",
+            "settings.gradle.kts",
+            "build.gradle.kts",
+            "app/build.gradle.kts",
+            "app/proguard-rules.pro",
+            "app/src/main/java/**/*.kt",
+            "app/src/main/res/**/*.xml",
+            "app/src/main/AndroidManifest.xml",
+        )
+        exclude(
+            "**/.env",
+            "**/local.properties",
+            "**/BuildConfig.*",
+            "**/build/**",
+            "**/.gradle/**",
+            "**/.git/**",
+        )
+        into("source")
+    }
+    doLast {
+        val metadata = generatedAgentAssets.get().file("source/SNAPSHOT.txt").asFile
+        metadata.parentFile.mkdirs()
+        metadata.writeText(
+            "version=${android.defaultConfig.versionName}\ncommit=$gitCommit\n",
+        )
+    }
+}
+
 android {
     namespace = "com.agent.voiceassistant"
     compileSdk = 34
@@ -52,6 +91,7 @@ android {
         buildConfigField("String", "OPENAI_API_KEY", "\"${llmProp("LLM_API_KEY", "")}\"")
         buildConfigField("String", "OPENAI_BASE_URL", "\"${llmProp("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")}\"")
         buildConfigField("String", "OPENAI_MODEL", "\"${llmProp("LLM_MODEL", "mimo-v2.5")}\"")
+        buildConfigField("String", "GIT_COMMIT", "\"$gitCommit\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -94,7 +134,7 @@ android {
 
     sourceSets {
         getByName("main") {
-            assets.setSrcDirs(emptyList<String>())
+            assets.srcDir(generatedAgentAssets)
         }
     }
 
@@ -126,6 +166,10 @@ android {
             out.outputFileName = "app-debug-ort1171.apk"
         }
     }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(generateAgentAssets)
 }
 
 dependencies {

@@ -1,0 +1,82 @@
+package com.agent.voiceassistant.agent.runtime
+
+import com.agent.voiceassistant.cloud.CloudSpeechClient
+
+sealed interface AgentEvent {
+    val turnId: String
+    val timestamp: Long
+
+    data class AgentStarted(
+        override val turnId: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class TurnStarted(
+        override val turnId: String,
+        val thinkingMode: CloudSpeechClient.ThinkingMode,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class MessageStarted(
+        override val turnId: String,
+        val modelCall: Int,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ContentDelta(
+        override val turnId: String,
+        val text: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ReasoningDelta(
+        override val turnId: String,
+        val text: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ToolStarted(
+        override val turnId: String,
+        val call: CloudSpeechClient.ToolCall,
+        val displayName: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ToolProgress(
+        override val turnId: String,
+        val toolCallId: String,
+        val detail: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ToolFinished(
+        override val turnId: String,
+        val call: CloudSpeechClient.ToolCall,
+        val result: CloudSpeechClient.LlmMessage,
+        val blocked: Boolean = false,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class MessageFinished(
+        override val turnId: String,
+        val message: CloudSpeechClient.LlmMessage,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class TurnFinished(
+        override val turnId: String,
+        val finalText: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class AgentFinished(
+        override val turnId: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class AgentFailed(
+        override val turnId: String,
+        val error: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+}

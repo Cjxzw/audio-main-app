@@ -39,6 +39,10 @@ class MainToolRegistry(
         add(locationRefresh())
         add(weatherCurrent())
         add(webSearch())
+        add(readFile())
+        add(writeFile())
+        add(execCommand())
+        add(httpRequest())
         if (allowReasoningEscalation) add(reasoningEscalation())
 
         // Hub tools are added here once the connected profile has a live Hub client.
@@ -66,6 +70,10 @@ class MainToolRegistry(
             TOOL_LOCATION_REFRESH -> "location.refresh"
             TOOL_WEATHER_CURRENT -> "weather.get_current"
             TOOL_WEB_SEARCH -> "web.search"
+            TOOL_READ -> "read"
+            TOOL_WRITE -> "write"
+            TOOL_EXEC -> "exec"
+            TOOL_HTTP_REQUEST -> "http_request"
             else -> call.name
         }
         val action = AgentAction(
@@ -83,6 +91,10 @@ class MainToolRegistry(
             "location.refresh", "location.get_current" -> TOOL_LOCATION_REFRESH
             "weather.get_current", "weather.current" -> TOOL_WEATHER_CURRENT
             "web.search", "websearch", "web_search" -> TOOL_WEB_SEARCH
+            "read" -> TOOL_READ
+            "write" -> TOOL_WRITE
+            "exec", "shell", "bash" -> TOOL_EXEC
+            "http.request", "http_request" -> TOOL_HTTP_REQUEST
             else -> action.actionType.replace('.', '_')
         }
         return CloudSpeechClient.ToolCall(
@@ -98,6 +110,10 @@ class MainToolRegistry(
         TOOL_LOCATION_REFRESH -> "刷新定位"
         TOOL_WEATHER_CURRENT -> "查询天气"
         TOOL_WEB_SEARCH -> "网络搜索"
+        TOOL_READ -> "读取文件"
+        TOOL_WRITE -> "写入文件"
+        TOOL_EXEC -> "执行命令"
+        TOOL_HTTP_REQUEST -> "发送网络请求"
         TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
         else -> toolName
     }
@@ -192,6 +208,91 @@ class MainToolRegistry(
         }
     }
 
+    private fun readFile() = tool(
+        name = TOOL_READ,
+        description = "读取虚拟文件系统中的文本文件。源码使用 /source，日志使用 /logs，工作文件使用 /workspace，Skill 使用 /skills。大文件应使用 offset 和 limit 分段读取。",
+        required = listOf("path"),
+    ) {
+        putJsonObject("path") {
+            put("type", "string")
+            put("description", "绝对虚拟路径，例如 /logs/voice-agent.log")
+        }
+        putJsonObject("offset") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("description", "起始行号，从 1 开始")
+        }
+        putJsonObject("limit") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("maximum", 1000)
+            put("description", "最多读取的行数")
+        }
+    }
+
+    private fun writeFile() = tool(
+        name = TOOL_WRITE,
+        description = "在 /workspace 中创建、覆盖或追加 UTF-8 文本文件。不得写入源码、日志或 Skill 目录。",
+        required = listOf("path", "content"),
+    ) {
+        putJsonObject("path") {
+            put("type", "string")
+            put("description", "必须位于 /workspace 的绝对虚拟路径")
+        }
+        putJsonObject("content") {
+            put("type", "string")
+            put("description", "需要写入的完整文本")
+        }
+        putJsonObject("mode") {
+            put("type", "string")
+            put("enum", buildJsonArray {
+                add(JsonPrimitive("overwrite"))
+                add(JsonPrimitive("append"))
+                add(JsonPrimitive("create"))
+            })
+        }
+    }
+
+    private fun execCommand() = tool(
+        name = TOOL_EXEC,
+        description = "在 Android App 自身 UID 沙箱和 /workspace 工作目录中执行一次性 shell 命令。适合日志诊断、文本处理、网络探测和短脚本；不得启动驻留或交互进程。",
+        required = listOf("command"),
+    ) {
+        putJsonObject("command") {
+            put("type", "string")
+            put("description", "传给系统 sh -lc 的命令；可使用 SOURCE_ROOT、LOGS_ROOT、WORKSPACE_ROOT、SKILLS_ROOT 环境变量")
+        }
+        putJsonObject("timeout_seconds") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("maximum", 120)
+        }
+    }
+
+    private fun httpRequest() = tool(
+        name = TOOL_HTTP_REQUEST,
+        description = "发送通用 HTTP/HTTPS 请求，用于 API 调试和 Skill 调用。凭据只能通过 credential_profile 引用，不得要求用户把密钥放进参数。",
+        required = listOf("url"),
+    ) {
+        putJsonObject("method") {
+            put("type", "string")
+            put("enum", buildJsonArray {
+                listOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+                    .forEach { add(JsonPrimitive(it)) }
+            })
+        }
+        putJsonObject("url") {
+            put("type", "string")
+            put("description", "完整 URL；指定 credential_profile 且该 profile 配有基础地址时，也可传 /api/... 相对路径")
+        }
+        putJsonObject("body") { put("type", "string") }
+        putJsonObject("content_type") { put("type", "string") }
+        putJsonObject("credential_profile") {
+            put("type", "string")
+            put("description", "Android Keystore 中已配置的凭据别名")
+        }
+    }
+
     private fun tool(
         name: String,
         description: String,
@@ -216,6 +317,10 @@ class MainToolRegistry(
         const val TOOL_LOCATION_REFRESH = "location_refresh"
         const val TOOL_WEATHER_CURRENT = "weather_get_current"
         const val TOOL_WEB_SEARCH = "web_search"
+        const val TOOL_READ = "read"
+        const val TOOL_WRITE = "write"
+        const val TOOL_EXEC = "exec"
+        const val TOOL_HTTP_REQUEST = "http_request"
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
     }
 }

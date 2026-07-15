@@ -90,7 +90,11 @@ class AudioRouteManager(context: Context) {
     }
 
     fun applyOutputRouting(player: MediaPlayer) {
-        applyOutputRouting(player as AudioRouting, "MediaPlayer")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            applyOutputRouting(player as AudioRouting, "MediaPlayer")
+        } else {
+            Timber.i("AudioRoute: MediaPlayer preferred routing requires API 28; using system route")
+        }
     }
 
     fun release() {

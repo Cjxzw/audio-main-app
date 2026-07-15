@@ -14,22 +14,18 @@ import java.util.Locale
  *
  * 日志同时输出到：
  * 1. Logcat（Timber.DebugTree，调试构建）
- * 2. 文件：filesDir/voice-agent.log（所有构建，adb run-as 可读）
- * 3. 崩溃栈：filesDir/voice-agent-crash.log（仅崩溃时写入）
+ * 2. 文件：filesDir/agent-runtime/logs/voice-agent.log（自动轮转）
+ * 3. 崩溃栈：filesDir/agent-runtime/logs/voice-agent-crash.log（仅崩溃时写入）
  *
- * 读取方式：adb shell run-as com.agent.voiceassistant cat files/voice-agent.log
+ * 读取方式：adb shell run-as com.agent.voiceassistant cat files/agent-runtime/logs/voice-agent.log
  */
 class App : Application() {
 
-    val logFile: File by lazy {
-        File(filesDir, "voice-agent.log")
-    }
+    private val logDir: File by lazy { File(filesDir, "agent-runtime/logs").apply(File::mkdirs) }
+    val logFile: File by lazy { File(logDir, "voice-agent.log") }
 
     override fun onCreate() {
         super.onCreate()
-
-        // 清空旧日志
-        try { logFile.writeText("") } catch (_: Exception) {}
 
         if (BuildConfig.DEBUG) {
             Timber.plant(Timber.DebugTree())
@@ -40,7 +36,7 @@ class App : Application() {
         // 全局崩溃捕获
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            val crashFile = File(filesDir, "voice-agent-crash.log")
+            val crashFile = File(logDir, "voice-agent-crash.log")
             try {
                 PrintWriter(FileWriter(crashFile)).use { pw ->
                     pw.println("=== CRASH at ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date())} ===")
@@ -72,6 +68,7 @@ class App : Application() {
      */
     private class FileLogTree(private val file: File) : Timber.Tree() {
         private val sdf = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
+        private val lock = Any()
 
         override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
             val level = when (priority) {
@@ -96,9 +93,29 @@ class App : Application() {
                 }
                 append("\n")
             }
-            try {
-                FileWriter(file, true).use { it.write(line) }
-            } catch (_: Exception) {}
+            synchronized(lock) {
+                try {
+                    rotateIfNeeded(line.toByteArray().size)
+                    FileWriter(file, true).use { it.write(line) }
+                } catch (_: Exception) {}
+            }
+        }
+
+        private fun rotateIfNeeded(incomingBytes: Int) {
+            if (file.length() + incomingBytes <= MAX_LOG_BYTES) return
+            for (index in MAX_LOG_FILES - 1 downTo 1) {
+                val source = if (index == 1) file else File(file.parentFile, "${file.name}.${index - 1}")
+                val target = File(file.parentFile, "${file.name}.$index")
+                if (source.exists()) {
+                    target.delete()
+                    source.renameTo(target)
+                }
+            }
+        }
+
+        private companion object {
+            private const val MAX_LOG_BYTES = 512 * 1024L
+            private const val MAX_LOG_FILES = 4
         }
     }
 }
