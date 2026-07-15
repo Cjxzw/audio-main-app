@@ -13,6 +13,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -31,7 +32,55 @@ import java.util.concurrent.TimeUnit
 class CloudSpeechClient(
     private val config: LLMConfig,
 ) {
-    data class LlmMessage(val role: String, val content: String)
+    enum class ThinkingMode(val wireValue: String) {
+        DISABLED("disabled"),
+        ENABLED("enabled"),
+    }
+
+    data class ToolDefinition(
+        val name: String,
+        val description: String,
+        val parameters: JsonObject,
+    )
+
+    data class ToolCall(
+        val id: String,
+        val name: String,
+        val arguments: String,
+    )
+
+    data class LlmMessage(
+        val role: String,
+        val content: String? = null,
+        val reasoningContent: String? = null,
+        val toolCalls: List<ToolCall> = emptyList(),
+        val toolCallId: String? = null,
+    )
+
+    data class ChatRequest(
+        val messages: List<LlmMessage>,
+        val tools: List<ToolDefinition>,
+        val thinkingMode: ThinkingMode,
+        val maxCompletionTokens: Int,
+    )
+
+    data class ChatCompletion(
+        val message: LlmMessage,
+        val finishReason: String?,
+    )
+
+    sealed interface ChatStreamEvent {
+        data class ContentDelta(val text: String) : ChatStreamEvent
+        data class ReasoningDelta(val text: String) : ChatStreamEvent
+        data class ToolCallDelta(
+            val index: Int,
+            val id: String?,
+            val name: String?,
+            val argumentsDelta: String?,
+        ) : ChatStreamEvent
+        data class Finished(val reason: String?) : ChatStreamEvent
+    }
+
     data class AudioPayload(val bytes: ByteArray, val mimeType: String?)
 
     private val json = Json {
@@ -76,23 +125,11 @@ class CloudSpeechClient(
     }
 
     suspend fun streamChat(
-        messages: List<LlmMessage>,
-        onDelta: suspend (String) -> Unit,
-    ) = withContext(Dispatchers.IO) {
-        val payload = buildJsonObject {
-            put("model", config.modelName)
-            put("stream", true)
-            put("temperature", config.temperature)
-            put("max_tokens", config.maxTokens)
-            putJsonArray("messages") {
-                for (message in messages) {
-                    add(buildJsonObject {
-                        put("role", message.role)
-                        put("content", message.content)
-                    })
-                }
-            }
-        }
+        request: ChatRequest,
+        onEvent: suspend (ChatStreamEvent) -> Unit,
+    ): ChatCompletion = withContext(Dispatchers.IO) {
+        val payload = buildChatPayload(request)
+        val accumulator = ChatStreamAccumulator()
 
         newJsonRequest(payload).execute().use { response ->
             val responseBody = response.body ?: throw IOException("LLM response body is empty")
@@ -102,8 +139,10 @@ class CloudSpeechClient(
             val contentType = responseBody.contentType()?.toString().orEmpty()
             if (!contentType.contains("text/event-stream", ignoreCase = true)) {
                 val text = responseBody.string()
-                extractAssistantDelta(parseJsonOrNull(text))?.let { onDelta(it) }
-                return@withContext
+                val element = parseJsonOrNull(text)
+                    ?: throw IOException("LLM returned invalid JSON: ${text.take(200)}")
+                for (event in accumulator.accept(element)) onEvent(event)
+                return@withContext accumulator.complete()
             }
 
             val source = responseBody.source()
@@ -112,8 +151,64 @@ class CloudSpeechClient(
                 if (!line.startsWith("data:")) continue
                 val data = line.removePrefix("data:").trim()
                 if (data == "[DONE]") break
-                val delta = extractAssistantDelta(parseJsonOrNull(data))
-                if (!delta.isNullOrEmpty()) onDelta(delta)
+                val element = parseJsonOrNull(data) ?: continue
+                for (event in accumulator.accept(element)) onEvent(event)
+            }
+        }
+        accumulator.complete()
+    }
+
+    internal fun buildChatPayload(request: ChatRequest): JsonObject = buildJsonObject {
+        put("model", config.modelName)
+        put("stream", true)
+        put("max_completion_tokens", request.maxCompletionTokens)
+        putJsonObject("thinking") {
+            put("type", request.thinkingMode.wireValue)
+        }
+        if (request.thinkingMode == ThinkingMode.DISABLED) {
+            put("temperature", config.temperature)
+        }
+        putJsonArray("messages") {
+            request.messages.forEach { message -> add(message.toJson()) }
+        }
+        if (request.tools.isNotEmpty()) {
+            putJsonArray("tools") {
+                request.tools.forEach { definition ->
+                    add(buildJsonObject {
+                        put("type", "function")
+                        putJsonObject("function") {
+                            put("name", definition.name)
+                            put("description", definition.description)
+                            put("parameters", definition.parameters)
+                        }
+                    })
+                }
+            }
+            put("tool_choice", "auto")
+        }
+    }
+
+    private fun LlmMessage.toJson(): JsonObject = buildJsonObject {
+        put("role", role)
+        if (content != null) {
+            put("content", content)
+        } else if (role == "assistant" && toolCalls.isNotEmpty()) {
+            put("content", "")
+        }
+        reasoningContent?.let { put("reasoning_content", it) }
+        toolCallId?.let { put("tool_call_id", it) }
+        if (toolCalls.isNotEmpty()) {
+            putJsonArray("tool_calls") {
+                toolCalls.forEach { call ->
+                    add(buildJsonObject {
+                        put("id", call.id)
+                        put("type", "function")
+                        putJsonObject("function") {
+                            put("name", call.name)
+                            put("arguments", call.arguments)
+                        }
+                    })
+                }
             }
         }
     }
@@ -146,8 +241,12 @@ class CloudSpeechClient(
                 if (!line.startsWith("data:")) continue
                 val data = line.removePrefix("data:").trim()
                 if (data == "[DONE]") break
-                val audio = parseJsonOrNull(data)?.let { extractAudioPayload(it) }
-                    ?: decodeAudioString(data, "data")
+                val parsed = parseJsonOrNull(data)
+                val audio = if (parsed != null) {
+                    extractAudioPayload(parsed)
+                } else {
+                    decodeAudioString(data, "data")
+                }
                 if (audio?.bytes?.isNotEmpty() == true) {
                     chunks++
                     onAudioChunk(audio)
@@ -232,7 +331,12 @@ class CloudSpeechClient(
             .map { it.removePrefix("data:").trim() }
             .takeWhile { it != "[DONE]" }
             .forEach { data ->
-                val payload = parseJsonOrNull(data)?.let { extractAudioPayload(it) } ?: decodeAudioString(data, "data")
+                val parsed = parseJsonOrNull(data)
+                val payload = if (parsed != null) {
+                    extractAudioPayload(parsed)
+                } else {
+                    decodeAudioString(data, "data")
+                }
                 if (payload != null) {
                     output.write(payload.bytes)
                     mimeType = payload.mimeType ?: mimeType
@@ -320,6 +424,9 @@ class CloudSpeechClient(
             key?.contains("base64", ignoreCase = true) == true ||
             key?.contains("b64", ignoreCase = true) == true
         if (!keySuggestsAudio || text.length < 128) return null
+        if (!text.all { it.isLetterOrDigit() || it == '+' || it == '/' || it == '=' || it.isWhitespace() }) {
+            return null
+        }
         return runCatching {
             val bytes = Base64.decode(text, Base64.DEFAULT)
             if (bytes.isNotEmpty()) AudioPayload(bytes, sniffMime(bytes)) else null
@@ -394,5 +501,107 @@ class CloudSpeechClient(
 
     private companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+    }
+}
+
+internal class ChatStreamAccumulator {
+    private data class PendingToolCall(
+        var id: String = "",
+        val name: StringBuilder = StringBuilder(),
+        val arguments: StringBuilder = StringBuilder(),
+    )
+
+    private val content = StringBuilder()
+    private val reasoning = StringBuilder()
+    private val toolCalls = sortedMapOf<Int, PendingToolCall>()
+    private var finishReason: String? = null
+
+    fun accept(element: JsonElement): List<CloudSpeechClient.ChatStreamEvent> {
+        if (element !is JsonObject) return emptyList()
+        val events = mutableListOf<CloudSpeechClient.ChatStreamEvent>()
+        val choices = element["choices"] as? JsonArray ?: return events
+        for (choiceElement in choices) {
+            val choice = choiceElement as? JsonObject ?: continue
+            val payload = (choice["delta"] as? JsonObject)
+                ?: (choice["message"] as? JsonObject)
+                ?: continue
+
+            payload.textValue("reasoning_content")?.takeIf { it.isNotEmpty() }?.let { delta ->
+                reasoning.append(delta)
+                events += CloudSpeechClient.ChatStreamEvent.ReasoningDelta(delta)
+            }
+            payload.contentText()?.takeIf { it.isNotEmpty() }?.let { delta ->
+                content.append(delta)
+                events += CloudSpeechClient.ChatStreamEvent.ContentDelta(delta)
+            }
+
+            val callDeltas = payload["tool_calls"] as? JsonArray
+            callDeltas?.forEachIndexed { fallbackIndex, callElement ->
+                val call = callElement as? JsonObject ?: return@forEachIndexed
+                val index = (call["index"] as? JsonPrimitive)?.intOrNull ?: fallbackIndex
+                val pending = toolCalls.getOrPut(index) { PendingToolCall() }
+                val id = call.textValue("id")
+                if (!id.isNullOrBlank()) pending.id = id
+                val function = call["function"] as? JsonObject
+                val nameDelta = function?.textValue("name")
+                val argumentsDelta = function?.textValue("arguments")
+                if (!nameDelta.isNullOrEmpty()) pending.name.append(nameDelta)
+                if (!argumentsDelta.isNullOrEmpty()) pending.arguments.append(argumentsDelta)
+                events += CloudSpeechClient.ChatStreamEvent.ToolCallDelta(
+                    index = index,
+                    id = id,
+                    name = nameDelta,
+                    argumentsDelta = argumentsDelta,
+                )
+            }
+
+            val reason = choice.textValue("finish_reason")
+            if (reason != null) {
+                finishReason = reason
+                events += CloudSpeechClient.ChatStreamEvent.Finished(reason)
+            }
+        }
+        return events
+    }
+
+    fun complete(): CloudSpeechClient.ChatCompletion {
+        val completedCalls = toolCalls.map { (index, pending) ->
+            val id = pending.id.trim()
+            val name = pending.name.toString().trim()
+            if (id.isEmpty() || name.isEmpty()) {
+                throw IOException("Incomplete tool call at index $index")
+            }
+            CloudSpeechClient.ToolCall(
+                id = id,
+                name = name,
+                arguments = pending.arguments.toString().ifBlank { "{}" },
+            )
+        }
+        return CloudSpeechClient.ChatCompletion(
+            message = CloudSpeechClient.LlmMessage(
+                role = "assistant",
+                content = content.toString(),
+                reasoningContent = reasoning.toString().takeIf { it.isNotEmpty() },
+                toolCalls = completedCalls,
+            ),
+            finishReason = finishReason,
+        )
+    }
+
+    private fun JsonObject.textValue(key: String): String? =
+        (this[key] as? JsonPrimitive)?.contentOrNull
+
+    private fun JsonObject.contentText(): String? {
+        return when (val value = this["content"]) {
+            is JsonPrimitive -> value.contentOrNull
+            is JsonArray -> value.mapNotNull { part ->
+                when (part) {
+                    is JsonPrimitive -> part.contentOrNull
+                    is JsonObject -> (part["text"] as? JsonPrimitive)?.contentOrNull
+                    else -> null
+                }
+            }.joinToString("")
+            else -> null
+        }
     }
 }

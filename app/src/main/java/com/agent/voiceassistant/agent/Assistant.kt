@@ -12,7 +12,7 @@ import dev.langchain4j.service.V
  * - `inject(prompt)` 注入系统级文本（用于汇报注入）
  * - `clearContext()` 清空对话历史
  *
- * `@SystemMessage` 由 [AgentFactory] 在构建时覆盖（注入 [DEFAULT_SYSTEM_PROMPT]）。
+ * `@SystemMessage` 由 [AgentFactory] 在构建时覆盖。
  */
 interface Assistant {
 

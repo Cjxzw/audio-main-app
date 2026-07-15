@@ -2,16 +2,20 @@
 
 Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成可通过手机、蓝牙耳机或智能音频眼镜随时唤醒的随身秘书。
 
-当前版本优先保证最小闭环稳定：语音输入、云端 ASR、云端 LLM、云端 TTS、语音播报、后台息屏运行、休眠/唤醒。后续会继续补会话管理、工具调用、任务派发和主动汇报。
+当前版本已跑通语音闭环、持久会话、本地工具和原生函数调用。复杂执行任务和主动汇报将在接入 Hub 后继续完善。
 
 ## 当前能力
 
 - 使用 Android `ForegroundService` 保持后台运行。
-- 使用 `AudioRecord` 走系统默认输入通道，支持手机麦克风、蓝牙耳机、音频眼镜等系统路由。
+- 使用 `AudioRouteManager` 优先选择可用的外部通信设备，并为 `AudioRecord`、`AudioTrack` 设置首选设备；无外设时回退手机音频。
 - 使用 MiMo 云端 ASR 将录音 WAV 转文字。
-- 使用 MiMo/OpenAI 兼容 LLM 接口进行对话。
-- 使用 MiMo 云端 TTS 播放回复。
-- 默认非流式 TTS，流式 TTS 管线保留但暂未默认启用。
+- 使用 MiMo/OpenAI 兼容 LLM 接口进行流式对话。
+- 使用 MiMo 云端流式 TTS 按句播放回复。
+- TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
+- 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
+- 支持记忆、定位、天气和网络搜索工具。
+- 会话与本地记忆持久化，支持 `/new` 开启新话题。
+- 每个用户回合默认关闭深度思考；模型或用户可为当前回合升级一次，下一回合自动恢复关闭。
 - 使用 `MediaSessionCompat` 接收播放/暂停类控制，作为唤醒和休眠入口。
 - 支持息屏后台继续响应。
 - 本地 ASR/TTS 模型资产已从当前构建链路移除，避免 APK 过大。
@@ -80,23 +84,25 @@ app/src/main/java/com/agent/voiceassistant/
 ├── service/VoiceAgentService.kt        # 当前主运行循环、唤醒休眠、TTS 播放
 ├── cloud/CloudSpeechClient.kt          # MiMo ASR / LLM / TTS 调用
 ├── cloud/SimpleVadRecorder.kt          # 轻量录音端点检测与 WAV 生成
-├── audio/AudioRouteManager.kt          # 系统音频路由诊断
+├── audio/AudioRouteManager.kt          # 外部音频设备选择、路由和释放
 ├── ui/                                # 主界面、聊天列表、音量条
-├── agent/                             # Agent 配置和旧工具封装
+├── agent/                             # Agent 提示词、逐回合推理策略和旧兼容封装
+├── tools/                             # 原生工具注册表和本地工具执行器
 ├── pipeline/                          # 早期管线骨架，目前不是主路径
 └── report/                            # 主动汇报相关早期模型
 ```
 
 ## 当前限制
 
-- 会话历史只保存在进程内，尚未持久化。
-- 工具调用还没有接入当前云端最小闭环。
-- TTS 流式管线存在，但默认关闭，需要后续专项验证首包延迟和分块格式。
-- 延迟波动尚未做结构化耗时埋点。
+- Hub 工具尚未接入新工具注册表，当前 `CONNECTED` Profile 只预留结构。
+- 主动汇报相关早期模型尚未接入当前 AgentLoop。
+- 语音打断和完整用户状态机尚未实现。
+- 自管理 Telecom 与第三方 VoIP 的蓝牙路由兼容性仍需受控实机验证。
+- 延迟已有关键埋点，但仍需持续采集实机数据调优。
 
 ## 下一步
 
-- 增加完整链路耗时日志：录音结束、ASR 完成、LLM 首字、首句生成、TTS 返回、播放开始、播放结束。
-- 增加会话 ID、持久化历史和上下文裁剪。
-- 接入第一个工具闭环，例如天气查询。
-- 完善耳机/音频眼镜使用场景下的唤醒、休眠和主动汇报。
+- 增加受目录权限约束的本地文件工具和 Gitea 协同工具；`exec` 先采用受限能力。
+- 按枢卫协议实现 Hub 工具 Profile 和任务派发。
+- 接入后台任务结果同步与主动汇报。
+- 完善耳机/音频眼镜使用场景下的唤醒、休眠、打断和状态机。
