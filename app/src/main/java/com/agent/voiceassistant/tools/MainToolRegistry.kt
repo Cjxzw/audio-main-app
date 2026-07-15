@@ -210,7 +210,7 @@ class MainToolRegistry(
 
     private fun readFile() = tool(
         name = TOOL_READ,
-        description = "读取虚拟文件系统中的文本文件。源码使用 /source，日志使用 /logs，工作文件使用 /workspace，Skill 使用 /skills。大文件应使用 offset 和 limit 分段读取。",
+        description = "读取虚拟文件系统中的文本文件或列出目录。源码使用 /source，日志使用 /logs，工作文件使用 /workspace，Skill 使用 /skills。日志优先使用 tail_lines 读取末尾；大文件使用 offset 和 limit 分段读取。",
         required = listOf("path"),
     ) {
         putJsonObject("path") {
@@ -227,6 +227,12 @@ class MainToolRegistry(
             put("minimum", 1)
             put("maximum", 1000)
             put("description", "最多读取的行数")
+        }
+        putJsonObject("tail_lines") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("maximum", 1000)
+            put("description", "从文件末尾读取的行数，不能与 offset 同时使用；查看日志时优先使用")
         }
     }
 
@@ -255,7 +261,7 @@ class MainToolRegistry(
 
     private fun execCommand() = tool(
         name = TOOL_EXEC,
-        description = "在 Android App 自身 UID 沙箱和 /workspace 工作目录中执行一次性 shell 命令。适合日志诊断、文本处理、网络探测和短脚本；不得启动驻留或交互进程。",
+        description = "在 Android App 自身 UID 沙箱中执行一次性 shell 命令。通过 cwd 选择 /source、/logs、/workspace 或 /skills 虚拟工作目录；适合日志诊断、文本处理、网络探测和短脚本，不得启动驻留或交互进程。",
         required = listOf("command"),
     ) {
         putJsonObject("command") {
@@ -266,6 +272,10 @@ class MainToolRegistry(
             put("type", "integer")
             put("minimum", 1)
             put("maximum", 120)
+        }
+        putJsonObject("cwd") {
+            put("type", "string")
+            put("description", "虚拟工作目录，默认 /workspace。不要在 shell 命令中直接使用 /source 等虚拟绝对路径")
         }
     }
 

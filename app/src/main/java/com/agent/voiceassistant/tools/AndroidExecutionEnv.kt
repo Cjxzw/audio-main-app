@@ -33,6 +33,7 @@ class AndroidExecutionEnv(
 ) {
     data class ReadResult(
         val path: String,
+        val kind: String,
         val content: String,
         val startLine: Int,
         val endLine: Int,
@@ -44,6 +45,7 @@ class AndroidExecutionEnv(
 
     data class ExecResult(
         val command: String,
+        val cwd: String,
         val exitCode: Int?,
         val output: String,
         val timedOut: Boolean,
@@ -71,26 +73,45 @@ class AndroidExecutionEnv(
         installBundledSkills()
     }
 
-    fun read(path: String, offset: Int = 1, limit: Int = DEFAULT_READ_LINES): ReadResult {
-        require(offset >= 1) { "offset 必须从 1 开始" }
+    fun read(
+        path: String,
+        offset: Int? = null,
+        limit: Int = DEFAULT_READ_LINES,
+        tailLines: Int? = null,
+    ): ReadResult {
+        offset?.let { require(it >= 1) { "offset 必须从 1 开始" } }
         require(limit in 1..MAX_READ_LINES) { "limit 必须在 1..$MAX_READ_LINES 之间" }
+        tailLines?.let { require(it in 1..MAX_READ_LINES) { "tail_lines 必须在 1..$MAX_READ_LINES 之间" } }
+        require(offset == null || tailLines == null) { "offset 和 tail_lines 不能同时使用" }
+        val normalizedPath = pathResolver.normalize(path)
         val file = pathResolver.resolve(path, write = false)
-        require(file.isFile) { "文件不存在：$path" }
+        require(file.exists()) { "路径不存在：$path" }
+        if (file.isDirectory) {
+            return readDirectory(normalizedPath, file, offset ?: 1, limit)
+        }
         require(file.length() <= MAX_READ_FILE_BYTES) { "文件过大，不能直接读取：$path" }
         val text = file.readText(Charsets.UTF_8)
         require(!text.contains('\u0000')) { "暂不支持读取二进制文件：$path" }
         val lines = text.lines()
-        val selected = lines.drop(offset - 1).take(limit)
-        val content = selected.joinToString("\n")
+        val effectiveTail = tailLines ?: if (offset == null && normalizedPath.startsWith("/logs/")) limit else null
+        val startLine = if (effectiveTail != null) {
+            (lines.size - effectiveTail).coerceAtLeast(0) + 1
+        } else {
+            offset ?: 1
+        }
+        val selected = lines.drop(startLine - 1).take(if (effectiveTail != null) effectiveTail else limit)
+        val fullContent = selected.joinToString("\n")
+        val content = fullContent
             .let { if (it.length > MAX_READ_OUTPUT_CHARS) it.take(MAX_READ_OUTPUT_CHARS) else it }
-        val endLine = if (selected.isEmpty()) offset - 1 else offset + selected.size - 1
+        val endLine = if (selected.isEmpty()) startLine - 1 else startLine + selected.size - 1
         return ReadResult(
-            path = pathResolver.normalize(path),
+            path = normalizedPath,
+            kind = "file",
             content = content,
-            startLine = offset,
+            startLine = startLine,
             endLine = endLine,
             totalLines = lines.size,
-            truncated = endLine < lines.size || selected.joinToString("\n").length > content.length,
+            truncated = startLine > 1 || endLine < lines.size || fullContent.length > content.length,
         )
     }
 
@@ -110,14 +131,21 @@ class AndroidExecutionEnv(
         return WriteResult(pathResolver.normalize(path), content.toByteArray().size, mode.lowercase())
     }
 
-    suspend fun exec(command: String, timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS): ExecResult {
+    suspend fun exec(
+        command: String,
+        timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
+        cwd: String = "/workspace",
+    ): ExecResult {
         require(command.isNotBlank()) { "command 不能为空" }
         require(command.length <= MAX_COMMAND_CHARS) { "command 过长" }
         val timeout = timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS)
+        val normalizedCwd = pathResolver.normalize(cwd)
+        val physicalCwd = pathResolver.resolve(normalizedCwd, write = false)
+        require(physicalCwd.isDirectory) { "cwd 不是目录：$cwd" }
         return withContext(Dispatchers.IO) {
             val shell = if (File("/system/bin/sh").exists()) "/system/bin/sh" else "/bin/sh"
             val process = ProcessBuilder(shell, "-lc", command)
-                .directory(workspaceRoot)
+                .directory(physicalCwd)
                 .redirectErrorStream(true)
                 .apply {
                     environment()["SOURCE_ROOT"] = sourceRoot.absolutePath
@@ -137,6 +165,7 @@ class AndroidExecutionEnv(
                     val captured = output.await()
                     ExecResult(
                         command = command,
+                        cwd = normalizedCwd,
                         exitCode = if (completed) process.exitValue() else null,
                         output = captured.first,
                         timedOut = !completed,
@@ -177,15 +206,14 @@ class AndroidExecutionEnv(
         }
         httpClient.newCall(builder.build()).execute().use { response ->
             val responseBody = response.body
-            val source = responseBody?.source()
-            val bytes = source?.readByteArray(MAX_HTTP_BODY_BYTES + 1L) ?: ByteArray(0)
-            val truncated = bytes.size > MAX_HTTP_BODY_BYTES
-            val kept = if (truncated) bytes.copyOf(MAX_HTTP_BODY_BYTES) else bytes
+            val bounded = responseBody?.source()?.let {
+                BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
+            } ?: BoundedSourceReader.Result(ByteArray(0), truncated = false)
             HttpResult(
                 status = response.code,
                 contentType = responseBody?.contentType()?.toString(),
-                body = kept.toString(Charsets.UTF_8),
-                truncated = truncated,
+                body = bounded.bytes.toString(Charsets.UTF_8),
+                truncated = bounded.truncated,
             )
         }
     }
@@ -204,6 +232,29 @@ class AndroidExecutionEnv(
             val base = profile.baseUrl?.let { "，基础地址 $it" }.orEmpty()
             "- ${profile.name}$base"
         }
+    }
+
+    private fun readDirectory(path: String, directory: File, offset: Int, limit: Int): ReadResult {
+        val entries = directory.listFiles().orEmpty()
+            .sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase() }))
+        val selected = entries.drop(offset - 1).take(limit)
+        val content = selected.joinToString("\n") { entry ->
+            if (entry.isDirectory) {
+                "[dir] ${entry.name}/"
+            } else {
+                "[file] ${entry.name} (${entry.length()} bytes)"
+            }
+        }
+        val end = if (selected.isEmpty()) offset - 1 else offset + selected.size - 1
+        return ReadResult(
+            path = path,
+            kind = "directory",
+            content = content.ifBlank { "[空目录]" },
+            startLine = offset,
+            endLine = end,
+            totalLines = entries.size,
+            truncated = end < entries.size,
+        )
     }
 
     private fun installAssetTree(assetPath: String, target: File, marker: String) {

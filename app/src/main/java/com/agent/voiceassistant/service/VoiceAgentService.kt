@@ -97,8 +97,8 @@ class VoiceAgentService : Service() {
         private const val TTS_FADE_MS = 18
         private const val TTS_INTER_SEGMENT_SILENCE_MS = 4
         private const val TTS_FINAL_SILENCE_MS = 90
-        private const val FAST_MAX_MODEL_CALLS = 3
-        private const val DEEP_MAX_MODEL_CALLS = 4
+        private const val FAST_MAX_TOOL_ROUNDS = 3
+        private const val DEEP_MAX_TOOL_ROUNDS = 4
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
         private const val MAX_TOOL_RESULT_CHARS = 12_000
@@ -397,7 +397,7 @@ class VoiceAgentService : Service() {
                         client = client,
                         messages = buildMessages(deepReasoning = false),
                         thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
-                        maxModelCalls = FAST_MAX_MODEL_CALLS,
+                        maxToolRounds = FAST_MAX_TOOL_ROUNDS,
                         allowReasoningEscalation = true,
                     )
                     when (fastOutcome) {
@@ -417,7 +417,21 @@ class VoiceAgentService : Service() {
                 store.addMessage("system", message)
                 EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
                 emitLog(message)
-                earcons.error()
+                val fallback = "这轮没有完成，执行过程中出现了异常。错误已经记入日志，你可以让我重试。"
+                store.addMessage("assistant", fallback)
+                EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, fallback))
+                emitLog("助手兜底: $fallback")
+                val client = speechClient
+                if (client != null) {
+                    try {
+                        speakAssistantText(client, fallback)
+                    } catch (speechError: Exception) {
+                        Timber.w(speechError, "Failed to speak fallback")
+                        earcons.error()
+                    }
+                } else {
+                    earcons.error()
+                }
                 updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
             }
         }
@@ -444,7 +458,7 @@ class VoiceAgentService : Service() {
             client = client,
             messages = buildMessages(deepReasoning = true),
             thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
-            maxModelCalls = DEEP_MAX_MODEL_CALLS,
+            maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
             allowReasoningEscalation = false,
             beforeSpeech = { acknowledgementJob.await() },
         )
@@ -461,7 +475,7 @@ class VoiceAgentService : Service() {
         client: CloudSpeechClient,
         messages: List<CloudSpeechClient.LlmMessage>,
         thinkingMode: CloudSpeechClient.ThinkingMode,
-        maxModelCalls: Int,
+        maxToolRounds: Int,
         allowReasoningEscalation: Boolean,
         beforeSpeech: suspend () -> Unit = {},
     ): AgentLoop.Outcome {
@@ -519,7 +533,7 @@ class VoiceAgentService : Service() {
             AgentLoop.Config(
                 messages = messages,
                 thinkingMode = thinkingMode,
-                maxModelCalls = maxModelCalls,
+                maxToolRounds = maxToolRounds,
                 allowReasoningEscalation = allowReasoningEscalation,
                 maxCompletionTokens = if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
                     DEEP_MAX_COMPLETION_TOKENS
@@ -544,7 +558,7 @@ class VoiceAgentService : Service() {
             )
             is AgentEvent.ToolFinished -> DiagLog.i(
                 "agent.tool.finished",
-                "turn=${event.turnId} id=${event.call.id} blocked=${event.blocked}",
+                "turn=${event.turnId} id=${event.call.id} success=${event.success} blocked=${event.blocked}",
             )
             is AgentEvent.TurnFinished -> DiagLog.i(
                 "agent.turn.finished",
@@ -566,7 +580,7 @@ class VoiceAgentService : Service() {
     private suspend fun executeToolCall(
         client: CloudSpeechClient,
         call: CloudSpeechClient.ToolCall,
-    ): CloudSpeechClient.LlmMessage = coroutineScope {
+    ): AgentLoop.ToolExecution = coroutineScope {
         val title = "调用工具：${toolRegistry.displayName(call.name)}"
         emitToolStatus(title)
         emitLog("$title args=${call.arguments.take(300)}")
@@ -582,10 +596,13 @@ class VoiceAgentService : Service() {
         store.addMessage("tool", result.displayText)
         EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, result.displayText))
         emitLog("工具结果: ${result.contextText}")
-        CloudSpeechClient.LlmMessage(
-            role = "tool",
-            content = result.contextText.take(MAX_TOOL_RESULT_CHARS),
-            toolCallId = call.id,
+        AgentLoop.ToolExecution(
+            message = CloudSpeechClient.LlmMessage(
+                role = "tool",
+                content = result.contextText.take(MAX_TOOL_RESULT_CHARS),
+                toolCallId = call.id,
+            ),
+            succeeded = result.success,
         )
     }
 

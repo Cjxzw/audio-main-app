@@ -53,6 +53,7 @@ sealed interface AgentEvent {
         override val turnId: String,
         val call: CloudSpeechClient.ToolCall,
         val result: CloudSpeechClient.LlmMessage,
+        val success: Boolean,
         val blocked: Boolean = false,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent

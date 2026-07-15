@@ -13,6 +13,7 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 使用 MiMo 云端流式 TTS 按句播放回复。
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
+- 工具阶段与最终回复使用独立预算；达到上限或连续失败后仍会保留一次无工具总结。
 - AgentLoop 已从语音 Service 抽离；Harness 提供串行回合、取消、`steer`/`followUp` 队列和统一事件。
 - 支持记忆、定位、天气、网络搜索、文件读写、Shell 和通用 HTTP 工具。
 - APK 自动携带不含密钥的源码快照，Agent 可读取源码与轮转日志进行交叉诊断。
@@ -120,12 +121,12 @@ app/src/main/java/com/agent/voiceassistant/
 
 核心工具：
 
-- `read(path, offset?, limit?)`
+- `read(path, offset?, limit?, tail_lines?)`，文件读取、目录列表和日志尾读共用一个入口
 - `write(path, content, mode?)`，只允许写 `/workspace`
-- `exec(command, timeout_seconds?)`，默认 30 秒、最大 120 秒
+- `exec(command, cwd?, timeout_seconds?)`，`cwd` 使用虚拟目录，默认 30 秒、最大 120 秒
 - `http_request(method, url, body?, credential_profile?)`
 
-`exec` 默认工作目录是 `/workspace` 对应的物理目录，并提供 `SOURCE_ROOT`、`LOGS_ROOT`、`WORKSPACE_ROOT`、`SKILLS_ROOT` 环境变量。命令有超时和输出上限，不支持交互式或长期驻留任务。
+`exec` 默认工作目录是 `/workspace` 对应的物理目录，也可直接把 `cwd` 设为 `/source`、`/logs` 或 `/skills`。兼容环境变量 `SOURCE_ROOT`、`LOGS_ROOT`、`WORKSPACE_ROOT`、`SKILLS_ROOT` 仍然保留。命令有超时和输出上限，不支持交互式或长期驻留任务。
 
 凭据 profile 只把名称和可公开的基础地址注入上下文。指定 profile 后，`http_request` 可使用 `/api/...` 相对路径；认证 Header 在本地拼接，不会返回模型。
 

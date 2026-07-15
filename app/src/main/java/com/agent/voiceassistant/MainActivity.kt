@@ -170,7 +170,6 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             EventBus.volumeEvents.collectLatest { level ->
                 binding.voiceBar.setLevel(level)
-                Timber.v("Volume UI: ${"%.4f".format(level)}")
             }
         }
     }

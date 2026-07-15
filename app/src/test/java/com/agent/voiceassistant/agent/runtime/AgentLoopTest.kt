@@ -62,7 +62,7 @@ class AgentLoopTest {
             ),
         )
 
-        AgentLoop(runtime).run(config(maxModelCalls = 3))
+        AgentLoop(runtime).run(config(maxToolRounds = 3))
 
         assertEquals(listOf("call-1"), runtime.executedCalls)
         assertEquals(listOf("call-2"), runtime.blockedCalls)
@@ -91,10 +91,52 @@ class AgentLoopTest {
         assertEquals(AgentLoop.Outcome.Escalate("需要比较多个方案"), outcome)
     }
 
-    private fun config(maxModelCalls: Int = 2) = AgentLoop.Config(
+    @Test
+    fun `reserves a tool-free final synthesis after tool budget`() = runBlocking {
+        val call = CloudSpeechClient.ToolCall("call-1", "read", "{\"path\":\"/logs\"}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(call)),
+                    message(content = "已经读取日志，这是当前结论"),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 1))
+
+        assertEquals(AgentLoop.Outcome.Completed("已经读取日志，这是当前结论", true), outcome)
+        assertEquals(2, runtime.requests.size)
+        assertTrue(runtime.requests.last().tools.isEmpty())
+        assertTrue(runtime.requests.last().messages.last().content.orEmpty().contains("工具阶段已经结束"))
+    }
+
+    @Test
+    fun `two consecutive tool failures trigger early synthesis`() = runBlocking {
+        val first = CloudSpeechClient.ToolCall("failed-1", "read", "{\"path\":\"/missing-a\"}")
+        val second = CloudSpeechClient.ToolCall("failed-2", "read", "{\"path\":\"/missing-b\"}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(first)),
+                    message(toolCalls = listOf(second)),
+                    message(content = "连续两次读取失败，我先停止重试"),
+                ),
+            ),
+            failedCallIds = setOf("failed-1", "failed-2"),
+        )
+
+        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 3))
+
+        assertEquals(AgentLoop.Outcome.Completed("连续两次读取失败，我先停止重试", true), outcome)
+        assertEquals(3, runtime.requests.size)
+        assertTrue(runtime.requests.last().tools.isEmpty())
+    }
+
+    private fun config(maxToolRounds: Int = 2) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
         thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
-        maxModelCalls = maxModelCalls,
+        maxToolRounds = maxToolRounds,
         maxCompletionTokens = 512,
         allowReasoningEscalation = true,
     )
@@ -110,6 +152,7 @@ class AgentLoopTest {
 
     private class FakeRuntime(
         private val responses: ArrayDeque<CloudSpeechClient.LlmMessage>,
+        private val failedCallIds: Set<String> = emptySet(),
     ) : AgentLoop.Runtime {
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
@@ -143,9 +186,12 @@ class AgentLoopTest {
 
         override fun toolDisplayName(toolName: String) = toolName
 
-        override suspend fun executeTool(call: CloudSpeechClient.ToolCall): CloudSpeechClient.LlmMessage {
+        override suspend fun executeTool(call: CloudSpeechClient.ToolCall): AgentLoop.ToolExecution {
             executedCalls += call.id
-            return CloudSpeechClient.LlmMessage("tool", "读取结果", toolCallId = call.id)
+            return AgentLoop.ToolExecution(
+                message = CloudSpeechClient.LlmMessage("tool", "读取结果", toolCallId = call.id),
+                succeeded = call.id !in failedCallIds,
+            )
         }
 
         override fun blockedTool(

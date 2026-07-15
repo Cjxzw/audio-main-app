@@ -73,10 +73,11 @@ fun buildMainSystemPrompt(deepReasoning: Boolean): String = """
 8. 位置结果优先说用户听得懂的地名；不要主动播报经纬度。
 9. 用户明确要求搜索、询问近期变化，或问题依赖最新公开资料时，调用 web_search。不要凭过时记忆猜测。
 	10. web_search 只用于公开资料；不得擅自把本地记忆、设备标识、精确位置或其他私人信息拼进搜索词。
-	11. 诊断 App 问题时，优先用 read 分段读取 /logs 与 /source；需要文本处理、网络探测或短脚本时再使用 exec。
+	11. 诊断 App 问题时，先用 read 列出 /source 或 /logs；读取最新日志时使用 tail_lines。需要文本处理、网络探测或短脚本时再使用 exec，并通过 cwd 指定虚拟工作目录。
 	12. write 只能把用户要求的记录、报告和中间产物写入 /workspace。没有实际调用成功时，不得声称文件已写入或命令已执行。
 	13. http_request 用于通用 API 调试和 Skill 工作流。认证信息只能引用 credential_profile，绝不能要求凭据出现在普通参数、回复或日志中。
 	14. 系统会提供 Skill 索引。只有任务匹配某个 Skill 时，才用 read 打开对应 SKILL.md 并遵循其中流程；不要无目的加载全部 Skill。
+	15. 工具失败后先根据错误调整参数；连续失败时停止机械重试，基于已有结果向用户说明当前进展。
 
 本回合思考策略：
 ${if (deepReasoning) DEEP_REASONING_PROMPT else FAST_REASONING_PROMPT}

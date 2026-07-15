@@ -24,6 +24,7 @@ class LocalToolExecutor(
         val displayText: String,
         val contextText: String,
         val shouldAskLlm: Boolean,
+        val success: Boolean = true,
     )
 
     suspend fun execute(action: AgentAction): ToolResult {
@@ -43,6 +44,7 @@ class LocalToolExecutor(
                 displayText = "未知本地工具：${action.actionType}",
                 contextText = "本地工具 ${action.actionType} 不存在。",
                 shouldAskLlm = true,
+                success = false,
             )
         }
     }
@@ -55,6 +57,7 @@ class LocalToolExecutor(
                 displayText = "记忆写入失败：缺少内容",
                 contextText = "记忆写入失败：缺少 content 字段。",
                 shouldAskLlm = true,
+                success = false,
             )
         }
         val memory = store.addMemory(content = content, tags = payload.stringList("tags"))
@@ -91,6 +94,7 @@ class LocalToolExecutor(
                 displayText = "定位失败",
                 contextText = "定位失败：没有权限、定位关闭或暂时无法获取位置。",
                 shouldAskLlm = true,
+                success = false,
             )
         }
         store.setLocation(location)
@@ -115,11 +119,12 @@ class LocalToolExecutor(
                 displayText = "天气查询失败：缺少定位",
                 contextText = "天气查询失败：没有可用定位。请提示用户授予定位权限或手动说明城市。",
                 shouldAskLlm = true,
+                success = false,
             )
         }
-        val weather = runCatching { weatherClient.getCurrent(location) }
+        val weatherResult = runCatching { weatherClient.getCurrent(location) }
             .onFailure { Timber.e(it, "weather tool failed") }
-            .getOrElse { "天气查询失败：${it.message ?: "网络或服务异常"}" }
+        val weather = weatherResult.getOrElse { "天气查询失败：${it.message ?: "网络或服务异常"}" }
 
         val locationNote = if (requestedPlace.isNotBlank()) {
             "用户请求地点：$requestedPlace。当前版本先使用手机当前位置查询。"
@@ -131,6 +136,7 @@ class LocalToolExecutor(
             displayText = "查询天气",
             contextText = "$locationNote\n$weather",
             shouldAskLlm = true,
+            success = weatherResult.isSuccess,
         )
     }
 
@@ -142,6 +148,7 @@ class LocalToolExecutor(
                 displayText = "网络搜索失败：缺少关键词",
                 contextText = "网络搜索失败：缺少 query 字段。",
                 shouldAskLlm = true,
+                success = false,
             )
         }
 
@@ -154,6 +161,7 @@ class LocalToolExecutor(
                     displayText = "网络搜索失败：${error.message ?: "服务异常"}",
                     contextText = "MiMo Web Search 查询失败：${error.message ?: error.javaClass.simpleName}",
                     shouldAskLlm = true,
+                    success = false,
                 )
             }
 
@@ -202,19 +210,24 @@ class LocalToolExecutor(
         return runCatching {
             env.read(
                 path = path,
-                offset = payload.int("offset") ?: 1,
+                offset = payload.int("offset"),
                 limit = payload.int("limit") ?: 200,
+                tailLines = payload.int("tail_lines"),
             )
         }.fold(
             onSuccess = { result ->
                 ToolResult(
                     actionType = "read",
-                    displayText = "读取 ${result.path}",
+                    displayText = if (result.kind == "directory") {
+                        "列出 ${result.path}"
+                    } else {
+                        "读取 ${result.path}"
+                    },
                     contextText = buildString {
-                        appendLine("文件：${result.path}")
-                        appendLine("行：${result.startLine}-${result.endLine}/${result.totalLines}")
+                        appendLine("${if (result.kind == "directory") "目录" else "文件"}：${result.path}")
+                        appendLine("范围：${result.startLine}-${result.endLine}/${result.totalLines}")
                         append(result.content)
-                        if (result.truncated) append("\n[输出已截断，可调整 offset/limit 继续读取]")
+                        if (result.truncated) append("\n[输出已截断，可调整 offset/limit 或 tail_lines 继续读取]")
                     },
                     shouldAskLlm = true,
                 )
@@ -250,7 +263,11 @@ class LocalToolExecutor(
             ?: return invalidArguments("exec", "缺少 command 字段")
         val env = executionEnv ?: return unavailable("exec")
         return runCatching {
-            env.exec(command, payload.int("timeout_seconds") ?: 30)
+            env.exec(
+                command = command,
+                timeoutSeconds = payload.int("timeout_seconds") ?: 30,
+                cwd = payload.string("cwd") ?: "/workspace",
+            )
         }.fold(
             onSuccess = { result ->
                 val status = when {
@@ -263,11 +280,13 @@ class LocalToolExecutor(
                     displayText = "执行命令：$status",
                     contextText = buildString {
                         appendLine("命令：${result.command}")
+                        appendLine("工作目录：${result.cwd}")
                         appendLine("状态：$status")
                         append(result.output.ifBlank { "[无输出]" })
                         if (result.truncated) append("\n[输出已截断]")
                     },
                     shouldAskLlm = true,
+                    success = !result.timedOut && result.exitCode == 0,
                 )
             },
             onFailure = { error -> failed("exec", "命令执行失败", error) },
@@ -298,6 +317,7 @@ class LocalToolExecutor(
                         if (result.truncated) append("\n[响应已截断]")
                     },
                     shouldAskLlm = true,
+                    success = result.status in 200..399,
                 )
             },
             onFailure = { error -> failed("http_request", "HTTP 请求失败", error) },
@@ -309,6 +329,7 @@ class LocalToolExecutor(
         displayText = "$actionType 调用失败：$detail",
         contextText = "$actionType 调用失败：$detail。",
         shouldAskLlm = true,
+        success = false,
     )
 
     private fun unavailable(actionType: String) = ToolResult(
@@ -316,6 +337,7 @@ class LocalToolExecutor(
         displayText = "$actionType 暂不可用",
         contextText = "Android 执行环境尚未初始化，无法执行 $actionType。",
         shouldAskLlm = true,
+        success = false,
     )
 
     private fun failed(actionType: String, label: String, error: Throwable) = ToolResult(
@@ -323,6 +345,7 @@ class LocalToolExecutor(
         displayText = "$label：${error.message ?: error.javaClass.simpleName}",
         contextText = "$label：${error.message ?: error.javaClass.simpleName}",
         shouldAskLlm = true,
+        success = false,
     )
 
     private fun locationContext(location: com.agent.voiceassistant.data.StoredLocation): String {

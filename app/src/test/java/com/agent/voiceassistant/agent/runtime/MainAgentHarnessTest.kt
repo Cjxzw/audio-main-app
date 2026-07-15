@@ -56,7 +56,7 @@ class MainAgentHarnessTest {
     private fun config() = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "test")),
         thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
-        maxModelCalls = 1,
+        maxToolRounds = 1,
         maxCompletionTokens = 32,
         allowReasoningEscalation = false,
     )
@@ -77,7 +77,7 @@ class MainAgentHarnessTest {
         override fun isReasoningEscalation(call: CloudSpeechClient.ToolCall) = false
         override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) = ""
         override fun toolDisplayName(toolName: String) = toolName
-        override suspend fun executeTool(call: CloudSpeechClient.ToolCall) = error("unused")
+        override suspend fun executeTool(call: CloudSpeechClient.ToolCall): AgentLoop.ToolExecution = error("unused")
         override fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String) = error("unused")
         override suspend fun finishAssistant(message: CloudSpeechClient.LlmMessage, streamedSpeech: Boolean) = true
     }
