@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.agent.runtime
 
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -9,6 +10,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 
 class AgentLoopTest {
     @Test
@@ -69,7 +71,7 @@ class AgentLoopTest {
     }
 
     @Test
-    fun `returns escalation only on first fast model call`() = runBlocking {
+    fun `escalation switches the current turn to deep reasoning`() = runBlocking {
         val runtime = FakeRuntime(
             responses = ArrayDeque(
                 listOf(
@@ -82,13 +84,53 @@ class AgentLoopTest {
                             ),
                         ),
                     ),
+                    message(content = "已经深入分析完成"),
                 ),
             ),
         )
 
         val outcome = AgentLoop(runtime).run(config())
 
-        assertEquals(AgentLoop.Outcome.Escalate("需要比较多个方案"), outcome)
+        assertEquals(AgentLoop.Outcome.Completed("已经深入分析完成", true), outcome)
+        assertEquals(
+            listOf(
+                CloudSpeechClient.ThinkingMode.DISABLED,
+                CloudSpeechClient.ThinkingMode.ENABLED,
+            ),
+            runtime.requests.map { it.thinkingMode },
+        )
+        assertEquals("reason-1", runtime.requests[1].messages.last().toolCallId)
+    }
+
+    @Test
+    fun `escalation and independent tools share a batch and run in parallel`() = runBlocking {
+        val reasoning = CloudSpeechClient.ToolCall(
+            "reason-1",
+            "request_deep_reasoning",
+            "{\"reason\":\"需要综合网络和本地资料\"}",
+        )
+        val search = CloudSpeechClient.ToolCall("search-1", "web_search", "{\"query\":\"示例\"}")
+        val read = CloudSpeechClient.ToolCall("read-1", "read", "{\"path\":\"/source/a.kt\"}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(reasoning, search, read)),
+                    message(content = "综合结果已经整理完成"),
+                ),
+            ),
+            parallelToolNames = setOf("web_search", "read"),
+            toolDelayMs = 20,
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("综合结果已经整理完成", true), outcome)
+        assertTrue(runtime.maxActiveTools.get() >= 2)
+        assertEquals(
+            listOf("reason-1", "search-1", "read-1"),
+            runtime.requests[1].messages.takeLast(3).map { it.toolCallId },
+        )
+        assertEquals(4_096, runtime.requests[1].maxCompletionTokens)
     }
 
     @Test
@@ -112,32 +154,35 @@ class AgentLoopTest {
     }
 
     @Test
-    fun `two consecutive tool failures trigger early synthesis`() = runBlocking {
+    fun `three consecutive tool failures trigger early synthesis`() = runBlocking {
         val first = CloudSpeechClient.ToolCall("failed-1", "read", "{\"path\":\"/missing-a\"}")
         val second = CloudSpeechClient.ToolCall("failed-2", "read", "{\"path\":\"/missing-b\"}")
+        val third = CloudSpeechClient.ToolCall("failed-3", "read", "{\"path\":\"/missing-c\"}")
         val runtime = FakeRuntime(
             responses = ArrayDeque(
                 listOf(
                     message(toolCalls = listOf(first)),
                     message(toolCalls = listOf(second)),
-                    message(content = "连续两次读取失败，我先停止重试"),
+                    message(toolCalls = listOf(third)),
+                    message(content = "连续三次读取失败，我先停止重试"),
                 ),
             ),
-            failedCallIds = setOf("failed-1", "failed-2"),
+            failedCallIds = setOf("failed-1", "failed-2", "failed-3"),
         )
 
-        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 3))
+        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 4))
 
-        assertEquals(AgentLoop.Outcome.Completed("连续两次读取失败，我先停止重试", true), outcome)
-        assertEquals(3, runtime.requests.size)
+        assertEquals(AgentLoop.Outcome.Completed("连续三次读取失败，我先停止重试", true), outcome)
+        assertEquals(4, runtime.requests.size)
         assertTrue(runtime.requests.last().tools.isEmpty())
     }
 
     private fun config(maxToolRounds: Int = 2) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
-        thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+        initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
         maxToolRounds = maxToolRounds,
-        maxCompletionTokens = 512,
+        fastMaxCompletionTokens = 512,
+        deepMaxCompletionTokens = 4_096,
         allowReasoningEscalation = true,
     )
 
@@ -153,10 +198,14 @@ class AgentLoopTest {
     private class FakeRuntime(
         private val responses: ArrayDeque<CloudSpeechClient.LlmMessage>,
         private val failedCallIds: Set<String> = emptySet(),
+        private val parallelToolNames: Set<String> = emptySet(),
+        private val toolDelayMs: Long = 0,
     ) : AgentLoop.Runtime {
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
         val blockedCalls = mutableListOf<String>()
+        private val activeTools = AtomicInteger(0)
+        val maxActiveTools = AtomicInteger(0)
 
         override fun toolDefinitions(allowReasoningEscalation: Boolean) = listOf(
             CloudSpeechClient.ToolDefinition("read", "read", buildJsonObject {}),
@@ -184,10 +233,27 @@ class AgentLoopTest {
         override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
             Json.parseToJsonElement(call.arguments).jsonObject.getValue("reason").jsonPrimitive.content
 
+        override fun reasoningEscalationResult(call: CloudSpeechClient.ToolCall) =
+            AgentLoop.ToolExecution(
+                CloudSpeechClient.LlmMessage(
+                    role = "tool",
+                    content = "已启用当前用户回合的深度思考模式。",
+                    toolCallId = call.id,
+                ),
+                succeeded = true,
+            )
+
+        override fun canExecuteToolInParallel(call: CloudSpeechClient.ToolCall) =
+            call.name in parallelToolNames
+
         override fun toolDisplayName(toolName: String) = toolName
 
         override suspend fun executeTool(call: CloudSpeechClient.ToolCall): AgentLoop.ToolExecution {
             executedCalls += call.id
+            val active = activeTools.incrementAndGet()
+            maxActiveTools.updateAndGet { current -> maxOf(current, active) }
+            if (toolDelayMs > 0) delay(toolDelayMs)
+            activeTools.decrementAndGet()
             return AgentLoop.ToolExecution(
                 message = CloudSpeechClient.LlmMessage("tool", "读取结果", toolCallId = call.id),
                 succeeded = call.id !in failedCallIds,

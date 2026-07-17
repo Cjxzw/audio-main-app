@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.tools
 
 import com.agent.voiceassistant.agent.LLMConfig
+import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -20,6 +21,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.util.concurrent.TimeUnit
 
 /** Xiaomi MiMo Web Search, using the same chat-completions plugin protocol as MiMo Code. */
@@ -42,9 +44,10 @@ class MimoWebSearchClient(
     )
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(40, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(5, TimeUnit.SECONDS)
         .build()
 
     suspend fun search(query: String, limit: Int = DEFAULT_LIMIT): SearchResult = withContext(Dispatchers.IO) {
@@ -82,16 +85,24 @@ class MimoWebSearchClient(
             .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
 
-        client.newCall(request).execute().use { response ->
-            val body = response.body?.string().orEmpty()
-            if (response.code == 409) {
-                throw IOException("MiMo Web Search 免费额度已用完或插件未开通")
+        var lastTimeout: IOException? = null
+        repeat(MAX_ATTEMPTS) {
+            try {
+                client.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (response.code == 409) {
+                        throw IOException("MiMo Web Search 免费额度已用完或插件未开通")
+                    }
+                    if (!response.isSuccessful) {
+                        throw IOException("MiMo Web Search HTTP ${response.code}: ${body.take(300)}")
+                    }
+                    return@withContext parseResponse(body)
+                }
+            } catch (error: InterruptedIOException) {
+                lastTimeout = error
             }
-            if (!response.isSuccessful) {
-                throw IOException("MiMo Web Search HTTP ${response.code}: ${body.take(300)}")
-            }
-            parseResponse(body)
         }
+        throw NetworkTimeoutException("web search", lastTimeout)
     }
 
     internal fun parseResponse(body: String): SearchResult {
@@ -149,6 +160,7 @@ class MimoWebSearchClient(
         const val MAX_COMPLETION_TOKENS = 384
         const val MAX_FIELD_CHARS = 160
         const val MAX_SUMMARY_CHARS = 600
+        const val MAX_ATTEMPTS = 2
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
     }

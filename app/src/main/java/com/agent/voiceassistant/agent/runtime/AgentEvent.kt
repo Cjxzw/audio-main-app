@@ -17,6 +17,12 @@ sealed interface AgentEvent {
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
+    data class ThinkingModeChanged(
+        override val turnId: String,
+        val thinkingMode: CloudSpeechClient.ThinkingMode,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
     data class MessageStarted(
         override val turnId: String,
         val modelCall: Int,

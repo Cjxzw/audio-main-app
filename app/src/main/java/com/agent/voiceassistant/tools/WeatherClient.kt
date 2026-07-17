@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.tools
 
 import com.agent.voiceassistant.data.StoredLocation
+import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -14,14 +15,17 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.util.concurrent.TimeUnit
 
 class WeatherClient {
 
     private val json = Json { ignoreUnknownKeys = true }
     private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(5, TimeUnit.SECONDS)
         .build()
 
     suspend fun getCurrent(location: StoredLocation): String = withContext(Dispatchers.IO) {
@@ -38,13 +42,21 @@ class WeatherClient {
             .build()
 
         val request = Request.Builder().url(url).build()
-        client.newCall(request).execute().use { response ->
-            val body = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("weather HTTP ${response.code}: ${body.take(300)}")
+        var lastTimeout: IOException? = null
+        repeat(MAX_ATTEMPTS) {
+            try {
+                client.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        throw IOException("weather HTTP ${response.code}: ${body.take(300)}")
+                    }
+                    return@withContext parseWeather(body, location)
+                }
+            } catch (error: InterruptedIOException) {
+                lastTimeout = error
             }
-            return@withContext parseWeather(body, location)
         }
+        throw NetworkTimeoutException("weather", lastTimeout)
     }
 
     private fun parseWeather(body: String, location: StoredLocation): String {
@@ -92,6 +104,10 @@ class WeatherClient {
         (this[key] as? JsonArray)?.getOrNull(index)?.jsonPrimitive?.intOrNull
 
     private fun Double.round1(): String = "%.1f".format(this)
+
+    private companion object {
+        const val MAX_ATTEMPTS = 2
+    }
 
     private fun weatherDescription(code: Int?): String = when (code) {
         0 -> "晴"

@@ -16,9 +16,12 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaPlayer
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.telephony.TelephonyManager
 import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import android.support.v4.media.session.MediaSessionCompat
@@ -26,9 +29,11 @@ import android.support.v4.media.session.PlaybackStateCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.MediaButtonReceiver
 import com.agent.voiceassistant.agent.LLMConfig
-import com.agent.voiceassistant.agent.ReasoningPolicy
 import com.agent.voiceassistant.agent.StructuredOutputParser
+import com.agent.voiceassistant.agent.SpokenReplyPolicy
+import com.agent.voiceassistant.agent.buildCurrentTurnUserContent
 import com.agent.voiceassistant.agent.buildMainSystemPrompt
+import com.agent.voiceassistant.agent.deepReasoningEnabledResult
 import com.agent.voiceassistant.agent.runtime.AgentEvent
 import com.agent.voiceassistant.agent.runtime.AgentLoop
 import com.agent.voiceassistant.agent.runtime.MainAgentHarness
@@ -36,12 +41,14 @@ import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.cloud.SpeechSegmenter
 import com.agent.voiceassistant.cloud.SimpleVadRecorder
 import com.agent.voiceassistant.cloud.StreamingSpeechExtractor
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.tools.LocalToolExecutor
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
+import com.agent.voiceassistant.tools.CodeGraphIndex
 import com.agent.voiceassistant.tools.LocationProvider
 import com.agent.voiceassistant.tools.MainToolRegistry
 import com.agent.voiceassistant.telecom.AssistantTelecomSession
@@ -88,20 +95,32 @@ class VoiceAgentService : Service() {
     companion object {
         private const val CHANNEL_ID = "voice_agent_channel"
         private const val NOTIFICATION_ID = 1
-        private const val MAX_HISTORY_MESSAGES = 12
         private const val STREAM_TTS_SAMPLE_RATE = 24_000
         private const val INITIAL_STREAM_BUFFER_BYTES = 9_600
         private const val ENABLE_STREAMING_TTS = true
         private const val ENABLE_PLAYBACK_DONE_EARCON = false
-        private const val TTS_OUTPUT_GAIN = 1.0f
+        private const val TTS_OUTPUT_GAIN = 1.2f
         private const val TTS_FADE_MS = 18
         private const val TTS_INTER_SEGMENT_SILENCE_MS = 4
         private const val TTS_FINAL_SILENCE_MS = 90
-        private const val FAST_MAX_TOOL_ROUNDS = 3
-        private const val DEEP_MAX_TOOL_ROUNDS = 4
+        private const val DEEP_MAX_TOOL_ROUNDS = 10
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
         private const val MAX_TOOL_RESULT_CHARS = 12_000
+        private val TECHNICAL_SPEECH_HINTS = listOf(
+            "代码",
+            "源码",
+            "日志",
+            "排查",
+            "诊断",
+            "报错",
+            "故障",
+            "方案",
+            "分析",
+            "修复",
+            "debug",
+            "stack trace",
+        )
 
         const val ACTION_START = "com.agent.voiceassistant.START"
         const val ACTION_STOP = "com.agent.voiceassistant.STOP"
@@ -207,6 +226,7 @@ class VoiceAgentService : Service() {
                 store = store,
                 locationProvider = locationProvider,
                 executionEnv = executionEnv,
+                codeGraph = CodeGraphIndex(this),
             ),
         )
         earcons = EarconPlayer { routeManager }
@@ -359,6 +379,9 @@ class VoiceAgentService : Service() {
                 processTurn(recording)
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: NetworkTimeoutException) {
+                handleConnectionLost("voice", e)
+                break
             } catch (e: Exception) {
                 Timber.e(e, "Voice loop failed")
                 emitLog("本轮失败: ${e.message}")
@@ -376,41 +399,53 @@ class VoiceAgentService : Service() {
             return
         }
 
-        processUserText(userText, source = "voice")
+        val turnNote = if (recording.truncated) {
+            "这段语音已达到 60 秒安全上限，转写内容可能不完整。不要自行补全被截断的语义；必要时请用户继续说。"
+        } else {
+            null
+        }
+        processUserText(userText, source = "voice", turnNote = turnNote)
     }
 
-    private suspend fun processUserText(userText: String, source: String) {
+    private suspend fun processUserText(
+        userText: String,
+        source: String,
+        turnNote: String? = null,
+    ) {
         turnMutex.withLock {
             try {
                 if (handleLocalConversationCommand(userText)) return
                 val client = ensureSpeechClient() ?: return
 
-                store.addMessage("user", userText)
+                val currentUserMessage = store.addMessage("user", userText)
                 EventBus.emitChatMessage(ChatMessage(ChatRole.USER, userText))
+                turnNote?.let {
+                    store.addMessage("system", it)
+                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, it))
+                }
                 emitLog("你($source): $userText")
                 updateNotification("正在回应...")
 
-                val outcome = if (ReasoningPolicy.requestsDeepReasoning(userText)) {
-                    runDeepReasoningTurn(client, reason = "用户明确要求深入思考")
-                } else {
-                    val fastOutcome = runAgentLoop(
-                        client = client,
-                        messages = buildMessages(deepReasoning = false),
-                        thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
-                        maxToolRounds = FAST_MAX_TOOL_ROUNDS,
-                        allowReasoningEscalation = true,
-                    )
-                    when (fastOutcome) {
-                        is AgentLoop.Outcome.Completed -> fastOutcome
-                        is AgentLoop.Outcome.Escalate -> runDeepReasoningTurn(client, fastOutcome.reason)
-                    }
-                }
+                val outcome = runAgentLoop(
+                    client = client,
+                    messages = buildMessages(
+                        userText = userText,
+                        currentUserMessageId = currentUserMessage.id,
+                        source = source,
+                        turnNote = turnNote,
+                    ),
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                    maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
+                    allowReasoningEscalation = true,
+                )
                 if (ENABLE_PLAYBACK_DONE_EARCON && outcome.playedSpeech) {
                     earcons.playbackDone()
                 }
                 updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: NetworkTimeoutException) {
+                handleConnectionLost("agent", e)
             } catch (e: Exception) {
                 Timber.e(e, "processUserText failed")
                 val message = "本轮失败: ${e.message ?: e.javaClass.simpleName}"
@@ -437,48 +472,14 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private suspend fun runDeepReasoningTurn(
-        client: CloudSpeechClient,
-        reason: String,
-    ): AgentLoop.Outcome.Completed = coroutineScope {
-        val status = "开启深度思考"
-        emitToolStatus(status)
-        emitLog("$status: $reason")
-        updateNotification("深入思考中...")
-
-        val acknowledgement = toolRegistry.audibleAcknowledgement(
-            MainToolRegistry.TOOL_REQUEST_DEEP_REASONING,
-        ).orEmpty()
-        val acknowledgementJob = async {
-            if (acknowledgement.isNotBlank()) {
-                speakAssistantText(client, acknowledgement)
-            }
-        }
-        val outcome = runAgentLoop(
-            client = client,
-            messages = buildMessages(deepReasoning = true),
-            thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
-            maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
-            allowReasoningEscalation = false,
-            beforeSpeech = { acknowledgementJob.await() },
-        )
-        acknowledgementJob.await()
-        when (outcome) {
-            is AgentLoop.Outcome.Completed -> outcome.copy(
-                playedSpeech = outcome.playedSpeech || acknowledgement.isNotBlank(),
-            )
-            is AgentLoop.Outcome.Escalate -> error("深度思考模式不能再次升级")
-        }
-    }
-
     private suspend fun runAgentLoop(
         client: CloudSpeechClient,
         messages: List<CloudSpeechClient.LlmMessage>,
-        thinkingMode: CloudSpeechClient.ThinkingMode,
+        initialThinkingMode: CloudSpeechClient.ThinkingMode,
         maxToolRounds: Int,
         allowReasoningEscalation: Boolean,
         beforeSpeech: suspend () -> Unit = {},
-    ): AgentLoop.Outcome {
+    ): AgentLoop.Outcome.Completed {
         val loop = AgentLoop(
             runtime = object : AgentLoop.Runtime {
                 override fun toolDefinitions(allowReasoningEscalation: Boolean) =
@@ -502,6 +503,26 @@ class VoiceAgentService : Service() {
                 override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
                     toolRegistry.reasoningEscalationReason(call)
 
+                override fun reasoningEscalationResult(
+                    call: CloudSpeechClient.ToolCall,
+                ): AgentLoop.ToolExecution {
+                    val reason = toolRegistry.reasoningEscalationReason(call)
+                    emitToolStatus("开启深度思考")
+                    emitLog("开启深度思考: $reason")
+                    updateNotification("深入思考中...")
+                    return AgentLoop.ToolExecution(
+                        message = CloudSpeechClient.LlmMessage(
+                            role = "tool",
+                            content = deepReasoningEnabledResult(),
+                            toolCallId = call.id,
+                        ),
+                        succeeded = true,
+                    )
+                }
+
+                override fun canExecuteToolInParallel(call: CloudSpeechClient.ToolCall): Boolean =
+                    toolRegistry.canExecuteInParallel(call)
+
                 override fun toolDisplayName(toolName: String) = toolRegistry.displayName(toolName)
 
                 override suspend fun executeTool(call: CloudSpeechClient.ToolCall) =
@@ -520,7 +541,7 @@ class VoiceAgentService : Service() {
                     emitLog("助手: $finalText")
                     if (!streamedSpeech) {
                         beforeSpeech()
-                        speakAssistantText(client, finalText)
+                        speakAssistantText(client, optimizeSpokenReply(finalText))
                         return true
                     }
                     return false
@@ -528,21 +549,20 @@ class VoiceAgentService : Service() {
             },
             eventSink = ::onAgentEvent,
         )
-        return agentHarness.run(
+        return when (val outcome = agentHarness.run(
             loop,
             AgentLoop.Config(
                 messages = messages,
-                thinkingMode = thinkingMode,
+                initialThinkingMode = initialThinkingMode,
                 maxToolRounds = maxToolRounds,
                 allowReasoningEscalation = allowReasoningEscalation,
-                maxCompletionTokens = if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
-                    DEEP_MAX_COMPLETION_TOKENS
-                } else {
-                    FAST_MAX_COMPLETION_TOKENS
-                },
+                fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
+                deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
                 beforeSpeech = beforeSpeech,
             ),
-        )
+        )) {
+            is AgentLoop.Outcome.Completed -> outcome
+        }
     }
 
     private fun onAgentEvent(event: AgentEvent) {
@@ -552,14 +572,23 @@ class VoiceAgentService : Service() {
                 "agent.turn.started",
                 "turn=${event.turnId} thinking=${event.thinkingMode}",
             )
+            is AgentEvent.ThinkingModeChanged -> DiagLog.i(
+                "agent.thinking.changed",
+                "turn=${event.turnId} thinking=${event.thinkingMode}",
+            )
             is AgentEvent.ToolStarted -> DiagLog.i(
                 "agent.tool.started",
                 "turn=${event.turnId} id=${event.call.id} name=${event.call.name}",
             )
-            is AgentEvent.ToolFinished -> DiagLog.i(
-                "agent.tool.finished",
-                "turn=${event.turnId} id=${event.call.id} success=${event.success} blocked=${event.blocked}",
-            )
+            is AgentEvent.ToolFinished -> {
+                DiagLog.i(
+                    "agent.tool.finished",
+                    "turn=${event.turnId} id=${event.call.id} success=${event.success} blocked=${event.blocked}",
+                )
+                if (!toolRegistry.isReasoningEscalation(event.call)) {
+                    store.addLlmMessage(event.result)
+                }
+            }
             is AgentEvent.TurnFinished -> DiagLog.i(
                 "agent.turn.finished",
                 "turn=${event.turnId} chars=${event.finalText.length}",
@@ -568,9 +597,19 @@ class VoiceAgentService : Service() {
                 "agent.loop.failed",
                 "turn=${event.turnId} error=${event.error}",
             )
+            is AgentEvent.MessageFinished -> {
+                val persistentCalls = event.message.toolCalls.filterNot(toolRegistry::isReasoningEscalation)
+                if (persistentCalls.isNotEmpty()) {
+                    store.addLlmMessage(
+                        event.message.copy(
+                            reasoningContent = null,
+                            toolCalls = persistentCalls,
+                        ),
+                    )
+                }
+            }
             is AgentEvent.AgentFinished,
             is AgentEvent.ContentDelta,
-            is AgentEvent.MessageFinished,
             is AgentEvent.MessageStarted,
             is AgentEvent.ReasoningDelta,
             is AgentEvent.ToolProgress -> Unit
@@ -581,6 +620,17 @@ class VoiceAgentService : Service() {
         client: CloudSpeechClient,
         call: CloudSpeechClient.ToolCall,
     ): AgentLoop.ToolExecution = coroutineScope {
+        if (call.name == MainToolRegistry.TOOL_PROTOCOL_REPAIR) {
+            emitLog("检测到无效工具协议，要求模型使用原生 tool_calls 重试")
+            return@coroutineScope AgentLoop.ToolExecution(
+                message = CloudSpeechClient.LlmMessage(
+                    role = "tool",
+                    content = "上一次工具调用格式无效。请立即使用 API 提供的原生工具调用重试；不要输出 XML、JSON 或解释文字。",
+                    toolCallId = call.id,
+                ),
+                succeeded = false,
+            )
+        }
         val title = "调用工具：${toolRegistry.displayName(call.name)}"
         emitToolStatus(title)
         emitLog("$title args=${call.arguments.take(300)}")
@@ -630,7 +680,8 @@ class VoiceAgentService : Service() {
         val raw = message.content.orEmpty()
         if (!raw.contains("<LOCAL_ACTION>", ignoreCase = true) &&
             !raw.contains("<HUB_ACTION>", ignoreCase = true) &&
-            !raw.contains("<REPLY>", ignoreCase = true)
+            !raw.contains("<REPLY>", ignoreCase = true) &&
+            !raw.contains("<tool_call>", ignoreCase = true)
         ) {
             return message
         }
@@ -639,6 +690,18 @@ class VoiceAgentService : Service() {
             toolRegistry.normalizeLegacyAction(
                 action = action,
                 callId = "legacy_${UUID.randomUUID()}_$index",
+            )
+        }.filter { toolRegistry.isKnownTool(it.name) }
+        if (raw.contains("<tool_call>", ignoreCase = true) && calls.isEmpty()) {
+            return message.copy(
+                content = "",
+                toolCalls = listOf(
+                    CloudSpeechClient.ToolCall(
+                        id = "repair_${UUID.randomUUID()}",
+                        name = MainToolRegistry.TOOL_PROTOCOL_REPAIR,
+                        arguments = "{}",
+                    ),
+                ),
             )
         }
         emitLog("兼容旧工具协议：${calls.joinToString { it.name }}")
@@ -651,6 +714,7 @@ class VoiceAgentService : Service() {
         beforeSpeech: suspend () -> Unit,
         onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
     ): AgentLoop.ModelTurn = coroutineScope {
+        val allowDirectSpeech = shouldStreamDirectSpeech(request)
         val extractor = StreamingSpeechExtractor()
         val segmenter = SpeechSegmenter()
         val ttsQueue = Channel<String>(Channel.UNLIMITED)
@@ -660,7 +724,18 @@ class VoiceAgentService : Service() {
         var reasoningStarted = false
         var streamedSpeech = false
 
-        Timber.i("Latency LLM request_start thinking=${request.thinkingMode}")
+        val promptChars = request.messages.sumOf { message -> message.content.orEmpty().length }
+        val systemHash = Integer.toHexString(request.messages.firstOrNull()?.content.orEmpty().hashCode())
+        val toolsHash = Integer.toHexString(
+            request.tools.joinToString("|") { tool ->
+                "${tool.name}:${tool.description}:${tool.parameters}"
+            }.hashCode(),
+        )
+        Timber.i(
+            "Latency LLM request_start thinking=${request.thinkingMode} " +
+                "messages=${request.messages.size} promptChars=$promptChars " +
+                "systemHash=$systemHash toolsHash=$toolsHash tools=${request.tools.size}",
+        )
         val playbackJob = launch {
             val playbackSession = StreamingTtsPlaybackSession(client)
             try {
@@ -696,28 +771,32 @@ class VoiceAgentService : Service() {
                             firstDeltaLogged = true
                             Timber.i("Latency LLM first_content elapsed=${System.currentTimeMillis() - startedAt}ms")
                         }
-                        val speechDelta = extractor.feed(event.text)
-                        for (segment in segmenter.feed(speechDelta)) {
-                            if (!firstSegmentLogged) {
-                                firstSegmentLogged = true
-                                Timber.i(
-                                    "Latency speech first_segment elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                                        "chars=${segment.length}",
-                                )
+                        if (allowDirectSpeech) {
+                            val speechDelta = extractor.feed(event.text)
+                            for (segment in segmenter.feed(speechDelta)) {
+                                if (!firstSegmentLogged) {
+                                    firstSegmentLogged = true
+                                    Timber.i(
+                                        "Latency speech first_segment elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                                            "chars=${segment.length}",
+                                    )
+                                }
+                                ttsQueue.send(segment)
                             }
-                            ttsQueue.send(segment)
                         }
                     }
                     is CloudSpeechClient.ChatStreamEvent.ToolCallDelta -> Unit
                     is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
                 }
             }
-            val tail = extractor.finish()
-            for (segment in segmenter.feed(tail)) {
-                ttsQueue.send(segment)
-            }
-            segmenter.flush()?.let { segment ->
-                ttsQueue.send(segment)
+            if (allowDirectSpeech) {
+                val tail = extractor.finish()
+                for (segment in segmenter.feed(tail)) {
+                    ttsQueue.send(segment)
+                }
+                segmenter.flush()?.let { segment ->
+                    ttsQueue.send(segment)
+                }
             }
             Timber.i(
                 "Latency LLM done elapsed=${System.currentTimeMillis() - startedAt}ms " +
@@ -731,27 +810,108 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun buildMessages(deepReasoning: Boolean): List<CloudSpeechClient.LlmMessage> = buildList {
-        val system = buildString {
-            append(buildMainSystemPrompt(deepReasoning))
-            append("\n\n当前时间：")
-            append(
-                ZonedDateTime.now().format(
-                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss EEEE XXX", Locale.CHINA),
-                ),
-            )
-            append("\n\n本地上下文：\n")
-            append(store.contextSummary())
-            append("\n\nAgent 虚拟文件系统：\n")
+    private fun shouldStreamDirectSpeech(request: CloudSpeechClient.ChatRequest): Boolean {
+        if (request.thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) return false
+        if (request.messages.any { it.role == "tool" }) return false
+        val recentText = request.messages
+            .filter { it.role == "user" || it.role == "assistant" }
+            .takeLast(4)
+            .joinToString("\n") { it.content.orEmpty() }
+        val normalized = recentText.lowercase(Locale.ROOT)
+        return TECHNICAL_SPEECH_HINTS.none(normalized::contains)
+    }
+
+    private fun optimizeSpokenReply(displayText: String): String {
+        val startedAt = System.currentTimeMillis()
+        val spoken = SpokenReplyPolicy.fallback(displayText)
+        Timber.i(
+            "Latency speech rewrite_local elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                "displayChars=${displayText.length} speechChars=${spoken.length}",
+        )
+        return spoken
+    }
+
+    private fun buildMessages(
+        userText: String,
+        currentUserMessageId: String,
+        source: String,
+        turnNote: String? = null,
+    ): List<CloudSpeechClient.LlmMessage> = buildList {
+        add(CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()))
+        val runtimeContext = buildString {
+            append("Agent 虚拟文件系统：\n")
             append(executionEnv.virtualRootSummary())
             append("\n\nSkill 索引：\n")
             append(skillRegistry.promptSummary())
             append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
             append(executionEnv.credentialProfileSummary())
-        }
-        add(CloudSpeechClient.LlmMessage("system", system))
-        addAll(store.llmHistory(MAX_HISTORY_MESSAGES))
+            append("\n\n本地上下文：\n")
+            append(store.contextSummary())
+        }.trim()
+        add(CloudSpeechClient.LlmMessage("system", runtimeContext))
+        addAll(store.llmHistory(excludeMessageId = currentUserMessageId))
+        val timestamp = ZonedDateTime.now().format(
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss EEEE XXX", Locale.CHINA),
+        )
+        add(
+            CloudSpeechClient.LlmMessage(
+                role = "user",
+                content = buildCurrentTurnUserContent(
+                    userText = userText,
+                    timestamp = timestamp,
+                    source = when (source) {
+                        "voice" -> "语音"
+                        "text" -> "文字"
+                        else -> source
+                    },
+                    network = currentNetworkLabel(),
+                    recentUserTiming = store.recentUserTimingSummary(),
+                    turnNote = turnNote,
+                ),
+            ),
+        )
     }
+
+    @SuppressLint("MissingPermission")
+    private fun currentNetworkLabel(): String = runCatching {
+        val manager = getSystemService(ConnectivityManager::class.java)
+        val network = manager.activeNetwork ?: return@runCatching "无网络"
+        val capabilities = manager.getNetworkCapabilities(network) ?: return@runCatching "未知"
+        when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WiFi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> cellularNetworkLabel()
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "以太网"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) -> "蓝牙网络"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+            else -> "其他网络"
+        }
+    }.getOrElse { "未知" }
+
+    @SuppressLint("MissingPermission")
+    private fun cellularNetworkLabel(): String = runCatching {
+        val manager = getSystemService(TelephonyManager::class.java)
+        when (manager.dataNetworkType) {
+            TelephonyManager.NETWORK_TYPE_NR -> "5G"
+            TelephonyManager.NETWORK_TYPE_LTE -> "4G"
+            TelephonyManager.NETWORK_TYPE_UMTS,
+            TelephonyManager.NETWORK_TYPE_EVDO_0,
+            TelephonyManager.NETWORK_TYPE_EVDO_A,
+            TelephonyManager.NETWORK_TYPE_HSDPA,
+            TelephonyManager.NETWORK_TYPE_HSUPA,
+            TelephonyManager.NETWORK_TYPE_HSPA,
+            TelephonyManager.NETWORK_TYPE_EVDO_B,
+            TelephonyManager.NETWORK_TYPE_EHRPD,
+            TelephonyManager.NETWORK_TYPE_HSPAP,
+            TelephonyManager.NETWORK_TYPE_TD_SCDMA -> "3G"
+            TelephonyManager.NETWORK_TYPE_GPRS,
+            TelephonyManager.NETWORK_TYPE_EDGE,
+            TelephonyManager.NETWORK_TYPE_CDMA,
+            TelephonyManager.NETWORK_TYPE_1xRTT,
+            TelephonyManager.NETWORK_TYPE_IDEN,
+            TelephonyManager.NETWORK_TYPE_GSM -> "2G"
+            else -> "蜂窝网络"
+        }
+    }.getOrElse { "蜂窝网络" }
 
     private suspend fun speakAssistantText(client: CloudSpeechClient, text: String) {
         val sentenceBuffer = SpeechSegmenter()
@@ -817,15 +977,19 @@ class VoiceAgentService : Service() {
         }
 
         val startedAt = System.currentTimeMillis()
-        val audio = runCatching { client.synthesizeSpeech(sentence) }
-            .onSuccess {
+        val audio = try {
+            client.synthesizeSpeech(sentence).also {
                 Timber.i(
                     "TTS full response bytes=${it.bytes.size} mime=${it.mimeType} " +
                         "elapsed=${System.currentTimeMillis() - startedAt}ms",
                 )
             }
-            .onFailure { Timber.e(it, "TTS failed for: $sentence") }
-            .getOrNull()
+        } catch (error: NetworkTimeoutException) {
+            throw error
+        } catch (error: Exception) {
+            Timber.e(error, "TTS failed for: $sentence")
+            null
+        }
         if (audio != null) {
             playAudio(audio)
         }
@@ -889,11 +1053,15 @@ class VoiceAgentService : Service() {
                     pendingTail = ByteArray(0)
                 }
                 streamed && wroteAudio && audioTrack != null
-            }
-            if (result.isFailure) {
-                Timber.w(result.exceptionOrNull(), "Streaming TTS failed, fallback to full audio")
-                finish()
-                false
+              }
+              if (result.isFailure) {
+                  val error = result.exceptionOrNull()
+                  if (error is CancellationException || error is NetworkTimeoutException) {
+                      throw error
+                  }
+                  Timber.w(result.exceptionOrNull(), "Streaming TTS failed, fallback to full audio")
+                  finish()
+                  false
             } else {
                 result.getOrDefault(false)
             }
@@ -1340,6 +1508,22 @@ class VoiceAgentService : Service() {
         emitState(ServiceState.FAILED)
         emitLog(message)
         updateNotification("启动失败")
+    }
+
+    private suspend fun handleConnectionLost(operation: String, error: NetworkTimeoutException) {
+        val message = "网络连接超时，已停止服务，请检查网络后重试。"
+        Timber.w(error, "Network connection lost during $operation")
+        DiagLog.w(
+            "network.connection_lost",
+            "operation=$operation reason=${error.message}",
+            showInUi = true,
+        )
+        store.addMessage("system", message)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+        emitLog(message)
+        earcons.error()
+        sleepAgent()
+        updateNotification("连接已断开，请检查网络")
     }
 
     private fun emitLog(msg: String) {

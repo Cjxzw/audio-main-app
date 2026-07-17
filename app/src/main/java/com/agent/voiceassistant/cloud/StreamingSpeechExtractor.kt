@@ -66,11 +66,11 @@ class StreamingSpeechExtractor {
         when (tag) {
             "<reply>" -> state = State.REPLY
             "</reply>" -> state = State.TEXT
-            "<local_action>", "<hub_action>" -> {
+            "<local_action>", "<hub_action>", "<tool_call>" -> {
                 toolTail.clear()
                 state = State.TOOL
             }
-            "</local_action>", "</hub_action>" -> state = State.TEXT
+            "</local_action>", "</hub_action>", "</tool_call>" -> state = State.TEXT
             else -> {
                 out.append("<").append(tag.removePrefix("<").removeSuffix(">")).append(">")
                 state = previousState
@@ -84,7 +84,10 @@ class StreamingSpeechExtractor {
             toolTail.delete(0, toolTail.length - TOOL_TAIL_CHARS)
         }
         val tail = toolTail.toString().lowercase()
-        if (tail.endsWith("</local_action>") || tail.endsWith("</hub_action>")) {
+        if (tail.endsWith("</local_action>") ||
+            tail.endsWith("</hub_action>") ||
+            tail.endsWith("</tool_call>")
+        ) {
             toolTail.clear()
             state = State.TEXT
         }

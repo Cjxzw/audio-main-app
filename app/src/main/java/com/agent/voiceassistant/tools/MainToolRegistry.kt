@@ -43,6 +43,8 @@ class MainToolRegistry(
         add(writeFile())
         add(execCommand())
         add(httpRequest())
+        add(codeGraphSearch())
+        add(codeGraphExplain())
         if (allowReasoningEscalation) add(reasoningEscalation())
 
         // Hub tools are added here once the connected profile has a live Hub client.
@@ -62,6 +64,17 @@ class MainToolRegistry(
             ?.take(200)
             ?: "模型判断当前问题需要深入分析"
 
+    fun canExecuteInParallel(call: CloudSpeechClient.ToolCall): Boolean = when (call.name) {
+        TOOL_HTTP_REQUEST -> {
+            val method = (parseArguments(call.arguments)["method"] as? JsonPrimitive)
+                ?.content
+                ?.uppercase()
+                ?: "GET"
+            method == "GET" || method == "HEAD"
+        }
+        else -> call.name in PARALLEL_SAFE_TOOL_NAMES
+    }
+
     suspend fun execute(call: CloudSpeechClient.ToolCall): Execution {
         val payload = parseArguments(call.arguments)
         val legacyAction = when (call.name) {
@@ -74,6 +87,8 @@ class MainToolRegistry(
             TOOL_WRITE -> "write"
             TOOL_EXEC -> "exec"
             TOOL_HTTP_REQUEST -> "http_request"
+            TOOL_CODE_GRAPH_SEARCH -> "code.graph.search"
+            TOOL_CODE_GRAPH_EXPLAIN -> "code.graph.explain"
             else -> call.name
         }
         val action = AgentAction(
@@ -95,6 +110,8 @@ class MainToolRegistry(
             "write" -> TOOL_WRITE
             "exec", "shell", "bash" -> TOOL_EXEC
             "http.request", "http_request" -> TOOL_HTTP_REQUEST
+            "code.graph.search", "code_graph_search" -> TOOL_CODE_GRAPH_SEARCH
+            "code.graph.explain", "code_graph_explain" -> TOOL_CODE_GRAPH_EXPLAIN
             else -> action.actionType.replace('.', '_')
         }
         return CloudSpeechClient.ToolCall(
@@ -103,6 +120,8 @@ class MainToolRegistry(
             arguments = action.payload.toString(),
         )
     }
+
+    fun isKnownTool(toolName: String): Boolean = toolName in KNOWN_TOOL_NAMES
 
     fun displayName(toolName: String): String = when (toolName) {
         TOOL_MEMORY_CREATE -> "写入记忆"
@@ -114,7 +133,10 @@ class MainToolRegistry(
         TOOL_WRITE -> "写入文件"
         TOOL_EXEC -> "执行命令"
         TOOL_HTTP_REQUEST -> "发送网络请求"
+        TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
+        TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
         TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
+        TOOL_PROTOCOL_REPAIR -> "修正工具调用格式"
         else -> toolName
     }
 
@@ -199,7 +221,7 @@ class MainToolRegistry(
 
     private fun reasoningEscalation() = tool(
         name = TOOL_REQUEST_DEEP_REASONING,
-        description = "仅当当前用户问题确实需要多步分析、方案权衡或头脑风暴时，为本回合申请一次深度思考。简单问答和普通工具调用不得使用。",
+        description = "为当前用户回合申请一次深度思考。适用于多步分析、方案权衡、复杂排障、头脑风暴，或需要明显提高回答质量的情况；简单问答不得使用。可以与参数互不依赖的其他工具在同一批次调用。",
         required = listOf("reason"),
     ) {
         putJsonObject("reason") {
@@ -303,6 +325,33 @@ class MainToolRegistry(
         }
     }
 
+    private fun codeGraphSearch() = tool(
+        name = TOOL_CODE_GRAPH_SEARCH,
+        description = "查询随 APK 分发的 Graphify 代码图谱，用于定位源码符号、文件关系和调用线索。图谱只用于导航，最终结论必须核对源码或日志。",
+        required = listOf("query"),
+    ) {
+        putJsonObject("query") {
+            put("type", "string")
+            put("description", "代码问题、类名、方法名或功能关键词")
+        }
+        putJsonObject("limit") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("maximum", 12)
+        }
+    }
+
+    private fun codeGraphExplain() = tool(
+        name = TOOL_CODE_GRAPH_EXPLAIN,
+        description = "解释某个源码符号在 Graphify 图谱中的位置和关联节点；解释后仍需读取精确源码。",
+        required = listOf("symbol"),
+    ) {
+        putJsonObject("symbol") {
+            put("type", "string")
+            put("description", "类名、对象名、函数名或文件名")
+        }
+    }
+
     private fun tool(
         name: String,
         description: String,
@@ -331,6 +380,32 @@ class MainToolRegistry(
         const val TOOL_WRITE = "write"
         const val TOOL_EXEC = "exec"
         const val TOOL_HTTP_REQUEST = "http_request"
+        const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
+        const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
+        const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
+
+        private val KNOWN_TOOL_NAMES = setOf(
+            TOOL_MEMORY_CREATE,
+            TOOL_MEMORY_SEARCH,
+            TOOL_LOCATION_REFRESH,
+            TOOL_WEATHER_CURRENT,
+            TOOL_WEB_SEARCH,
+            TOOL_READ,
+            TOOL_WRITE,
+            TOOL_EXEC,
+            TOOL_HTTP_REQUEST,
+            TOOL_CODE_GRAPH_SEARCH,
+            TOOL_CODE_GRAPH_EXPLAIN,
+            TOOL_REQUEST_DEEP_REASONING,
+        )
+
+        private val PARALLEL_SAFE_TOOL_NAMES = setOf(
+            TOOL_MEMORY_SEARCH,
+            TOOL_WEB_SEARCH,
+            TOOL_READ,
+            TOOL_CODE_GRAPH_SEARCH,
+            TOOL_CODE_GRAPH_EXPLAIN,
+        )
     }
 }

@@ -3,6 +3,11 @@ package com.agent.voiceassistant.cloud
 import android.util.Base64
 import com.agent.voiceassistant.agent.LLMConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -27,7 +32,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import timber.log.Timber
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 class CloudSpeechClient(
     private val config: LLMConfig,
@@ -88,9 +95,9 @@ class CloudSpeechClient(
         isLenient = true
     }
     private val client = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(config.timeoutSeconds, TimeUnit.SECONDS)
-        .writeTimeout(config.timeoutSeconds, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
         .callTimeout(0, TimeUnit.SECONDS)
         .build()
 
@@ -117,7 +124,7 @@ class CloudSpeechClient(
             }
         }
 
-        val body = executeJson(payload)
+        val body = executeJsonWithRetry(payload, "ASR")
         val element = parseJsonOrNull(body)
         val text = element?.let { extractAsrText(it) } ?: body.trim()
         Timber.i("Cloud ASR: '$text'")
@@ -127,35 +134,90 @@ class CloudSpeechClient(
     suspend fun streamChat(
         request: ChatRequest,
         onEvent: suspend (ChatStreamEvent) -> Unit,
-    ): ChatCompletion = withContext(Dispatchers.IO) {
-        val payload = buildChatPayload(request)
-        val accumulator = ChatStreamAccumulator()
-
-        newJsonRequest(payload).execute().use { response ->
-            val responseBody = response.body ?: throw IOException("LLM response body is empty")
-            if (!response.isSuccessful) {
-                throw IOException("LLM HTTP ${response.code}: ${responseBody.string().take(500)}")
-            }
-            val contentType = responseBody.contentType()?.toString().orEmpty()
-            if (!contentType.contains("text/event-stream", ignoreCase = true)) {
-                val text = responseBody.string()
-                val element = parseJsonOrNull(text)
-                    ?: throw IOException("LLM returned invalid JSON: ${text.take(200)}")
-                for (event in accumulator.accept(element)) onEvent(event)
-                return@withContext accumulator.complete()
-            }
-
-            val source = responseBody.source()
-            while (true) {
-                val line = source.readUtf8Line() ?: break
-                if (!line.startsWith("data:")) continue
-                val data = line.removePrefix("data:").trim()
-                if (data == "[DONE]") break
-                val element = parseJsonOrNull(data) ?: continue
-                for (event in accumulator.accept(element)) onEvent(event)
+    ): ChatCompletion {
+        var firstTimeout: FirstEventTimeoutException? = null
+        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
+            try {
+                return streamChatOnce(request, onEvent)
+            } catch (error: FirstEventTimeoutException) {
+                firstTimeout = error
+                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
+                    Timber.w("LLM first event timeout; retrying chat request")
+                }
             }
         }
-        accumulator.complete()
+        throw firstTimeout ?: IOException("LLM request failed before receiving an event")
+    }
+
+    private suspend fun streamChatOnce(
+        request: ChatRequest,
+        onEvent: suspend (ChatStreamEvent) -> Unit,
+    ): ChatCompletion = coroutineScope {
+        val payload = buildChatPayload(request)
+        val accumulator = ChatStreamAccumulator()
+        val call = newJsonRequest(payload).also {
+            it.timeout().timeout(config.timeoutSeconds, TimeUnit.SECONDS)
+        }
+        val receivedEvent = AtomicBoolean(false)
+        val firstEventTimedOut = AtomicBoolean(false)
+        val cancellation = coroutineContext[Job]?.invokeOnCompletion {
+            call.cancel()
+        }
+        val firstEventWatchdog = launch(Dispatchers.IO) {
+            delay(FIRST_EVENT_TIMEOUT_MS)
+            if (!receivedEvent.get()) {
+                firstEventTimedOut.set(true)
+                call.cancel()
+            }
+        }
+
+        try {
+            withContext(Dispatchers.IO) {
+                call.execute().use { response ->
+                    val responseBody = response.body ?: throw IOException("LLM response body is empty")
+                    if (!response.isSuccessful) {
+                        throw IOException("LLM HTTP ${response.code}: ${responseBody.string().take(500)}")
+                    }
+                    val contentType = responseBody.contentType()?.toString().orEmpty()
+                    if (!contentType.contains("text/event-stream", ignoreCase = true)) {
+                        val text = responseBody.string()
+                        val element = parseJsonOrNull(text)
+                            ?: throw IOException("LLM returned invalid JSON: ${text.take(200)}")
+                        val events = accumulator.accept(element)
+                        if (events.isNotEmpty()) {
+                            receivedEvent.set(true)
+                            firstEventWatchdog.cancel()
+                        }
+                        for (event in events) onEvent(event)
+                        return@withContext
+                    }
+
+                    val source = responseBody.source()
+                    while (true) {
+                        val line = source.readUtf8Line() ?: break
+                        if (!line.startsWith("data:")) continue
+                        val data = line.removePrefix("data:").trim()
+                        if (data == "[DONE]") break
+                        val element = parseJsonOrNull(data) ?: continue
+                        val events = accumulator.accept(element)
+                        if (events.isNotEmpty()) {
+                            receivedEvent.set(true)
+                            firstEventWatchdog.cancel()
+                        }
+                        for (event in events) onEvent(event)
+                    }
+                }
+            }
+            accumulator.complete()
+        } catch (error: IOException) {
+            if (firstEventTimedOut.get() && !receivedEvent.get()) {
+                throw FirstEventTimeoutException(error)
+            }
+            throw error
+        } finally {
+            firstEventWatchdog.cancelAndJoin()
+            cancellation?.dispose()
+        }
     }
 
     internal fun buildChatPayload(request: ChatRequest): JsonObject = buildJsonObject {
@@ -214,45 +276,101 @@ class CloudSpeechClient(
     }
 
     suspend fun synthesizeSpeech(text: String): AudioPayload = withContext(Dispatchers.IO) {
-        val full = requestTts(text, stream = false)
-        if (full.bytes.isEmpty()) error("Cloud TTS returned empty audio")
-        full
+        var lastTimeout: IOException? = null
+        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
+            try {
+                val full = requestTts(text, stream = false)
+                if (full.bytes.isEmpty()) throw IOException("Cloud TTS returned empty audio")
+                return@withContext full
+            } catch (error: IOException) {
+                if (!isTimeout(error)) throw error
+                lastTimeout = error
+                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
+                    Timber.w("TTS timeout; retrying request")
+                }
+            }
+        }
+        throw NetworkTimeoutException("TTS", lastTimeout)
     }
 
     suspend fun streamSynthesizeSpeech(
         text: String,
         onAudioChunk: suspend (AudioPayload) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
-        val payload = buildTtsPayload(text, stream = true)
-        newJsonRequest(payload).execute().use { response ->
-            val body = response.body ?: throw IOException("TTS response body is empty")
-            if (!response.isSuccessful) {
-                throw IOException("TTS HTTP ${response.code}: ${body.string().take(500)}")
+        var lastTimeout: FirstAudioTimeoutException? = null
+        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
+            try {
+                return@withContext streamSynthesizeSpeechOnce(text, onAudioChunk)
+            } catch (error: FirstAudioTimeoutException) {
+                lastTimeout = error
+                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
+                    Timber.w("TTS first audio timeout; retrying request")
+                }
             }
-            val contentType = body.contentType()?.toString().orEmpty()
-            if (!contentType.contains("text/event-stream", ignoreCase = true)) {
-                return@withContext false
-            }
+        }
+        throw lastTimeout ?: NetworkTimeoutException("TTS")
+    }
 
-            var chunks = 0
-            val source = body.source()
-            while (true) {
-                val line = source.readUtf8Line() ?: break
-                if (!line.startsWith("data:")) continue
-                val data = line.removePrefix("data:").trim()
-                if (data == "[DONE]") break
-                val parsed = parseJsonOrNull(data)
-                val audio = if (parsed != null) {
-                    extractAudioPayload(parsed)
-                } else {
-                    decodeAudioString(data, "data")
-                }
-                if (audio?.bytes?.isNotEmpty() == true) {
-                    chunks++
-                    onAudioChunk(audio)
-                }
+    private suspend fun streamSynthesizeSpeechOnce(
+        text: String,
+        onAudioChunk: suspend (AudioPayload) -> Unit,
+    ): Boolean = coroutineScope {
+        val payload = buildTtsPayload(text, stream = true)
+        val call = newJsonRequest(payload)
+        val receivedAudio = AtomicBoolean(false)
+        val firstAudioTimedOut = AtomicBoolean(false)
+        val cancellation = coroutineContext[Job]?.invokeOnCompletion {
+            call.cancel()
+        }
+        val firstAudioWatchdog = launch(Dispatchers.IO) {
+            delay(FIRST_AUDIO_TIMEOUT_MS)
+            if (!receivedAudio.get()) {
+                firstAudioTimedOut.set(true)
+                call.cancel()
             }
-            chunks > 0
+        }
+
+        try {
+            call.execute().use { response ->
+                val body = response.body ?: throw IOException("TTS response body is empty")
+                if (!response.isSuccessful) {
+                    throw IOException("TTS HTTP ${response.code}: ${body.string().take(500)}")
+                }
+                val contentType = body.contentType()?.toString().orEmpty()
+                if (!contentType.contains("text/event-stream", ignoreCase = true)) {
+                    return@coroutineScope false
+                }
+
+                var chunks = 0
+                val source = body.source()
+                while (true) {
+                    val line = source.readUtf8Line() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val data = line.removePrefix("data:").trim()
+                    if (data == "[DONE]") break
+                    val parsed = parseJsonOrNull(data)
+                    val audio = if (parsed != null) {
+                        extractAudioPayload(parsed)
+                    } else {
+                        decodeAudioString(data, "data")
+                    }
+                    if (audio?.bytes?.isNotEmpty() == true) {
+                        chunks++
+                        receivedAudio.set(true)
+                        firstAudioWatchdog.cancel()
+                        onAudioChunk(audio)
+                    }
+                }
+                chunks > 0
+            }
+        } catch (error: IOException) {
+            if (firstAudioTimedOut.get() && !receivedAudio.get()) {
+                throw FirstAudioTimeoutException(error)
+            }
+            throw error
+        } finally {
+            firstAudioWatchdog.cancelAndJoin()
+            cancellation?.dispose()
         }
     }
 
@@ -264,7 +382,7 @@ class CloudSpeechClient(
     private fun requestTts(text: String, stream: Boolean): AudioPayload {
         val payload = buildTtsPayload(text, stream)
 
-        newJsonRequest(payload).execute().use { response ->
+        newJsonRequest(payload, REQUEST_TIMEOUT_SECONDS).execute().use { response ->
             val body = response.body ?: throw IOException("TTS response body is empty")
             if (!response.isSuccessful) {
                 throw IOException("TTS HTTP ${response.code}: ${body.string().take(500)}")
@@ -303,7 +421,7 @@ class CloudSpeechClient(
     }
 
     private fun executeJson(payload: JsonObject): String {
-        newJsonRequest(payload).execute().use { response ->
+        newJsonRequest(payload, REQUEST_TIMEOUT_SECONDS).execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 throw IOException("HTTP ${response.code}: ${body.take(500)}")
@@ -312,7 +430,23 @@ class CloudSpeechClient(
         }
     }
 
-    private fun newJsonRequest(payload: JsonObject): okhttp3.Call {
+    private fun executeJsonWithRetry(payload: JsonObject, operation: String): String {
+        var lastTimeout: IOException? = null
+        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
+            try {
+                return executeJson(payload)
+            } catch (error: IOException) {
+                if (!isTimeout(error)) throw error
+                lastTimeout = error
+                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
+                    Timber.w("$operation timeout; retrying request")
+                }
+            }
+        }
+        throw NetworkTimeoutException(operation, lastTimeout)
+    }
+
+    private fun newJsonRequest(payload: JsonObject, callTimeoutSeconds: Long? = null): okhttp3.Call {
         val request = Request.Builder()
             .url("${config.baseUrl.trimEnd('/')}/chat/completions")
             .addHeader("Content-Type", JSON_MEDIA_TYPE.toString())
@@ -320,7 +454,9 @@ class CloudSpeechClient(
             .addHeader("Authorization", "Bearer ${config.apiKey}")
             .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        return client.newCall(request)
+        return client.newCall(request).also { call ->
+            callTimeoutSeconds?.let { call.timeout().timeout(it, TimeUnit.SECONDS) }
+        }
     }
 
     private fun readTtsEventStream(sseText: String, contentType: String?): AudioPayload {
@@ -439,11 +575,22 @@ class CloudSpeechClient(
             .addHeader("api-key", config.apiKey)
             .addHeader("Authorization", "Bearer ${config.apiKey}")
             .build()
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return null
-            val body = response.body ?: return null
-            return AudioPayload(body.bytes(), body.contentType()?.toString())
+        var lastTimeout: IOException? = null
+        repeat(MAX_NETWORK_ATTEMPTS) {
+            try {
+                client.newCall(request).also {
+                    it.timeout().timeout(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                }.execute().use { response ->
+                    if (!response.isSuccessful) return null
+                    val body = response.body ?: return null
+                    return AudioPayload(body.bytes(), body.contentType()?.toString())
+                }
+            } catch (error: IOException) {
+                if (!isTimeout(error)) throw error
+                lastTimeout = error
+            }
         }
+        throw NetworkTimeoutException("TTS audio download", lastTimeout)
     }
 
     private fun findStringByKeys(element: JsonElement, keys: Set<String>): String? {
@@ -501,8 +648,27 @@ class CloudSpeechClient(
 
     private companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val FIRST_EVENT_TIMEOUT_MS = 5_000L
+        private const val FIRST_AUDIO_TIMEOUT_MS = 5_000L
+        private const val REQUEST_TIMEOUT_SECONDS = 5L
+        private const val MAX_NETWORK_ATTEMPTS = 2
+
+        private fun isTimeout(error: IOException): Boolean =
+            error is java.io.InterruptedIOException ||
+                error.message?.contains("timeout", ignoreCase = true) == true
     }
 }
+
+internal open class NetworkTimeoutException(
+    operation: String,
+    cause: Throwable? = null,
+) : IOException("$operation did not return within 5 seconds", cause)
+
+internal class FirstEventTimeoutException(cause: Throwable) :
+    NetworkTimeoutException("LLM first event", cause)
+
+private class FirstAudioTimeoutException(cause: Throwable) :
+    NetworkTimeoutException("TTS first audio", cause)
 
 internal class ChatStreamAccumulator {
     private data class PendingToolCall(

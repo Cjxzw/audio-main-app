@@ -1,6 +1,9 @@
 package com.agent.voiceassistant.agent.runtime
 
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.util.UUID
 
 class AgentLoop(
@@ -9,9 +12,10 @@ class AgentLoop(
 ) {
     data class Config(
         val messages: List<CloudSpeechClient.LlmMessage>,
-        val thinkingMode: CloudSpeechClient.ThinkingMode,
+        val initialThinkingMode: CloudSpeechClient.ThinkingMode,
         val maxToolRounds: Int,
-        val maxCompletionTokens: Int,
+        val fastMaxCompletionTokens: Int,
+        val deepMaxCompletionTokens: Int,
         val allowReasoningEscalation: Boolean,
         val beforeSpeech: suspend () -> Unit = {},
     )
@@ -31,8 +35,6 @@ class AgentLoop(
             val finalText: String,
             val playedSpeech: Boolean,
         ) : Outcome
-
-        data class Escalate(val reason: String) : Outcome
     }
 
     interface Runtime {
@@ -47,6 +49,8 @@ class AgentLoop(
         fun normalizeAssistant(message: CloudSpeechClient.LlmMessage): CloudSpeechClient.LlmMessage
         fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean
         fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall): String
+        fun reasoningEscalationResult(call: CloudSpeechClient.ToolCall): ToolExecution
+        fun canExecuteToolInParallel(call: CloudSpeechClient.ToolCall): Boolean
         fun toolDisplayName(toolName: String): String
         suspend fun executeTool(call: CloudSpeechClient.ToolCall): ToolExecution
         fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String): CloudSpeechClient.LlmMessage
@@ -61,9 +65,11 @@ class AgentLoop(
         var playedSpeech = false
         var modelCall = 0
         var consecutiveToolFailures = 0
+        var thinkingMode = config.initialThinkingMode
+        var reasoningEscalated = thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED
 
         eventSink(AgentEvent.AgentStarted(turnId))
-        eventSink(AgentEvent.TurnStarted(turnId, config.thinkingMode))
+        eventSink(AgentEvent.TurnStarted(turnId, thinkingMode))
         try {
             suspend fun requestModel(
                 tools: List<CloudSpeechClient.ToolDefinition>,
@@ -73,8 +79,12 @@ class AgentLoop(
                 val request = CloudSpeechClient.ChatRequest(
                     messages = workingMessages,
                     tools = tools,
-                    thinkingMode = config.thinkingMode,
-                    maxCompletionTokens = config.maxCompletionTokens,
+                    thinkingMode = thinkingMode,
+                    maxCompletionTokens = if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
+                        config.deepMaxCompletionTokens
+                    } else {
+                        config.fastMaxCompletionTokens
+                    },
                 )
                 val streamed = runtime.modelTurn(request, config.beforeSpeech) { streamEvent ->
                     when (streamEvent) {
@@ -125,17 +135,22 @@ class AgentLoop(
 
             repeat(config.maxToolRounds) { toolRound ->
                 val tools = runtime.toolDefinitions(
-                    config.allowReasoningEscalation && toolRound == 0,
+                    config.allowReasoningEscalation && !reasoningEscalated && toolRound == 0,
                 )
                 val (streamed, assistant) = requestModel(tools)
 
-                val escalation = assistant.toolCalls.firstOrNull(runtime::isReasoningEscalation)
+                val escalationCalls = assistant.toolCalls.filter(runtime::isReasoningEscalation)
+                if (escalationCalls.size > 1) {
+                    error("一个用户回合只能申请一次深度思考")
+                }
+                val escalation = escalationCalls.singleOrNull()
                 if (escalation != null) {
-                    if (!config.allowReasoningEscalation || toolRound != 0) {
+                    if (!config.allowReasoningEscalation || reasoningEscalated || toolRound != 0) {
                         error("本回合深度思考升级请求无效")
                     }
-                    eventSink(AgentEvent.AgentFinished(turnId))
-                    return Outcome.Escalate(runtime.reasoningEscalationReason(escalation))
+                    reasoningEscalated = true
+                    thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED
+                    eventSink(AgentEvent.ThinkingModeChanged(turnId, thinkingMode))
                 }
 
                 if (assistant.toolCalls.isEmpty()) {
@@ -149,7 +164,12 @@ class AgentLoop(
                 val repeatedBatch = batchSignature == previousToolBatchSignature
                 previousToolBatchSignature = batchSignature
 
-                for (call in assistant.toolCalls) {
+                data class PendingTool(
+                    val call: CloudSpeechClient.ToolCall,
+                    val blockedReason: String?,
+                )
+
+                val pendingTools = assistant.toolCalls.map { call ->
                     eventSink(AgentEvent.ToolStarted(turnId, call, runtime.toolDisplayName(call.name)))
                     val blockedReason = when {
                         !completedToolCallIds.add(call.id) ->
@@ -158,11 +178,37 @@ class AgentLoop(
                             "检测到连续重复工具调用，调用已停止。请改变参数或直接总结已有结果。"
                         else -> null
                     }
-                    val execution = if (blockedReason == null) {
-                        runtime.executeTool(call)
-                    } else {
-                        ToolExecution(runtime.blockedTool(call, blockedReason), succeeded = false)
+                    PendingTool(call, blockedReason)
+                }
+
+                suspend fun execute(pending: PendingTool): ToolExecution {
+                    val call = pending.call
+                    return when {
+                        pending.blockedReason != null ->
+                            ToolExecution(runtime.blockedTool(call, pending.blockedReason), succeeded = false)
+                        runtime.isReasoningEscalation(call) ->
+                            runtime.reasoningEscalationResult(call)
+                        else -> runtime.executeTool(call)
                     }
+                }
+
+                val parallelTools = pendingTools.filter { pending ->
+                    pending.blockedReason == null &&
+                        !runtime.isReasoningEscalation(pending.call) &&
+                        runtime.canExecuteToolInParallel(pending.call)
+                }
+                val parallelResults = coroutineScope {
+                    parallelTools.map { pending ->
+                        async { pending.call.id to execute(pending) }
+                    }.awaitAll().toMap()
+                }
+                val executions = pendingTools.map { pending ->
+                    val execution = parallelResults[pending.call.id] ?: execute(pending)
+                    pending to execution
+                }
+
+                for ((pending, execution) in executions) {
+                    val call = pending.call
                     consecutiveToolFailures = if (execution.succeeded) 0 else consecutiveToolFailures + 1
                     eventSink(
                         AgentEvent.ToolFinished(
@@ -170,7 +216,7 @@ class AgentLoop(
                             call = call,
                             result = execution.message,
                             success = execution.succeeded,
-                            blocked = blockedReason != null,
+                            blocked = pending.blockedReason != null,
                         ),
                     )
                     workingMessages += execution.message
@@ -192,6 +238,6 @@ class AgentLoop(
     }
 
     private companion object {
-        private const val MAX_CONSECUTIVE_TOOL_FAILURES = 2
+        private const val MAX_CONSECUTIVE_TOOL_FAILURES = 3
     }
 }

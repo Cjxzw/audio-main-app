@@ -2,6 +2,7 @@ package com.agent.voiceassistant.tools
 
 import android.content.Context
 import android.util.Base64
+import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -14,6 +15,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
@@ -26,9 +28,10 @@ class AndroidExecutionEnv(
     context: Context,
     private val credentialStore: CredentialProfileStore = CredentialProfileStore(context),
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(5, TimeUnit.SECONDS)
         .build(),
 ) {
     data class ReadResult(
@@ -204,18 +207,27 @@ class AndroidExecutionEnv(
         credentialProfile?.takeIf(String::isNotBlank)?.let { profile ->
             credentialStore.headers(profile).forEach(builder::addHeader)
         }
-        httpClient.newCall(builder.build()).execute().use { response ->
-            val responseBody = response.body
-            val bounded = responseBody?.source()?.let {
-                BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
-            } ?: BoundedSourceReader.Result(ByteArray(0), truncated = false)
-            HttpResult(
-                status = response.code,
-                contentType = responseBody?.contentType()?.toString(),
-                body = bounded.bytes.toString(Charsets.UTF_8),
-                truncated = bounded.truncated,
-            )
+        val request = builder.build()
+        var lastTimeout: IOException? = null
+        repeat(MAX_HTTP_ATTEMPTS) {
+            try {
+                httpClient.newCall(request).execute().use { response ->
+                    val responseBody = response.body
+                    val bounded = responseBody?.source()?.let {
+                        BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
+                    } ?: BoundedSourceReader.Result(ByteArray(0), truncated = false)
+                    return@withContext HttpResult(
+                        status = response.code,
+                        contentType = responseBody?.contentType()?.toString(),
+                        body = bounded.bytes.toString(Charsets.UTF_8),
+                        truncated = bounded.truncated,
+                    )
+                }
+            } catch (error: InterruptedIOException) {
+                lastTimeout = error
+            }
         }
+        throw NetworkTimeoutException("HTTP request", lastTimeout)
     }
 
     fun virtualRootSummary(): String = buildString {
@@ -371,6 +383,7 @@ class AndroidExecutionEnv(
         private const val MAX_COMMAND_CHARS = 8_000
         private const val MAX_EXEC_OUTPUT_CHARS = 40_000
         private const val MAX_HTTP_BODY_BYTES = 512 * 1024
+        private const val MAX_HTTP_ATTEMPTS = 2
         private val HTTP_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
     }
 }

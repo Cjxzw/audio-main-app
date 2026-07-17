@@ -30,15 +30,28 @@ class ConversationStore(context: Context) {
 
     fun recentChatMessages(limit: Int = 100): List<ChatMessage> = synchronized(lock) {
         currentSessionLocked().messages
+            .filter { it.chatVisible != false }
             .takeLast(limit)
             .map { it.toChatMessage() }
     }
 
-    fun llmHistory(limit: Int = 12): List<CloudSpeechClient.LlmMessage> = synchronized(lock) {
+    fun llmHistory(excludeMessageId: String? = null): List<CloudSpeechClient.LlmMessage> = synchronized(lock) {
         currentSessionLocked().messages
-            .filter { it.role == "user" || it.role == "assistant" }
-            .takeLast(limit)
-            .map { CloudSpeechClient.LlmMessage(role = it.role, content = it.content) }
+            .filter { message ->
+                message.llmVisible ?: (message.role == "user" || message.role == "assistant")
+            }
+            .filter { it.role == "user" || it.role == "assistant" || it.role == "tool" }
+            .filterNot { it.id == excludeMessageId }
+            .map { message ->
+                CloudSpeechClient.LlmMessage(
+                    role = message.role,
+                    content = message.content,
+                    toolCalls = message.toolCalls.map { call ->
+                        CloudSpeechClient.ToolCall(call.id, call.name, call.arguments)
+                    },
+                    toolCallId = message.toolCallId,
+                )
+            }
     }
 
     fun addMessage(role: String, content: String, timestamp: Long = System.currentTimeMillis()): StoredMessage {
@@ -59,10 +72,40 @@ class ConversationStore(context: Context) {
             if (normalizedRole == "user" && session.title.isBlank()) {
                 session.title = content.take(24)
             }
-            trimMessages(session)
+            session.updatedAt = System.currentTimeMillis()
             persistLocked()
         }
         return message
+    }
+
+    fun addLlmMessage(
+        message: CloudSpeechClient.LlmMessage,
+        timestamp: Long = System.currentTimeMillis(),
+        chatVisible: Boolean = false,
+    ): StoredMessage {
+        val normalizedRole = when (message.role) {
+            "assistant", "tool", "user" -> message.role
+            else -> "system"
+        }
+        val stored = StoredMessage(
+            id = UUID.randomUUID().toString(),
+            role = normalizedRole,
+            content = message.content.orEmpty(),
+            timestamp = timestamp,
+            toolCalls = message.toolCalls.map { call ->
+                StoredToolCall(call.id, call.name, call.arguments)
+            },
+            toolCallId = message.toolCallId,
+            llmVisible = true,
+            chatVisible = chatVisible,
+        )
+        synchronized(lock) {
+            val session = currentSessionLocked()
+            session.messages.add(stored)
+            session.updatedAt = System.currentTimeMillis()
+            persistLocked()
+        }
+        return stored
     }
 
     fun startNewConversation(reason: String = "用户开启新话题"): ConversationSession {
@@ -75,7 +118,6 @@ class ConversationStore(context: Context) {
         synchronized(lock) {
             state.currentConversationId = session.id
             state.sessions.add(session)
-            trimSessionsLocked()
             persistLocked()
         }
         Timber.i("ConversationStore: new session ${session.id}, reason=$reason")
@@ -141,6 +183,18 @@ class ConversationStore(context: Context) {
         }.trim()
     }
 
+    fun recentUserTimingSummary(limit: Int = 4, now: Long = System.currentTimeMillis()): String =
+        synchronized(lock) {
+            val users = currentSessionLocked().messages
+                .filter { it.role == "user" }
+                .takeLast(limit)
+            if (users.isEmpty()) return@synchronized "暂无上一轮用户输入"
+            users.joinToString(separator = "\n") { message ->
+                val elapsedSeconds = ((now - message.timestamp).coerceAtLeast(0L) / 1000L)
+                "- ${elapsedSeconds} 秒前收到一轮用户输入"
+            }
+        }
+
     private fun loadState(): StoreState {
         if (!file.exists()) {
             val initial = StoreState()
@@ -168,19 +222,6 @@ class ConversationStore(context: Context) {
         return session
     }
 
-    private fun trimMessages(session: ConversationSession) {
-        session.updatedAt = System.currentTimeMillis()
-        while (session.messages.size > MAX_MESSAGES_PER_SESSION) {
-            session.messages.removeAt(0)
-        }
-    }
-
-    private fun trimSessionsLocked() {
-        while (state.sessions.size > MAX_SESSIONS) {
-            state.sessions.removeAt(0)
-        }
-    }
-
     private fun trimMemoriesLocked() {
         while (state.memories.size > MAX_MEMORIES) {
             state.memories.removeAt(0)
@@ -205,8 +246,6 @@ class ConversationStore(context: Context) {
     }
 
     private companion object {
-        private const val MAX_MESSAGES_PER_SESSION = 300
-        private const val MAX_SESSIONS = 20
         private const val MAX_MEMORIES = 500
     }
 }
@@ -234,6 +273,17 @@ data class StoredMessage(
     val role: String,
     val content: String,
     val timestamp: Long,
+    val toolCalls: List<StoredToolCall> = emptyList(),
+    val toolCallId: String? = null,
+    val llmVisible: Boolean? = null,
+    val chatVisible: Boolean? = null,
+)
+
+@Serializable
+data class StoredToolCall(
+    val id: String,
+    val name: String,
+    val arguments: String,
 )
 
 @Serializable

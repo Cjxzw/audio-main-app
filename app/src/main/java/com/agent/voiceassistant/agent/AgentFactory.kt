@@ -56,7 +56,7 @@ class AgentFactory(
             .chatLanguageModel(chatModel)
             .chatMemory(chatMemory)
             .tools(agentTools)
-            .systemMessageProvider { buildMainSystemPrompt(deepReasoning = false) }
+            .systemMessageProvider { buildMainSystemPrompt() }
             .build()
 
         assistant = instance

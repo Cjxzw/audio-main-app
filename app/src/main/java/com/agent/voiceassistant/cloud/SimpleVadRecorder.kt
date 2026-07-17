@@ -25,6 +25,7 @@ class SimpleVadRecorder(
     data class Recording(
         val wavBytes: ByteArray,
         val durationMs: Long,
+        val truncated: Boolean = false,
     )
 
     private val stopped = AtomicBoolean(false)
@@ -135,7 +136,7 @@ class SimpleVadRecorder(
                 }
                 if (capturedMs >= MAX_UTTERANCE_MS) {
                     Timber.i("CloudRecorder: max utterance reached (${capturedMs}ms)")
-                    buildRecording(frames)?.let { return@withContext it }
+                    buildRecording(frames, truncated = true)?.let { return@withContext it }
                     frames.clear()
                     preRoll.clear()
                     speechStarted = false
@@ -160,7 +161,7 @@ class SimpleVadRecorder(
         }
     }
 
-    private fun buildRecording(frames: List<ShortArray>): Recording? {
+    private fun buildRecording(frames: List<ShortArray>, truncated: Boolean = false): Recording? {
         val sampleCount = frames.sumOf { it.size }
         if (sampleCount < SAMPLE_RATE * MIN_UTTERANCE_MS / 1000) return null
         val pcm = ShortArray(sampleCount)
@@ -183,7 +184,7 @@ class SimpleVadRecorder(
             "CloudRecorder: utterance complete, samples=$sampleCount, " +
                 "duration=${durationMs}ms, rms=${"%.5f".format(rms)}"
         )
-        return Recording(WavUtil.pcm16ToWav(pcm, SAMPLE_RATE), durationMs)
+        return Recording(WavUtil.pcm16ToWav(pcm, SAMPLE_RATE), durationMs, truncated)
     }
 
     private fun applyInputGain(sample: Short): Short {
@@ -255,7 +256,7 @@ class SimpleVadRecorder(
         private const val MIN_UTTERANCE_MS = 350L
         private const val MIN_VALID_UTTERANCE_MS = 500L
         private const val MIN_VALID_RMS = 0.0025f
-        private const val MAX_UTTERANCE_MS = 15_000L
+        private const val MAX_UTTERANCE_MS = 60_000L
         private const val END_SILENCE_MS = 750L
         private const val KEEP_TRAILING_SILENCE_MS = 180L
         private const val PRE_ROLL_MS = 450L

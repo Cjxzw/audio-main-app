@@ -26,6 +26,18 @@ object StructuredOutputParser {
     private val replyPattern = Regex("<REPLY>(.*?)</REPLY>", RegexOption.DOT_MATCHES_ALL)
     private val actionPattern = Regex("<LOCAL_ACTION>(.*?)</LOCAL_ACTION>", RegexOption.DOT_MATCHES_ALL)
     private val hubActionPattern = Regex("<HUB_ACTION>(.*?)</HUB_ACTION>", RegexOption.DOT_MATCHES_ALL)
+    private val pseudoToolCallPattern = Regex(
+        "<tool_call>(.*?)</tool_call>",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+    )
+    private val pseudoFunctionPattern = Regex(
+        "<function\\s*=\\s*([A-Za-z0-9_.-]+)\\s*>(.*?)</function>",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+    )
+    private val pseudoParameterPattern = Regex(
+        "<parameter\\s*=\\s*([A-Za-z0-9_.-]+)\\s*>(.*?)</parameter>",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+    )
 
     fun parse(raw: String): AgentOutput {
         val actions = mutableListOf<AgentAction>()
@@ -34,6 +46,9 @@ object StructuredOutputParser {
         }
         hubActionPattern.findAll(raw).forEach { match ->
             parseAction(match.groupValues[1].trim())?.let { actions += it }
+        }
+        pseudoToolCallPattern.findAll(raw).forEach { match ->
+            parsePseudoToolCall(match.groupValues[1])?.let { actions += it }
         }
         if (actions.isEmpty()) {
             parseAction(stripCodeFence(raw))?.let { actions += it }
@@ -48,6 +63,7 @@ object StructuredOutputParser {
             raw
                 .replace(actionPattern, "")
                 .replace(hubActionPattern, "")
+                .replace(pseudoToolCallPattern, "")
                 .replace(replyPattern) { it.groupValues[1] }
                 .trim()
         }
@@ -95,6 +111,37 @@ object StructuredOutputParser {
         )
         return AgentAction(actionType = actionType, payload = payload, rawJson = rawJson)
     }
+
+    private fun parsePseudoToolCall(body: String): AgentAction? {
+        val function = pseudoFunctionPattern.find(body) ?: return null
+        val payload = buildMap {
+            pseudoParameterPattern.findAll(function.groupValues[2]).forEach { parameter ->
+                val name = parameter.groupValues[1].trim()
+                val value = decodeXml(parameter.groupValues[2].trim())
+                put(name, scalarJsonValue(value))
+            }
+        }
+        return AgentAction(
+            actionType = function.groupValues[1].trim(),
+            payload = JsonObject(payload),
+            rawJson = body.trim(),
+        )
+    }
+
+    private fun scalarJsonValue(value: String): JsonPrimitive = when {
+        value.equals("true", ignoreCase = true) -> JsonPrimitive(true)
+        value.equals("false", ignoreCase = true) -> JsonPrimitive(false)
+        value.toLongOrNull() != null -> JsonPrimitive(value.toLong())
+        value.toDoubleOrNull() != null -> JsonPrimitive(value.toDouble())
+        else -> JsonPrimitive(value)
+    }
+
+    private fun decodeXml(value: String): String = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 
     private fun JsonObject.stringValue(key: String): String? =
         (this[key] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
