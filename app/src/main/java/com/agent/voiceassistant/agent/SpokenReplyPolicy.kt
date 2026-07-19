@@ -1,8 +1,12 @@
 package com.agent.voiceassistant.agent
 
 object SpokenReplyPolicy {
-    private val fencedCode = Regex("```.*?```", setOf(RegexOption.DOT_MATCHES_ALL))
+    const val DETAILS_NOTICE = "该回复中有详细信息，请查看手机。"
+
     private val markdownPrefix = Regex("(?m)^\\s*(?:[-*+] |\\d+[.)] )")
+    private val markdownHeading = Regex("(?m)^\\s*#{1,6}\\s*")
+    private val markdownEmphasis = Regex("[*_]{1,3}")
+    private val markdownLink = Regex("\\[([^\\]]+)]\\([^)]*\\)")
     private val technicalPath = Regex("(?:/[A-Za-z0-9_.-]+){2,}|[A-Za-z]:\\\\")
     private val url = Regex("https?://\\S+")
 
@@ -14,20 +18,50 @@ object SpokenReplyPolicy {
             technicalPath.containsMatchIn(text) ||
             url.containsMatchIn(text)
 
-    fun fallback(text: String, maxChars: Int = 120): String {
-        val cleaned = text
-            .replace(fencedCode, "详细代码已放在聊天窗口里。")
+    fun hasFencedDetails(text: String): Boolean = text.contains("```")
+
+    fun withoutFencedDetails(text: String): String {
+        val firstFence = text.indexOf("```")
+        if (firstFence < 0) return text
+        val output = StringBuilder(text.length)
+        var cursor = 0
+        while (cursor < text.length) {
+            val opening = text.indexOf("```", cursor)
+            if (opening < 0) {
+                output.append(text, cursor, text.length)
+                break
+            }
+            output.append(text, cursor, opening)
+            val closing = text.indexOf("```", opening + 3)
+            if (closing < 0) break
+            cursor = closing + 3
+        }
+        return output.toString()
+    }
+
+    fun isDetailsOnly(text: String): Boolean =
+        hasFencedDetails(text) && withoutFencedDetails(text).isBlank()
+
+    fun hasUnsupportedUnfencedStructure(text: String): Boolean {
+        val visible = withoutFencedDetails(text).trim()
+        if (visible.startsWith('{') || visible.startsWith('[')) return true
+        return Regex("<[A-Za-z][^>]*>.*</[A-Za-z][^>]*>", RegexOption.DOT_MATCHES_ALL)
+            .containsMatchIn(visible)
+    }
+
+    fun fallback(text: String): String {
+        val hasDetails = hasFencedDetails(text)
+        val cleaned = withoutFencedDetails(text)
             .replace(url, "相关链接已放在聊天窗口里")
             .replace(technicalPath, "相关文件")
+            .replace(markdownLink, "$1")
+            .replace(markdownHeading, "")
             .replace(markdownPrefix, "")
+            .replace(markdownEmphasis, "")
             .replace("`", "")
             .replace(Regex("\\s+"), " ")
             .trim()
-        if (cleaned.isBlank()) return "详细结果已经放在聊天窗口里。"
-        if (cleaned.length <= maxChars) return cleaned
-        val end = cleaned
-            .take(maxChars)
-            .indexOfLast { it in setOf('。', '！', '？', '；', '!', '?', ';') }
-        return if (end >= 20) cleaned.substring(0, end + 1) else cleaned.take(maxChars).trimEnd() + "。"
+        if (cleaned.isBlank()) return ""
+        return if (hasDetails) "$cleaned $DETAILS_NOTICE" else cleaned
     }
 }

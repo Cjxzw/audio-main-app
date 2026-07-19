@@ -404,20 +404,26 @@ class CloudSpeechClient(
         }
     }
 
-    private fun buildTtsPayload(text: String, stream: Boolean): JsonObject = buildJsonObject {
+    internal fun buildTtsPayload(text: String, stream: Boolean): JsonObject = buildJsonObject {
         put("model", "mimo-v2.5-tts")
         if (stream) put("stream", true)
         putJsonArray("messages") {
             add(buildJsonObject {
                 put("role", "user")
-                put("content", "请用自然、温和的中文口语语气朗读。")
+                put(
+                    "content",
+                    "请用自然、连贯、略快的中文口语语气朗读。保持前后内容的语气连续，不要每句话重新起调。停顿自然，不要刻意拖长语速。只朗读正文，不要添加说明。",
+                )
             })
             add(buildJsonObject {
                 put("role", "assistant")
                 put("content", text)
             })
         }
-        putJsonObject("audio") {}
+        putJsonObject("audio") {
+            put("format", if (stream) "pcm16" else "wav")
+            put("voice", TTS_VOICE)
+        }
     }
 
     private fun executeJson(payload: JsonObject): String {
@@ -648,10 +654,11 @@ class CloudSpeechClient(
 
     private companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-        private const val FIRST_EVENT_TIMEOUT_MS = 5_000L
+        private const val FIRST_EVENT_TIMEOUT_MS = 15_000L
         private const val FIRST_AUDIO_TIMEOUT_MS = 5_000L
         private const val REQUEST_TIMEOUT_SECONDS = 5L
         private const val MAX_NETWORK_ATTEMPTS = 2
+        private const val TTS_VOICE = "冰糖"
 
         private fun isTimeout(error: IOException): Boolean =
             error is java.io.InterruptedIOException ||
@@ -662,7 +669,15 @@ class CloudSpeechClient(
 internal open class NetworkTimeoutException(
     operation: String,
     cause: Throwable? = null,
-) : IOException("$operation did not return within 5 seconds", cause)
+    timeoutSeconds: Long? = null,
+) : IOException(
+    if (timeoutSeconds != null) {
+        "$operation did not return within $timeoutSeconds seconds"
+    } else {
+        "$operation timed out"
+    },
+    cause,
+)
 
 internal class FirstEventTimeoutException(cause: Throwable) :
     NetworkTimeoutException("LLM first event", cause)

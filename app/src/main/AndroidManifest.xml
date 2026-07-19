@@ -32,7 +32,7 @@
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="true"
         android:largeHeap="true"
-        android:theme="@style/Theme.Material3.DayNight"
+        android:theme="@style/Theme.VoiceAssistant"
         tools:targetApi="34">
 
         <activity

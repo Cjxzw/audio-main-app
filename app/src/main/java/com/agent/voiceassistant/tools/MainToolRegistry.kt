@@ -3,6 +3,7 @@ package com.agent.voiceassistant.tools
 import com.agent.voiceassistant.agent.AgentAction
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
@@ -37,6 +38,7 @@ class MainToolRegistry(
         add(memoryCreate())
         add(memorySearch())
         add(locationRefresh())
+        add(locationReverseGeocode())
         add(weatherCurrent())
         add(webSearch())
         add(readFile())
@@ -81,6 +83,7 @@ class MainToolRegistry(
             TOOL_MEMORY_CREATE -> "memory.create"
             TOOL_MEMORY_SEARCH -> "memory.search"
             TOOL_LOCATION_REFRESH -> "location.refresh"
+            TOOL_LOCATION_REVERSE_GEOCODE -> "location.reverse_geocode"
             TOOL_WEATHER_CURRENT -> "weather.get_current"
             TOOL_WEB_SEARCH -> "web.search"
             TOOL_READ -> "read"
@@ -99,34 +102,11 @@ class MainToolRegistry(
         return Execution(call, executor.execute(action))
     }
 
-    fun normalizeLegacyAction(action: AgentAction, callId: String): CloudSpeechClient.ToolCall {
-        val name = when (action.actionType) {
-            "memory.create", "note.create" -> TOOL_MEMORY_CREATE
-            "memory.search", "note.search" -> TOOL_MEMORY_SEARCH
-            "location.refresh", "location.get_current" -> TOOL_LOCATION_REFRESH
-            "weather.get_current", "weather.current" -> TOOL_WEATHER_CURRENT
-            "web.search", "websearch", "web_search" -> TOOL_WEB_SEARCH
-            "read" -> TOOL_READ
-            "write" -> TOOL_WRITE
-            "exec", "shell", "bash" -> TOOL_EXEC
-            "http.request", "http_request" -> TOOL_HTTP_REQUEST
-            "code.graph.search", "code_graph_search" -> TOOL_CODE_GRAPH_SEARCH
-            "code.graph.explain", "code_graph_explain" -> TOOL_CODE_GRAPH_EXPLAIN
-            else -> action.actionType.replace('.', '_')
-        }
-        return CloudSpeechClient.ToolCall(
-            id = callId,
-            name = name,
-            arguments = action.payload.toString(),
-        )
-    }
-
-    fun isKnownTool(toolName: String): Boolean = toolName in KNOWN_TOOL_NAMES
-
     fun displayName(toolName: String): String = when (toolName) {
         TOOL_MEMORY_CREATE -> "写入记忆"
         TOOL_MEMORY_SEARCH -> "查询记忆"
         TOOL_LOCATION_REFRESH -> "刷新定位"
+        TOOL_LOCATION_REVERSE_GEOCODE -> "解析当前位置"
         TOOL_WEATHER_CURRENT -> "查询天气"
         TOOL_WEB_SEARCH -> "网络搜索"
         TOOL_READ -> "读取文件"
@@ -140,11 +120,36 @@ class MainToolRegistry(
         else -> toolName
     }
 
-    fun audibleAcknowledgement(toolName: String): String? = when (toolName) {
-        TOOL_WEB_SEARCH -> "我去搜一下。"
-        TOOL_REQUEST_DEEP_REASONING -> "嗯，这个我想一下。"
-        else -> null
+    fun displaySummary(call: CloudSpeechClient.ToolCall): String? {
+        val payload = parseArguments(call.arguments)
+        val value = when (call.name) {
+            TOOL_MEMORY_CREATE -> payload.text("content")?.let { "保存 ${it.take(24)}" }
+            TOOL_MEMORY_SEARCH -> payload.text("query")
+            TOOL_LOCATION_REFRESH -> "获取缓存"
+            TOOL_LOCATION_REVERSE_GEOCODE -> "解析地址"
+            TOOL_WEATHER_CURRENT -> listOfNotNull(payload.text("location"), payload.text("date"))
+                .joinToString(" · ")
+                .ifBlank { "当前位置" }
+            TOOL_WEB_SEARCH -> payload.text("query")
+            TOOL_READ -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
+                ?: (payload["paths"] as? JsonArray)?.size?.let { "$it 个项目" }
+            TOOL_WRITE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
+            TOOL_EXEC -> payload.text("command")?.lineSequence()?.firstOrNull()
+            TOOL_HTTP_REQUEST -> payload.text("url")
+            TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
+            TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
+            TOOL_REQUEST_DEEP_REASONING -> "当前回合"
+            else -> null
+        }
+        return value
+            ?.replace(Regex("\\s+"), " ")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { if (it.length <= MAX_DISPLAY_SUMMARY_CHARS) it else it.take(MAX_DISPLAY_SUMMARY_CHARS - 3) + "..." }
     }
+
+    fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
+        call.name != TOOL_REQUEST_DEEP_REASONING && call.name != TOOL_PROTOCOL_REPAIR
 
     private fun parseArguments(raw: String): JsonObject {
         if (raw.isBlank()) return JsonObject(emptyMap())
@@ -156,6 +161,9 @@ class MainToolRegistry(
                 ),
             )
     }
+
+    private fun JsonObject.text(key: String): String? =
+        (this[key] as? JsonPrimitive)?.content?.trim()?.takeIf { it.isNotBlank() }
 
     private fun memoryCreate() = tool(
         name = TOOL_MEMORY_CREATE,
@@ -190,16 +198,25 @@ class MainToolRegistry(
 
     private fun locationRefresh() = tool(
         name = TOOL_LOCATION_REFRESH,
-        description = "强制刷新手机当前位置。仅在用户询问或要求更新位置时调用。",
+        description = "获取手机当前位置缓存，并在允许时后台发起一次刷新。返回经纬度、精度、来源、定位时间和缓存状态；已有缓存时不等待刷新。启动或新话题也会自动后台刷新，成功后 5 分钟内不会重复请求系统定位。",
+    ) {}
+
+    private fun locationReverseGeocode() = tool(
+        name = TOOL_LOCATION_REVERSE_GEOCODE,
+        description = "将当前位置缓存中的经纬度解析为人类可读地址。只有用户询问街道、地址或当前位置名称时调用；天气、距离和地图类任务直接使用 location_refresh 返回的经纬度，不要先调用本工具。",
     ) {}
 
     private fun weatherCurrent() = tool(
         name = TOOL_WEATHER_CURRENT,
-        description = "查询当前天气。未指定地点时使用手机当前位置。",
+        description = "查询指定日期的天气预报和逐小时变化。未指定地点时使用手机当前位置；日期可填今天、明天、后天或 YYYY-MM-DD。",
     ) {
         putJsonObject("location") {
             put("type", "string")
             put("description", "用户指定的城市或地点，可省略")
+        }
+        putJsonObject("date") {
+            put("type", "string")
+            put("description", "目标日期：今天、明天、后天或 YYYY-MM-DD；省略时查询今天")
         }
     }
 
@@ -232,12 +249,20 @@ class MainToolRegistry(
 
     private fun readFile() = tool(
         name = TOOL_READ,
-        description = "读取虚拟文件系统中的文本文件或列出目录。源码使用 /source，日志使用 /logs，工作文件使用 /workspace，Skill 使用 /skills。日志优先使用 tail_lines 读取末尾；大文件使用 offset 和 limit 分段读取。",
-        required = listOf("path"),
+        description = "读取虚拟文件系统中的一个或多个文本文件，也可列出目录。读取单项时传 path；同一步需要读取多个独立文件时优先在一次调用中传 paths，最多 10 项，不要拆成多个并行 read。源码使用 /source，日志使用 /logs，工作文件使用 /workspace，Skill 使用 /skills。必须使用这些虚拟路径；日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
     ) {
         putJsonObject("path") {
             put("type", "string")
             put("description", "绝对虚拟路径，例如 /logs/voice-agent.log")
+        }
+        putJsonObject("paths") {
+            put("type", "array")
+            put("minItems", 1)
+            put("maxItems", 10)
+            put("description", "需要同时读取的绝对虚拟路径列表；与 path 二选一")
+            put("items", buildJsonObject {
+                put("type", "string")
+            })
         }
         putJsonObject("offset") {
             put("type", "integer")
@@ -374,6 +399,7 @@ class MainToolRegistry(
         const val TOOL_MEMORY_CREATE = "memory_create"
         const val TOOL_MEMORY_SEARCH = "memory_search"
         const val TOOL_LOCATION_REFRESH = "location_refresh"
+        const val TOOL_LOCATION_REVERSE_GEOCODE = "location_reverse_geocode"
         const val TOOL_WEATHER_CURRENT = "weather_get_current"
         const val TOOL_WEB_SEARCH = "web_search"
         const val TOOL_READ = "read"
@@ -385,20 +411,7 @@ class MainToolRegistry(
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
 
-        private val KNOWN_TOOL_NAMES = setOf(
-            TOOL_MEMORY_CREATE,
-            TOOL_MEMORY_SEARCH,
-            TOOL_LOCATION_REFRESH,
-            TOOL_WEATHER_CURRENT,
-            TOOL_WEB_SEARCH,
-            TOOL_READ,
-            TOOL_WRITE,
-            TOOL_EXEC,
-            TOOL_HTTP_REQUEST,
-            TOOL_CODE_GRAPH_SEARCH,
-            TOOL_CODE_GRAPH_EXPLAIN,
-            TOOL_REQUEST_DEEP_REASONING,
-        )
+        private const val MAX_DISPLAY_SUMMARY_CHARS = 48
 
         private val PARALLEL_SAFE_TOOL_NAMES = setOf(
             TOOL_MEMORY_SEARCH,
@@ -407,5 +420,6 @@ class MainToolRegistry(
             TOOL_CODE_GRAPH_SEARCH,
             TOOL_CODE_GRAPH_EXPLAIN,
         )
+
     }
 }

@@ -23,6 +23,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.util.concurrent.TimeUnit
+import timber.log.Timber
 
 /** Xiaomi MiMo Web Search, using the same chat-completions plugin protocol as MiMo Code. */
 class MimoWebSearchClient(
@@ -44,10 +45,10 @@ class MimoWebSearchClient(
     )
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .writeTimeout(5, TimeUnit.SECONDS)
-        .callTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(SEARCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .writeTimeout(SEARCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .callTimeout(SEARCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 
     suspend fun search(query: String, limit: Int = DEFAULT_LIMIT): SearchResult = withContext(Dispatchers.IO) {
@@ -73,37 +74,65 @@ class MimoWebSearchClient(
             put("max_completion_tokens", MAX_COMPLETION_TOKENS)
             put("temperature", 1.0)
             put("top_p", 0.95)
-            put("stream", false)
+            put("stream", true)
             putJsonObject("thinking") { put("type", "disabled") }
         }
 
         val request = Request.Builder()
             .url("${config.baseUrl.trimEnd('/')}/chat/completions")
             .addHeader("Content-Type", JSON_MEDIA_TYPE.toString())
+            .addHeader("Accept", "text/event-stream")
             .addHeader("api-key", config.apiKey)
             .addHeader("Authorization", "Bearer ${config.apiKey}")
             .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
 
-        var lastTimeout: IOException? = null
-        repeat(MAX_ATTEMPTS) {
+        val startedAt = System.nanoTime()
+        try {
             try {
                 client.newCall(request).execute().use { response ->
-                    val body = response.body?.string().orEmpty()
                     if (response.code == 409) {
                         throw IOException("MiMo Web Search 免费额度已用完或插件未开通")
                     }
                     if (!response.isSuccessful) {
+                        val body = response.body?.string().orEmpty()
                         throw IOException("MiMo Web Search HTTP ${response.code}: ${body.take(300)}")
                     }
-                    return@withContext parseResponse(body)
+                    val source = response.body?.source()
+                        ?: throw IOException("MiMo Web Search 返回了空响应")
+                    while (true) {
+                        val line = source.readUtf8Line() ?: break
+                        val sources = parseStreamEvent(line) ?: continue
+                        Timber.i(
+                            "MiMo web search first_results query=${query.take(80)} " +
+                                "elapsedMs=${elapsedMs(startedAt)} sources=${sources.size}",
+                        )
+                        return@withContext SearchResult(
+                            answer = "",
+                            sources = sources,
+                            toolUsage = null,
+                            pageUsage = null,
+                        )
+                    }
+                    throw IOException("MiMo Web Search 未返回搜索结果")
                 }
             } catch (error: InterruptedIOException) {
-                lastTimeout = error
+                Timber.w(
+                    "MiMo web search timeout query=${query.take(80)} " +
+                        "elapsedMs=${elapsedMs(startedAt)} timeoutSeconds=$SEARCH_TIMEOUT_SECONDS",
+                )
+                throw NetworkTimeoutException("web search", error, SEARCH_TIMEOUT_SECONDS)
             }
+        } catch (error: NetworkTimeoutException) {
+            throw error
+        } catch (error: IOException) {
+            Timber.w(error, "MiMo web search request failed query=${query.take(80)}")
+            throw error
         }
-        throw NetworkTimeoutException("web search", lastTimeout)
     }
+
+    private fun elapsedMs(startedAt: Long): Long =
+        (System.nanoTime() - startedAt) / 1_000_000L
 
     internal fun parseResponse(body: String): SearchResult {
         val root = runCatching { JSON.parseToJsonElement(body) as? JsonObject }
@@ -133,6 +162,22 @@ class MimoWebSearchClient(
         )
     }
 
+    internal fun parseStreamEvent(line: String): List<Source>? {
+        if (!line.startsWith("data:")) return null
+        val data = line.removePrefix("data:").trim()
+        if (data.isBlank() || data == "[DONE]") return null
+        val root = runCatching { JSON.parseToJsonElement(data) as? JsonObject }.getOrNull() ?: return null
+        val choice = (root["choices"] as? JsonArray)?.firstOrNull().asObject()
+        val annotations = choice?.get("delta").asObject()?.get("annotations") as? JsonArray
+            ?: choice?.get("message").asObject()?.get("annotations") as? JsonArray
+            ?: return null
+        return annotations
+            .mapNotNull(::parseSource)
+            .distinctBy { it.url }
+            .take(MAX_RESULTS)
+            .takeIf { it.isNotEmpty() }
+    }
+
     private fun parseSource(element: JsonElement): Source? {
         val source = element.asObject() ?: return null
         val url = source["url"].stringValue()?.trim()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
@@ -157,10 +202,11 @@ class MimoWebSearchClient(
         const val DEFAULT_LIMIT = 5
         const val MAX_RESULTS = 5
         const val MAX_KEYWORDS = 3
-        const val MAX_COMPLETION_TOKENS = 384
+        const val MAX_COMPLETION_TOKENS = 256
         const val MAX_FIELD_CHARS = 160
         const val MAX_SUMMARY_CHARS = 600
-        const val MAX_ATTEMPTS = 2
+        const val CONNECT_TIMEOUT_SECONDS = 8L
+        const val SEARCH_TIMEOUT_SECONDS = 15L
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
     }

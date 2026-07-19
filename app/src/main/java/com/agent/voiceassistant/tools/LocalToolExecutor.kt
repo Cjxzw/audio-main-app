@@ -1,6 +1,5 @@
 package com.agent.voiceassistant.tools
 
-import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.AgentAction
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.data.ConversationStore
@@ -16,7 +15,7 @@ class LocalToolExecutor(
     private val store: ConversationStore,
     private val locationProvider: LocationProvider,
     private val weatherClient: WeatherClient = WeatherClient(),
-    private val webSearchClient: MimoWebSearchClient = MimoWebSearchClient(LLMConfig.auto()),
+    private val webSearchClient: ExaWebSearchClient = ExaWebSearchClient(),
     private val executionEnv: AndroidExecutionEnv? = null,
     private val codeGraph: CodeGraphIndex? = null,
 ) {
@@ -35,6 +34,7 @@ class LocalToolExecutor(
             "memory.create", "note.create" -> createMemory(action.payload)
             "memory.search", "note.search" -> searchMemory(action.payload)
             "location.refresh", "location.get_current" -> refreshLocation()
+            "location.reverse_geocode", "location.reverseGeocode" -> reverseGeocodeLocation()
             "weather.get_current", "weather.current" -> currentWeather(action.payload)
             "web.search", "websearch", "web_search" -> webSearch(action.payload)
             "read" -> readFile(action.payload)
@@ -91,57 +91,102 @@ class LocalToolExecutor(
     }
 
     private suspend fun refreshLocation(): ToolResult {
-        val location = locationProvider.currentLocation(timeoutMs = 8_000L, forceFresh = true)
+        val snapshot = locationProvider.locationForTool("tool.location_get")
+        val location = snapshot.location
         if (location == null) {
+            val reason = locationProvider.availabilityIssue()
+                ?: snapshot.error
+                ?: "定位请求超时：权限和定位开关均正常，但系统在 30 秒内没有返回位置。"
             return ToolResult(
                 actionType = "location.refresh",
-                displayText = "定位失败",
-                contextText = "定位失败：没有权限、定位关闭或暂时无法获取位置。",
+                displayText = "定位失败：$reason",
+                contextText = "定位失败：$reason",
                 shouldAskLlm = true,
                 success = false,
             )
         }
-        store.setLocation(location)
+        val status = when (snapshot.state) {
+            LocationProvider.RefreshState.REQUESTING -> "，后台刷新中"
+            LocationProvider.RefreshState.COOLDOWN -> "，5分钟冷却中"
+            LocationProvider.RefreshState.TIMEOUT -> "，上次刷新超时"
+            LocationProvider.RefreshState.FAILED -> "，上次刷新失败"
+            LocationProvider.RefreshState.IDLE -> ""
+        }
         return ToolResult(
             actionType = "location.refresh",
-            displayText = "定位已更新：${location.userPlaceText()}",
-            contextText = locationContext(location),
+            displayText = "定位缓存$status",
+            contextText = locationContext(location, snapshot),
+            shouldAskLlm = true,
+        )
+    }
+
+    private suspend fun reverseGeocodeLocation(): ToolResult {
+        val location = locationProvider.cachedLocation()
+            ?: return ToolResult(
+                actionType = "location.reverse_geocode",
+                displayText = "地址解析失败：没有定位缓存",
+                contextText = "地址解析失败：当前没有可用的经纬度，请先调用 location_get 获取定位。",
+                shouldAskLlm = true,
+                success = false,
+            )
+        val address = locationProvider.reverseGeocode(location)
+        if (address.isNullOrBlank()) {
+            return ToolResult(
+                actionType = "location.reverse_geocode",
+                displayText = "地址解析失败",
+                contextText = "地址解析失败：反向地理编码在 3 秒内没有返回结果。经纬度仍然可用于天气和地图类工具。",
+                shouldAskLlm = true,
+                success = false,
+            )
+        }
+        store.setLocation(location.copy(address = address))
+        return ToolResult(
+            actionType = "location.reverse_geocode",
+            displayText = "地址已解析",
+            contextText = "当前位置：$address。定位坐标：${"%.5f".format(location.latitude)}, ${"%.5f".format(location.longitude)}。",
             shouldAskLlm = true,
         )
     }
 
     private suspend fun currentWeather(payload: JsonObject): ToolResult {
         val requestedPlace = payload.string("location").orEmpty().trim()
-        var location = store.lastLocation()?.takeIf { it.isFresh(MAX_WEATHER_LOCATION_AGE_MS) }
+        val snapshot = locationProvider.locationForTool("tool.weather")
+        val location = snapshot.location
         if (location == null) {
-            location = locationProvider.currentLocation(timeoutMs = 8_000L, forceFresh = true)
-            if (location != null) store.setLocation(location)
-        }
-        if (location == null) {
+            val reason = locationProvider.availabilityIssue()
+                ?: snapshot.error
+                ?: "系统在 30 秒内没有返回位置。"
             return ToolResult(
                 actionType = "weather.get_current",
                 displayText = "天气查询失败：缺少定位",
-                contextText = "天气查询失败：没有可用定位。请提示用户授予定位权限或手动说明城市。",
+                contextText = "天气查询失败：没有可用定位，$reason 请让用户稍后重试或直接说明城市。",
                 shouldAskLlm = true,
                 success = false,
             )
         }
-        val weatherResult = runCatching { weatherClient.getCurrent(location) }
+        val requestedDate = payload.string("date")
+        val weatherResult = runCatching { weatherClient.getForecast(location, requestedDate) }
             .onFailure { Timber.e(it, "weather tool failed") }
-        weatherResult.exceptionOrNull()?.let { error ->
-            if (error is NetworkTimeoutException) throw error
+        val weather = weatherResult.getOrElse {
+            return ToolResult(
+                actionType = "weather.get_current",
+                displayText = "天气查询失败",
+                contextText = "天气查询失败：${it.message ?: "网络或服务异常"}",
+                shouldAskLlm = true,
+                success = false,
+            )
         }
-        val weather = weatherResult.getOrElse { "天气查询失败：${it.message ?: "网络或服务异常"}" }
 
         val locationNote = if (requestedPlace.isNotBlank()) {
             "用户请求地点：$requestedPlace。当前版本先使用手机当前位置查询。"
         } else {
             "使用手机当前位置查询。"
         }
+        val locationAgeSeconds = ((System.currentTimeMillis() - location.timestamp) / 1000).coerceAtLeast(0)
         return ToolResult(
             actionType = "weather.get_current",
             displayText = "查询天气",
-            contextText = "$locationNote\n$weather",
+            contextText = "$locationNote\n位置缓存生成于 ${locationAgeSeconds} 秒前，精度约 ${location.accuracyMeters?.toInt() ?: -1} 米。\n$weather",
             shouldAskLlm = true,
             success = weatherResult.isSuccess,
         )
@@ -162,9 +207,6 @@ class LocalToolExecutor(
         val limit = (payload.int("limit") ?: 5).coerceIn(1, 5)
         val result = runCatching { webSearchClient.search(query, limit) }
             .onFailure { Timber.e(it, "MiMo web search failed: $query") }
-        result.exceptionOrNull()?.let { error ->
-            if (error is NetworkTimeoutException) throw error
-        }
         val searchResult = result
             .getOrElse { error ->
                 return ToolResult(
@@ -215,37 +257,71 @@ class LocalToolExecutor(
     }
 
     private fun readFile(payload: JsonObject): ToolResult {
-        val path = payload.string("path")
-            ?: return invalidArguments("read", "缺少 path 字段")
+        val paths = buildList {
+            payload.string("path")?.let(::add)
+            addAll(payload.stringList("paths"))
+        }.distinct()
+        if (paths.isEmpty()) return invalidArguments("read", "缺少 path 或 paths 字段")
+        if (paths.size > MAX_BATCH_READ_ITEMS) {
+            return invalidArguments("read", "paths 最多包含 $MAX_BATCH_READ_ITEMS 项")
+        }
         val env = executionEnv ?: return unavailable("read")
-        return runCatching {
-            env.read(
-                path = path,
-                offset = payload.int("offset"),
-                limit = payload.int("limit") ?: 200,
-                tailLines = payload.int("tail_lines"),
-            )
-        }.fold(
-            onSuccess = { result ->
-                ToolResult(
-                    actionType = "read",
-                    displayText = if (result.kind == "directory") {
-                        "列出 ${result.path}"
-                    } else {
-                        "读取 ${result.path}"
-                    },
-                    contextText = buildString {
-                        appendLine("${if (result.kind == "directory") "目录" else "文件"}：${result.path}")
-                        appendLine("范围：${result.startLine}-${result.endLine}/${result.totalLines}")
-                        append(result.content)
-                        if (result.truncated) append("\n[输出已截断，可调整 offset/limit 或 tail_lines 继续读取]")
-                    },
-                    shouldAskLlm = true,
+        val results = paths.map { path ->
+            path to runCatching {
+                env.read(
+                    path = path,
+                    offset = payload.int("offset"),
+                    limit = payload.int("limit") ?: 200,
+                    tailLines = payload.int("tail_lines"),
                 )
+            }
+        }
+        if (paths.size == 1) {
+            return results.single().second.fold(
+                onSuccess = { result -> readResult(result) },
+                onFailure = { error -> failed("read", "读取失败", error) },
+            )
+        }
+
+        val succeeded = results.count { (_, result) -> result.isSuccess }
+        return ToolResult(
+            actionType = "read",
+            displayText = "批量读取：$succeeded/${paths.size} 成功",
+            contextText = buildString {
+                appendLine("批量读取结果：$succeeded 项成功，${paths.size - succeeded} 项失败。")
+                results.forEachIndexed { index, (requestedPath, result) ->
+                    appendLine()
+                    result.fold(
+                        onSuccess = { item ->
+                            appendLine("[${index + 1}] 成功：${item.path}")
+                            appendLine("范围：${item.startLine}-${item.endLine}/${item.totalLines}")
+                            append(item.content.take(MAX_BATCH_READ_ITEM_CHARS))
+                            if (item.content.length > MAX_BATCH_READ_ITEM_CHARS || item.truncated) {
+                                append("\n[该项输出已截断，可单独读取以查看更多]")
+                            }
+                        },
+                        onFailure = { error ->
+                            append("[${index + 1}] 失败：$requestedPath：${error.message ?: error.javaClass.simpleName}")
+                        },
+                    )
+                }
             },
-            onFailure = { error -> failed("read", "读取失败", error) },
+            shouldAskLlm = true,
+            success = succeeded > 0,
         )
     }
+
+    private fun readResult(result: AndroidExecutionEnv.ReadResult) = ToolResult(
+        actionType = "read",
+        displayText = if (result.kind == "directory") "列出 ${result.path}" else "读取 ${result.path}",
+        contextText = buildString {
+            appendLine("${if (result.kind == "directory") "目录" else "文件"}：${result.path}")
+            appendLine("范围：${result.startLine}-${result.endLine}/${result.totalLines}")
+            append(result.content)
+            if (result.truncated) append("\n[输出已截断，可调整 offset/limit 或 tail_lines 继续读取]")
+        },
+        shouldAskLlm = true,
+    )
 
     private fun writeFile(payload: JsonObject): ToolResult {
         val path = payload.string("path")
@@ -389,22 +465,33 @@ class LocalToolExecutor(
         success = false,
     )
 
-    private fun locationContext(location: com.agent.voiceassistant.data.StoredLocation): String {
+    private fun locationContext(
+        location: com.agent.voiceassistant.data.StoredLocation,
+        snapshot: LocationProvider.RefreshSnapshot,
+    ): String {
         val accuracy = location.accuracyMeters?.let { "精度约 ${it.toInt()} 米。" }.orEmpty()
         val provider = location.provider?.let { "定位来源：$it。" }.orEmpty()
         val ageSeconds = ((System.currentTimeMillis() - location.timestamp) / 1000).coerceAtLeast(0)
         val internalCoord = "内部坐标：${"%.5f".format(location.latitude)}, ${"%.5f".format(location.longitude)}。"
+        val refresh = when (snapshot.state) {
+            LocationProvider.RefreshState.REQUESTING -> "后台刷新正在进行。"
+            LocationProvider.RefreshState.COOLDOWN -> "定位处于5分钟冷却期。"
+            LocationProvider.RefreshState.TIMEOUT -> "最近一次定位刷新超时。"
+            LocationProvider.RefreshState.FAILED -> "最近一次定位刷新失败。"
+            LocationProvider.RefreshState.IDLE -> ""
+        }
         val place = location.address?.takeIf { it.isNotBlank() }
         return if (place != null) {
-            "定位已刷新。可向用户描述为：$place 附近。$accuracy$provider${internalCoord}定位记录生成于 ${ageSeconds} 秒前。除非用户明确要求坐标，否则不要播报经纬度。"
+            "定位缓存：可向用户描述为：$place 附近。$accuracy$provider${internalCoord}定位记录生成于 ${ageSeconds} 秒前。${refresh}除非用户明确要求坐标，否则不要播报经纬度。"
         } else {
-            "定位已刷新，但暂时无法解析成街道地址。$accuracy$provider${internalCoord}定位记录生成于 ${ageSeconds} 秒前。请不要向用户播报经纬度；如果用户问当前位置，只说已定位但具体地名解析失败，可继续用于天气等内部工具查询。"
+            "定位缓存可用，但尚未解析成街道地址。$accuracy$provider${internalCoord}定位记录生成于 ${ageSeconds} 秒前。${refresh}请不要向用户播报经纬度；用户询问具体地址时再调用 location_reverse_geocode。"
         }
     }
 
     private companion object {
-        private const val MAX_WEATHER_LOCATION_AGE_MS = 5 * 60 * 1000L
         private const val MAX_SEARCH_ANSWER_CHARS = 2_000
+        private const val MAX_BATCH_READ_ITEMS = 10
+        private const val MAX_BATCH_READ_ITEM_CHARS = 1_000
     }
 
     private fun JsonObject.string(key: String): String? =

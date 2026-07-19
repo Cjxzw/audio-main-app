@@ -4,6 +4,7 @@ import android.content.Context
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatRole
+import com.agent.voiceassistant.ui.ToolDisplayStatus
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -21,6 +22,7 @@ class ConversationStore(context: Context) {
         prettyPrint = true
     }
     private val file = File(context.filesDir, "main-agent-store.json")
+    private val toolTraceDir = File(context.filesDir, "agent-runtime/tool-traces").apply { mkdirs() }
 
     private val lock = Any()
     private var state = loadState()
@@ -54,7 +56,13 @@ class ConversationStore(context: Context) {
             }
     }
 
-    fun addMessage(role: String, content: String, timestamp: Long = System.currentTimeMillis()): StoredMessage {
+    fun addMessage(
+        role: String,
+        content: String,
+        timestamp: Long = System.currentTimeMillis(),
+        toolCallId: String? = null,
+        toolStatus: ToolDisplayStatus? = null,
+    ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
             "system", "tool" -> role
@@ -65,6 +73,8 @@ class ConversationStore(context: Context) {
             role = normalizedRole,
             content = content,
             timestamp = timestamp,
+            toolCallId = toolCallId,
+            toolStatus = toolStatus?.name,
         )
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -76,6 +86,28 @@ class ConversationStore(context: Context) {
             persistLocked()
         }
         return message
+    }
+
+    fun updateMessage(
+        messageId: String,
+        content: String,
+        timestamp: Long = System.currentTimeMillis(),
+        toolStatus: ToolDisplayStatus? = null,
+    ): StoredMessage? {
+        synchronized(lock) {
+            val session = currentSessionLocked()
+            val index = session.messages.indexOfFirst { it.id == messageId }
+            if (index < 0) return null
+            val updated = session.messages[index].copy(
+                content = content,
+                timestamp = timestamp,
+                toolStatus = toolStatus?.name ?: session.messages[index].toolStatus,
+            )
+            session.messages[index] = updated
+            session.updatedAt = timestamp
+            persistLocked()
+            return updated
+        }
     }
 
     fun addLlmMessage(
@@ -106,6 +138,36 @@ class ConversationStore(context: Context) {
             persistLocked()
         }
         return stored
+    }
+
+    fun addToolResult(
+        turnId: String,
+        call: CloudSpeechClient.ToolCall,
+        result: CloudSpeechClient.LlmMessage,
+        success: Boolean,
+        timestamp: Long = System.currentTimeMillis(),
+    ): StoredMessage {
+        val rawContent = result.content.orEmpty()
+        persistToolTrace(
+            StoredToolTrace(
+                turnId = turnId,
+                toolCallId = call.id,
+                toolName = call.name,
+                arguments = call.arguments,
+                result = rawContent,
+                success = success,
+                timestamp = timestamp,
+            ),
+        )
+        val compactContent = ToolHistoryPolicy.compact(rawContent, turnId, call.id)
+        Timber.i(
+            "agent.tool.persisted_chars turn=$turnId id=${call.id} " +
+                "raw=${rawContent.length} stored=${compactContent.length}",
+        )
+        return addLlmMessage(
+            message = result.copy(content = compactContent),
+            timestamp = timestamp,
+        )
     }
 
     fun startNewConversation(reason: String = "用户开启新话题"): ConversationSession {
@@ -167,12 +229,6 @@ class ConversationStore(context: Context) {
 
     fun contextSummary(): String = synchronized(lock) {
         buildString {
-            val location = state.lastLocation
-            if (location != null) {
-                appendLine("当前定位：${location.displayText()}")
-            } else {
-                appendLine("当前定位：未知")
-            }
             val memories = state.memories.takeLast(5)
             if (memories.isNotEmpty()) {
                 appendLine("用户记忆：")
@@ -236,17 +292,77 @@ class ConversationStore(context: Context) {
         }
     }
 
+    private fun persistToolTrace(trace: StoredToolTrace) {
+        synchronized(lock) {
+            runCatching {
+                val turnDir = File(toolTraceDir, trace.turnId.safeFilePart()).apply { mkdirs() }
+                File(turnDir, "${trace.toolCallId.safeFilePart()}.json")
+                    .writeText(json.encodeToString(trace))
+                toolTraceDir.walkTopDown()
+                    .filter { it.isFile && it.extension == "json" }
+                    .sortedByDescending { it.lastModified() }
+                    .drop(MAX_TOOL_TRACE_FILES)
+                    .forEach { it.delete() }
+            }.onFailure {
+                Timber.w(it, "ConversationStore: tool trace persist failed")
+            }
+        }
+    }
+
+    private fun String.safeFilePart(): String =
+        replace(Regex("[^A-Za-z0-9._-]"), "_").take(120).ifBlank { "unknown" }
+
     private fun StoredMessage.toChatMessage(): ChatMessage {
         val role = when (role) {
             "assistant" -> ChatRole.BOT
             "system", "tool" -> ChatRole.SYSTEM
             else -> ChatRole.USER
         }
-        return ChatMessage(role = role, text = content, timestamp = timestamp)
+        val storedStatus = toolStatus?.let { stored ->
+            runCatching { ToolDisplayStatus.valueOf(stored) }.getOrNull()
+        }
+        val status = storedStatus ?: when {
+            content.trimEnd().endsWith("✅") -> ToolDisplayStatus.SUCCEEDED
+            content.trimEnd().endsWith("❌") -> ToolDisplayStatus.FAILED
+            toolCallId != null -> ToolDisplayStatus.RUNNING
+            else -> null
+        }
+        val displayContent = if (toolCallId != null) {
+            compactLegacyToolDisplay(content)
+        } else {
+            content
+        }
+        return ChatMessage(
+            role = role,
+            text = displayContent,
+            timestamp = timestamp,
+            toolCallId = toolCallId,
+            toolStatus = status,
+        )
     }
 
     private companion object {
         private const val MAX_MEMORIES = 500
+        private const val MAX_TOOL_TRACE_FILES = 500
+    }
+
+    private fun compactLegacyToolDisplay(content: String): String {
+        val withoutStatus = content.removeSuffix(" ✅").removeSuffix(" ❌").trimEnd()
+        val rawJsonStart = withoutStatus.indexOf(" {")
+        return if (rawJsonStart > 0) withoutStatus.substring(0, rawJsonStart) else withoutStatus
+    }
+}
+
+internal object ToolHistoryPolicy {
+    const val MAX_PERSISTED_RESULT_CHARS = 3_000
+
+    fun compact(content: String, turnId: String, toolCallId: String): String {
+        if (content.length <= MAX_PERSISTED_RESULT_CHARS) return content
+        val marker = "\n...[长期历史已压缩，完整记录 turn=$turnId call=$toolCallId]...\n"
+        val available = (MAX_PERSISTED_RESULT_CHARS - marker.length).coerceAtLeast(0)
+        val headSize = (available * 2 / 3).coerceAtLeast(0)
+        val tailSize = (available - headSize).coerceAtLeast(0)
+        return content.take(headSize) + marker + content.takeLast(tailSize)
     }
 }
 
@@ -275,6 +391,7 @@ data class StoredMessage(
     val timestamp: Long,
     val toolCalls: List<StoredToolCall> = emptyList(),
     val toolCallId: String? = null,
+    val toolStatus: String? = null,
     val llmVisible: Boolean? = null,
     val chatVisible: Boolean? = null,
 )
@@ -284,6 +401,17 @@ data class StoredToolCall(
     val id: String,
     val name: String,
     val arguments: String,
+)
+
+@Serializable
+data class StoredToolTrace(
+    val turnId: String,
+    val toolCallId: String,
+    val toolName: String,
+    val arguments: String,
+    val result: String,
+    val success: Boolean,
+    val timestamp: Long,
 )
 
 @Serializable
@@ -305,6 +433,15 @@ data class StoredLocation(
     val address: String? = null,
     val timestamp: Long = System.currentTimeMillis(),
     val sourceTimestamp: Long = timestamp,
+    val altitudeMeters: Double? = null,
+    val verticalAccuracyMeters: Float? = null,
+    val speedMps: Float? = null,
+    val speedAccuracyMps: Float? = null,
+    val bearingDegrees: Float? = null,
+    val bearingAccuracyDegrees: Float? = null,
+    val elapsedRealtimeNanos: Long? = null,
+    val elapsedRealtimeUncertaintyNanos: Double? = null,
+    val isMock: Boolean? = null,
 ) {
     fun isFresh(maxAgeMs: Long, now: Long = System.currentTimeMillis()): Boolean =
         now - timestamp <= maxAgeMs

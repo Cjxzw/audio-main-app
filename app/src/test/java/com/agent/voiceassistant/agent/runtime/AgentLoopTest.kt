@@ -99,6 +99,7 @@ class AgentLoopTest {
             ),
             runtime.requests.map { it.thinkingMode },
         )
+        assertEquals(listOf("需要比较多个方案"), runtime.modelEscalations)
         assertEquals("reason-1", runtime.requests[1].messages.last().toolCallId)
     }
 
@@ -131,6 +132,94 @@ class AgentLoopTest {
             runtime.requests[1].messages.takeLast(3).map { it.toolCallId },
         )
         assertEquals(4_096, runtime.requests[1].maxCompletionTokens)
+    }
+
+    @Test
+    fun `third business tool automatically enables thinking without extra model call`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(CloudSpeechClient.ToolCall("call-1", "read", "{\"path\":\"/a\"}"))),
+                    message(toolCalls = listOf(CloudSpeechClient.ToolCall("call-2", "read", "{\"path\":\"/b\"}"))),
+                    message(toolCalls = listOf(CloudSpeechClient.ToolCall("call-3", "read", "{\"path\":\"/c\"}"))),
+                    message(content = "调查完成"),
+                ),
+            ),
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(config(maxToolRounds = 4))
+
+        assertEquals(AgentLoop.Outcome.Completed("调查完成", true), outcome)
+        assertEquals(listOf("call-1", "call-2", "call-3"), runtime.executedCalls)
+        assertEquals(4, runtime.requests.size)
+        assertEquals(
+            listOf(
+                CloudSpeechClient.ThinkingMode.DISABLED,
+                CloudSpeechClient.ThinkingMode.DISABLED,
+                CloudSpeechClient.ThinkingMode.DISABLED,
+                CloudSpeechClient.ThinkingMode.ENABLED,
+            ),
+            runtime.requests.map { it.thinkingMode },
+        )
+        assertEquals(1, runtime.automaticEscalations.size)
+        assertTrue(runtime.modelEscalations.isEmpty())
+        assertEquals(3, runtime.automaticEscalations.single().first)
+        assertTrue(events.any { it is AgentEvent.AutomaticThinkingEscalated && it.toolCallCount == 3 })
+    }
+
+    @Test
+    fun `three parallel tools escalate once and all still execute`() = runBlocking {
+        val calls = listOf(
+            CloudSpeechClient.ToolCall("call-1", "read", "{}"),
+            CloudSpeechClient.ToolCall("call-2", "web_search", "{}"),
+            CloudSpeechClient.ToolCall("call-3", "code_graph_search", "{}"),
+        )
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = calls),
+                    message(content = "并行调查完成"),
+                ),
+            ),
+            parallelToolNames = calls.map { it.name }.toSet(),
+        )
+
+        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 2))
+
+        assertEquals(AgentLoop.Outcome.Completed("并行调查完成", true), outcome)
+        assertEquals(calls.map { it.id }.toSet(), runtime.executedCalls.toSet())
+        assertEquals(2, runtime.requests.size)
+        assertEquals(CloudSpeechClient.ThinkingMode.ENABLED, runtime.requests.last().thinkingMode)
+        assertEquals(1, runtime.automaticEscalations.size)
+        assertEquals(calls.map { it.id }.toSet(), runtime.automaticEscalations.single().second.toSet())
+    }
+
+    @Test
+    fun `parallel failures count as one failed round and model can repair`() = runBlocking {
+        val failed = listOf(
+            CloudSpeechClient.ToolCall("failed-1", "read", "{}"),
+            CloudSpeechClient.ToolCall("failed-2", "read", "{}"),
+            CloudSpeechClient.ToolCall("failed-3", "read", "{}"),
+        )
+        val repaired = CloudSpeechClient.ToolCall("repaired-1", "read", "{\"path\":\"/source/a.kt\"}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = failed),
+                    message(toolCalls = listOf(repaired)),
+                    message(content = "修正路径后读取成功"),
+                ),
+            ),
+            failedCallIds = failed.map { it.id }.toSet(),
+            parallelToolNames = setOf("read"),
+        )
+
+        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 3))
+
+        assertEquals(AgentLoop.Outcome.Completed("修正路径后读取成功", true), outcome)
+        assertEquals(failed.map { it.id }.toSet() + repaired.id, runtime.executedCalls.toSet())
+        assertEquals(3, runtime.requests.size)
     }
 
     @Test
@@ -177,6 +266,60 @@ class AgentLoopTest {
         assertTrue(runtime.requests.last().tools.isEmpty())
     }
 
+    @Test
+    fun `tool free summary rejects xml tool protocol and asks for plain text`() = runBlocking {
+        val failures = listOf(
+            CloudSpeechClient.ToolCall("failed-1", "read", "{}"),
+            CloudSpeechClient.ToolCall("failed-2", "read", "{}"),
+            CloudSpeechClient.ToolCall("failed-3", "read", "{}"),
+        )
+        val invalidXml = "<tool_call><function=exec><parameter=command>pwd</parameter></function></tool_call>"
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(failures[0])),
+                    message(toolCalls = listOf(failures[1])),
+                    message(toolCalls = listOf(failures[2])),
+                    message(content = invalidXml),
+                    message(content = "已有读取均失败，需要使用虚拟路径重试"),
+                ),
+            ),
+            failedCallIds = failures.map { it.id }.toSet(),
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(config(maxToolRounds = 4))
+
+        assertEquals(
+            AgentLoop.Outcome.Completed("已有读取均失败，需要使用虚拟路径重试", true),
+            outcome,
+        )
+        assertEquals(5, runtime.requests.size)
+        assertTrue(runtime.requests.takeLast(2).all { it.tools.isEmpty() })
+        assertTrue(
+            events.filterIsInstance<AgentEvent.MessageFinished>()
+                .none { it.message.content == invalidXml },
+        )
+    }
+
+    @Test
+    fun `details only final response is repaired with speakable summary`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(content = "```json\n{\"status\":\"ok\"}\n```"),
+                    message(content = "处理已经完成，详细数据请看手机。"),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("处理已经完成，详细数据请看手机。", true), outcome)
+        assertEquals(2, runtime.requests.size)
+        assertTrue(runtime.requests.last().tools.isEmpty())
+    }
+
     private fun config(maxToolRounds: Int = 2) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
         initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
@@ -204,6 +347,8 @@ class AgentLoopTest {
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
         val blockedCalls = mutableListOf<String>()
+        val automaticEscalations = mutableListOf<Pair<Int, List<String>>>()
+        val modelEscalations = mutableListOf<String>()
         private val activeTools = AtomicInteger(0)
         val maxActiveTools = AtomicInteger(0)
 
@@ -233,6 +378,10 @@ class AgentLoopTest {
         override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
             Json.parseToJsonElement(call.arguments).jsonObject.getValue("reason").jsonPrimitive.content
 
+        override fun onReasoningEscalation(reason: String) {
+            modelEscalations += reason
+        }
+
         override fun reasoningEscalationResult(call: CloudSpeechClient.ToolCall) =
             AgentLoop.ToolExecution(
                 CloudSpeechClient.LlmMessage(
@@ -242,6 +391,13 @@ class AgentLoopTest {
                 ),
                 succeeded = true,
             )
+
+        override suspend fun onAutomaticReasoningEscalation(
+            toolCallCount: Int,
+            triggerCalls: List<CloudSpeechClient.ToolCall>,
+        ) {
+            automaticEscalations += toolCallCount to triggerCalls.map { it.id }
+        }
 
         override fun canExecuteToolInParallel(call: CloudSpeechClient.ToolCall) =
             call.name in parallelToolNames

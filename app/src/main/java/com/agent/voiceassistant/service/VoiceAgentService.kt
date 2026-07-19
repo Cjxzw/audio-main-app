@@ -28,6 +28,7 @@ import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.MediaButtonReceiver
+import com.agent.voiceassistant.R
 import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
@@ -54,6 +55,7 @@ import com.agent.voiceassistant.tools.MainToolRegistry
 import com.agent.voiceassistant.telecom.AssistantTelecomSession
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatRole
+import com.agent.voiceassistant.ui.ToolDisplayStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -73,6 +75,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -89,6 +92,8 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 
 class VoiceAgentService : Service() {
 
@@ -101,12 +106,26 @@ class VoiceAgentService : Service() {
         private const val ENABLE_PLAYBACK_DONE_EARCON = false
         private const val TTS_OUTPUT_GAIN = 1.2f
         private const val TTS_FADE_MS = 18
-        private const val TTS_INTER_SEGMENT_SILENCE_MS = 4
         private const val TTS_FINAL_SILENCE_MS = 90
         private const val DEEP_MAX_TOOL_ROUNDS = 10
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
         private const val MAX_TOOL_RESULT_CHARS = 12_000
+        private const val SESSION_GREETING_MESSAGE_ID = "__session_greeting__"
+        private const val SESSION_GREETING_TRIGGER =
+            "这是 Main Agent 的内部会话事件：用户刚刚开启了一个新话题。请只向用户发送一句简短、自然的中文问候，并邀请用户提出新的话题。不要调用工具，不要提及这个内部事件。"
+        private val THINKING_FEEDBACK_AUDIO = intArrayOf(
+            R.raw.thinking_um_long,
+            R.raw.thinking_er_long,
+            R.raw.thinking_zhege,
+            R.raw.thinking_wo_xiang_yixia,
+            R.raw.thinking_wo_xiangxiang,
+            R.raw.thinking_lvilv,
+            R.raw.thinking_xianrang,
+            R.raw.thinking_shaodeng,
+            R.raw.thinking_zuzhi,
+            R.raw.thinking_liaojie,
+        )
         private val TECHNICAL_SPEECH_HINTS = listOf(
             "代码",
             "源码",
@@ -211,6 +230,9 @@ class VoiceAgentService : Service() {
     private lateinit var telecomSession: AssistantTelecomSession
     private var dormant = true
     private val turnMutex = Mutex()
+    private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
+    private val thinkingFeedbackLock = Any()
+    private var lastThinkingFeedbackAudio: Int? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -218,7 +240,7 @@ class VoiceAgentService : Service() {
         super.onCreate()
         DiagLog.i("service.create", "pid=${android.os.Process.myPid()}", showInUi = true)
         store = ConversationStore(this)
-        locationProvider = LocationProvider(this)
+        locationProvider = LocationProvider(this, store)
         executionEnv = AndroidExecutionEnv(this)
         skillRegistry = SkillRegistry(executionEnv.skillsRoot)
         toolRegistry = MainToolRegistry(
@@ -229,6 +251,7 @@ class VoiceAgentService : Service() {
                 codeGraph = CodeGraphIndex(this),
             ),
         )
+        locationProvider.refreshInBackground("service_start")
         earcons = EarconPlayer { routeManager }
         telecomSession = AssistantTelecomSession(this)
         telecomSession.register()
@@ -248,7 +271,7 @@ class VoiceAgentService : Service() {
             ACTION_TOGGLE -> toggleAgent()
             Intent.ACTION_MEDIA_BUTTON -> handleMediaButtonIntent(intent)
             ACTION_TEXT_INPUT -> {
-                ensureDormantForeground()
+                ensureForegroundForCurrentState()
                 val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
                 if (text.isNotBlank()) {
                     serviceScope.launch { processUserText(text.trim(), source = "text") }
@@ -269,6 +292,7 @@ class VoiceAgentService : Service() {
         mediaSession?.release()
         mediaSession = null
         serviceScope.cancel()
+        locationProvider.close()
         super.onDestroy()
     }
 
@@ -288,16 +312,7 @@ class VoiceAgentService : Service() {
 
     private fun wakeAgent() {
         DiagLog.i("agent.wake.begin", "dormant=$dormant loop=${loopJob?.isActive == true}", showInUi = true)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification("唤醒中..."),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, buildNotification("唤醒中..."))
-        }
+        ensureForeground("唤醒中...", microphoneActive = true)
         if (loopJob?.isActive == true && !dormant) return
 
         val config = LLMConfig.auto()
@@ -381,7 +396,7 @@ class VoiceAgentService : Service() {
                 throw e
             } catch (e: NetworkTimeoutException) {
                 handleConnectionLost("voice", e)
-                break
+                continue
             } catch (e: Exception) {
                 Timber.e(e, "Voice loop failed")
                 emitLog("本轮失败: ${e.message}")
@@ -478,21 +493,55 @@ class VoiceAgentService : Service() {
         initialThinkingMode: CloudSpeechClient.ThinkingMode,
         maxToolRounds: Int,
         allowReasoningEscalation: Boolean,
+        toolsEnabled: Boolean = true,
         beforeSpeech: suspend () -> Unit = {},
     ): AgentLoop.Outcome.Completed {
+        var reasoningFeedbackJob: Job? = null
+
+        fun startReasoningFeedback(source: String) {
+            if (reasoningFeedbackJob?.isActive == true) return
+            reasoningFeedbackJob = serviceScope.launch {
+                val startedAt = System.currentTimeMillis()
+                DiagLog.i("agent.wait_feedback.started", "source=$source")
+                runCatching { playThinkingFeedback() }
+                    .onFailure { Timber.w(it, "Reasoning feedback playback failed source=$source") }
+                DiagLog.i(
+                    "agent.wait_feedback.finished",
+                    "source=$source elapsedMs=${System.currentTimeMillis() - startedAt}",
+                )
+            }
+        }
+
+        suspend fun awaitReasoningFeedback() {
+            reasoningFeedbackJob?.join()
+            reasoningFeedbackJob = null
+        }
+
         val loop = AgentLoop(
             runtime = object : AgentLoop.Runtime {
                 override fun toolDefinitions(allowReasoningEscalation: Boolean) =
-                    toolRegistry.definitions(
-                        profile = MainToolRegistry.Profile.STANDALONE,
-                        allowReasoningEscalation = allowReasoningEscalation,
-                    )
+                    if (toolsEnabled) {
+                        toolRegistry.definitions(
+                            profile = MainToolRegistry.Profile.STANDALONE,
+                            allowReasoningEscalation = allowReasoningEscalation,
+                        )
+                    } else {
+                        emptyList()
+                    }
 
                 override suspend fun modelTurn(
                     request: CloudSpeechClient.ChatRequest,
                     beforeSpeech: suspend () -> Unit,
                     onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
-                ): AgentLoop.ModelTurn = streamModelTurn(client, request, beforeSpeech, onStreamEvent)
+                ): AgentLoop.ModelTurn = streamModelTurn(
+                    client = client,
+                    request = request,
+                    beforeSpeech = {
+                        awaitReasoningFeedback()
+                        beforeSpeech()
+                    },
+                    onStreamEvent = onStreamEvent,
+                )
 
                 override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) =
                     normalizeLegacyMessage(message)
@@ -503,11 +552,14 @@ class VoiceAgentService : Service() {
                 override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
                     toolRegistry.reasoningEscalationReason(call)
 
+                override fun onReasoningEscalation(reason: String) {
+                    startReasoningFeedback("model")
+                }
+
                 override fun reasoningEscalationResult(
                     call: CloudSpeechClient.ToolCall,
                 ): AgentLoop.ToolExecution {
                     val reason = toolRegistry.reasoningEscalationReason(call)
-                    emitToolStatus("开启深度思考")
                     emitLog("开启深度思考: $reason")
                     updateNotification("深入思考中...")
                     return AgentLoop.ToolExecution(
@@ -520,13 +572,23 @@ class VoiceAgentService : Service() {
                     )
                 }
 
+                override fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
+                    toolRegistry.countsTowardAutomaticReasoning(call)
+
+                override suspend fun onAutomaticReasoningEscalation(
+                    toolCallCount: Int,
+                    triggerCalls: List<CloudSpeechClient.ToolCall>,
+                ) {
+                    startReasoningFeedback("automatic:$toolCallCount")
+                }
+
                 override fun canExecuteToolInParallel(call: CloudSpeechClient.ToolCall): Boolean =
                     toolRegistry.canExecuteInParallel(call)
 
                 override fun toolDisplayName(toolName: String) = toolRegistry.displayName(toolName)
 
                 override suspend fun executeTool(call: CloudSpeechClient.ToolCall) =
-                    executeToolCall(client, call)
+                    executeToolCall(call)
 
                 override fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String) =
                     blockedToolCall(call, reason)
@@ -540,6 +602,7 @@ class VoiceAgentService : Service() {
                     EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, finalText))
                     emitLog("助手: $finalText")
                     if (!streamedSpeech) {
+                        awaitReasoningFeedback()
                         beforeSpeech()
                         speakAssistantText(client, optimizeSpokenReply(finalText))
                         return true
@@ -549,19 +612,23 @@ class VoiceAgentService : Service() {
             },
             eventSink = ::onAgentEvent,
         )
-        return when (val outcome = agentHarness.run(
-            loop,
-            AgentLoop.Config(
-                messages = messages,
-                initialThinkingMode = initialThinkingMode,
-                maxToolRounds = maxToolRounds,
-                allowReasoningEscalation = allowReasoningEscalation,
-                fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
-                deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
-                beforeSpeech = beforeSpeech,
-            ),
-        )) {
-            is AgentLoop.Outcome.Completed -> outcome
+        return try {
+            when (val outcome = agentHarness.run(
+                loop,
+                AgentLoop.Config(
+                    messages = messages,
+                    initialThinkingMode = initialThinkingMode,
+                    maxToolRounds = maxToolRounds,
+                    allowReasoningEscalation = allowReasoningEscalation,
+                    fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
+                    deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
+                    beforeSpeech = beforeSpeech,
+                ),
+            )) {
+                is AgentLoop.Outcome.Completed -> outcome
+            }
+        } finally {
+            awaitReasoningFeedback()
         }
     }
 
@@ -576,17 +643,41 @@ class VoiceAgentService : Service() {
                 "agent.thinking.changed",
                 "turn=${event.turnId} thinking=${event.thinkingMode}",
             )
-            is AgentEvent.ToolStarted -> DiagLog.i(
-                "agent.tool.started",
-                "turn=${event.turnId} id=${event.call.id} name=${event.call.name}",
+            is AgentEvent.AutomaticThinkingEscalated -> {
+                val callNames = event.triggerCalls.joinToString(",") { it.name }
+                DiagLog.i(
+                    "agent.thinking.auto_escalated",
+                    "turn=${event.turnId} count=${event.toolCallCount} calls=$callNames",
+                )
+                val status = "正在深入分析"
+                store.addMessage("system", status)
+                EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, status))
+                updateNotification("深入分析中...")
+            }
+            is AgentEvent.ToolStarted -> {
+                DiagLog.i(
+                    "agent.tool.started",
+                    "turn=${event.turnId} id=${event.call.id} name=${event.call.name}",
+                )
+                startToolStatus(event.call, event.displayName)
+            }
+            is AgentEvent.ParallelToolsStarted -> DiagLog.i(
+                "agent.tools.parallel",
+                "turn=${event.turnId} count=${event.calls.size} names=${event.calls.joinToString(",") { it.name }}",
             )
             is AgentEvent.ToolFinished -> {
                 DiagLog.i(
                     "agent.tool.finished",
                     "turn=${event.turnId} id=${event.call.id} success=${event.success} blocked=${event.blocked}",
                 )
+                finishToolStatus(event.call, event.success && !event.blocked)
                 if (!toolRegistry.isReasoningEscalation(event.call)) {
-                    store.addLlmMessage(event.result)
+                    store.addToolResult(
+                        turnId = event.turnId,
+                        call = event.call,
+                        result = event.result,
+                        success = event.success && !event.blocked,
+                    )
                 }
             }
             is AgentEvent.TurnFinished -> DiagLog.i(
@@ -617,36 +708,26 @@ class VoiceAgentService : Service() {
     }
 
     private suspend fun executeToolCall(
-        client: CloudSpeechClient,
         call: CloudSpeechClient.ToolCall,
-    ): AgentLoop.ToolExecution = coroutineScope {
+    ): AgentLoop.ToolExecution {
         if (call.name == MainToolRegistry.TOOL_PROTOCOL_REPAIR) {
             emitLog("检测到无效工具协议，要求模型使用原生 tool_calls 重试")
-            return@coroutineScope AgentLoop.ToolExecution(
+            return AgentLoop.ToolExecution(
                 message = CloudSpeechClient.LlmMessage(
                     role = "tool",
-                    content = "上一次工具调用格式无效。请立即使用 API 提供的原生工具调用重试；不要输出 XML、JSON 或解释文字。",
+                    content = "未受支持的工具调用格式。请立即使用 API 提供的原生 tool_calls 重新输出；不要在正文中输出 XML、JSON、代码块、工具标签或解释文字。如果原内容不是工具调用而是展示资料，请用 Markdown 三反引号围栏包裹，并在围栏外提供一句自然语言结论。",
                     toolCallId = call.id,
                 ),
                 succeeded = false,
             )
         }
-        val title = "调用工具：${toolRegistry.displayName(call.name)}"
-        emitToolStatus(title)
-        emitLog("$title args=${call.arguments.take(300)}")
+        val title = "${toolRegistry.displayName(call.name)}"
+        emitLog("调用工具：$title args=${call.arguments.take(300)}")
 
-        val acknowledgement = toolRegistry.audibleAcknowledgement(call.name)
-        val acknowledgementJob = acknowledgement?.let { text ->
-            async { speakAssistantText(client, text) }
-        }
         val execution = toolRegistry.execute(call)
-        acknowledgementJob?.await()
-
         val result = execution.result
-        store.addMessage("tool", result.displayText)
-        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, result.displayText))
         emitLog("工具结果: ${result.contextText}")
-        AgentLoop.ToolExecution(
+        return AgentLoop.ToolExecution(
             message = CloudSpeechClient.LlmMessage(
                 role = "tool",
                 content = result.contextText.take(MAX_TOOL_RESULT_CHARS),
@@ -661,7 +742,6 @@ class VoiceAgentService : Service() {
         reason: String,
     ): CloudSpeechClient.LlmMessage {
         val status = "已阻止重复工具调用：${toolRegistry.displayName(call.name)}"
-        emitToolStatus(status)
         emitLog("$status id=${call.id}")
         return CloudSpeechClient.LlmMessage(
             role = "tool",
@@ -670,29 +750,54 @@ class VoiceAgentService : Service() {
         )
     }
 
-    private fun emitToolStatus(text: String) {
-        store.addMessage("tool", text)
-        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, text))
+    private fun startToolStatus(call: CloudSpeechClient.ToolCall, displayName: String) {
+        val text = compactToolLabel(call, displayName)
+        val stored = store.addMessage(
+            role = "tool",
+            content = text,
+            toolCallId = call.id,
+            toolStatus = ToolDisplayStatus.RUNNING,
+        )
+        toolStatusMessageIds[call.id] = stored.id
+        EventBus.emitChatMessage(
+            ChatMessage(
+                role = ChatRole.SYSTEM,
+                text = text,
+                toolCallId = call.id,
+                toolStatus = ToolDisplayStatus.RUNNING,
+            ),
+        )
+    }
+
+    private fun finishToolStatus(call: CloudSpeechClient.ToolCall, success: Boolean) {
+        val text = compactToolLabel(call, toolRegistry.displayName(call.name))
+        val status = if (success) ToolDisplayStatus.SUCCEEDED else ToolDisplayStatus.FAILED
+        val messageId = toolStatusMessageIds.remove(call.id)
+        if (messageId != null) {
+            store.updateMessage(messageId, text, toolStatus = status)
+        } else {
+            store.addMessage("tool", text, toolCallId = call.id, toolStatus = status)
+        }
+        EventBus.emitChatMessage(
+            ChatMessage(
+                role = ChatRole.SYSTEM,
+                text = text,
+                toolCallId = call.id,
+                toolStatus = status,
+            ),
+        )
+    }
+
+    private fun compactToolLabel(call: CloudSpeechClient.ToolCall, displayName: String): String {
+        val summary = toolRegistry.displaySummary(call)
+        return if (summary.isNullOrBlank()) "🔧 $displayName" else "🔧 $displayName · $summary"
     }
 
     private fun normalizeLegacyMessage(message: CloudSpeechClient.LlmMessage): CloudSpeechClient.LlmMessage {
         if (message.toolCalls.isNotEmpty()) return message
         val raw = message.content.orEmpty()
-        if (!raw.contains("<LOCAL_ACTION>", ignoreCase = true) &&
-            !raw.contains("<HUB_ACTION>", ignoreCase = true) &&
-            !raw.contains("<REPLY>", ignoreCase = true) &&
-            !raw.contains("<tool_call>", ignoreCase = true)
-        ) {
-            return message
-        }
-        val parsed = StructuredOutputParser.parse(raw)
-        val calls = parsed.actions.mapIndexed { index, action ->
-            toolRegistry.normalizeLegacyAction(
-                action = action,
-                callId = "legacy_${UUID.randomUUID()}_$index",
-            )
-        }.filter { toolRegistry.isKnownTool(it.name) }
-        if (raw.contains("<tool_call>", ignoreCase = true) && calls.isEmpty()) {
+        if (!StructuredOutputParser.containsStructuredProtocol(raw)) return message
+        if (StructuredOutputParser.containsToolProtocol(raw)) {
             return message.copy(
                 content = "",
                 toolCalls = listOf(
@@ -704,8 +809,8 @@ class VoiceAgentService : Service() {
                 ),
             )
         }
-        emitLog("兼容旧工具协议：${calls.joinToString { it.name }}")
-        return message.copy(content = parsed.speakText, toolCalls = calls)
+        val parsed = StructuredOutputParser.parse(raw)
+        return message.copy(content = parsed.speakText, toolCalls = emptyList())
     }
 
     private suspend fun streamModelTurn(
@@ -740,16 +845,31 @@ class VoiceAgentService : Service() {
             val playbackSession = StreamingTtsPlaybackSession(client)
             try {
                 var speechGateOpened = false
-                for (segment in ttsQueue) {
+                var segment = ttsQueue.receiveCatching().getOrNull()
+                var prepared: PreparedTtsAudio? = null
+                while (segment != null) {
                     if (!speechGateOpened) {
                         beforeSpeech()
                         speechGateOpened = true
                     }
                     streamedSpeech = true
                     emitLog("播报: $segment")
-                    if (!playbackSession.playSentence(segment)) {
+                    val nextPrefetch = async(Dispatchers.IO) {
+                        ttsQueue.receiveCatching().getOrNull()?.let { next ->
+                            next to playbackSession.prepareSentence(next)
+                        }
+                    }
+                    val played = if (prepared != null) {
+                        playbackSession.playPrepared(prepared!!)
+                    } else {
+                        playbackSession.playSentence(segment!!)
+                    }
+                    if (!played) {
                         playFullTtsSentence(client, segment)
                     }
+                    val next = nextPrefetch.await()
+                    segment = next?.first
+                    prepared = next?.second
                 }
             } finally {
                 playbackSession.finish()
@@ -811,8 +931,10 @@ class VoiceAgentService : Service() {
     }
 
     private fun shouldStreamDirectSpeech(request: CloudSpeechClient.ChatRequest): Boolean {
-        if (request.thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) return false
-        if (request.messages.any { it.role == "tool" }) return false
+        // Deep reasoning and post-tool final answers are still user-visible text.
+        // Reasoning deltas and native tool calls are parsed separately and never enter this path.
+        if (request.thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) return true
+        if (request.messages.any { it.role == "tool" }) return true
         val recentText = request.messages
             .filter { it.role == "user" || it.role == "assistant" }
             .takeLast(4)
@@ -935,6 +1057,20 @@ class VoiceAgentService : Service() {
         }
     }
 
+    private suspend fun playThinkingFeedback() {
+        val resourceId = synchronized(thinkingFeedbackLock) {
+            val previous = lastThinkingFeedbackAudio
+            val available = THINKING_FEEDBACK_AUDIO.filterNot { it == previous }
+            available.random(Random.Default).also { lastThinkingFeedbackAudio = it }
+        }
+        val resourceName = resources.getResourceEntryName(resourceId)
+        val audioBytes = withContext(Dispatchers.IO) {
+            resources.openRawResource(resourceId).use { it.readBytes() }
+        }
+        emitLog("思考反馈音: $resourceName")
+        playAudio(CloudSpeechClient.AudioPayload(audioBytes, "audio/wav"))
+    }
+
     private suspend fun handleLocalConversationCommand(text: String): Boolean {
         val normalized = text.trim().lowercase()
         val compact = normalized.replace(" ", "")
@@ -943,21 +1079,52 @@ class VoiceAgentService : Service() {
         if (!isNew) return false
 
         store.startNewConversation(reason = text)
+        locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
-        val msg = "已开启新话题"
-        store.addMessage("system", msg)
-        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, msg))
-        emitLog(msg)
-        serviceScope.launch {
-            val location = locationProvider.currentLocation(timeoutMs = 8_000L, forceFresh = true)
-            if (location != null) {
-                store.setLocation(location)
-                val locationMsg = "新话题定位已更新"
-                store.addMessage("tool", locationMsg)
-                EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, locationMsg))
-            }
+        emitLog("已开启新话题，准备主动问候")
+
+        val client = ensureSpeechClient()
+        if (client == null) {
+            emitSessionGreetingFallback(null)
+            return true
         }
-        return true
+
+        updateNotification("正在问候...")
+        return try {
+            runAgentLoop(
+                client = client,
+                messages = buildMessages(
+                    userText = SESSION_GREETING_TRIGGER,
+                    currentUserMessageId = SESSION_GREETING_MESSAGE_ID,
+                    source = "session",
+                ),
+                initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                maxToolRounds = 1,
+                allowReasoningEscalation = false,
+                toolsEnabled = false,
+            )
+            updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
+            true
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Timber.w(error, "Session greeting failed")
+            emitLog("新话题问候失败，使用本地问候")
+            emitSessionGreetingFallback(client)
+            true
+        }
+    }
+
+    private suspend fun emitSessionGreetingFallback(client: CloudSpeechClient?) {
+        val greeting = "你好，新的话题开始了。想聊什么？"
+        store.addMessage("assistant", greeting)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, greeting))
+        emitLog("助手: $greeting")
+        if (client != null) {
+            runCatching { speakAssistantText(client, greeting) }
+                .onFailure { Timber.w(it, "Session greeting fallback TTS failed") }
+        }
+        updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
     }
 
     private fun ensureSpeechClient(): CloudSpeechClient? {
@@ -1003,54 +1170,29 @@ class VoiceAgentService : Service() {
         private var sampleRate = STREAM_TTS_SAMPLE_RATE
         private var firstAudioLogged = false
         private var playbackStartedLogged = false
+        private var speechStarted = false
+        private var pendingTail = ByteArray(0)
         private val focus = requestPlaybackFocus()
         private val startedAt = System.currentTimeMillis()
 
         suspend fun playSentence(sentence: String): Boolean = withContext(Dispatchers.IO) {
             if (!ENABLE_STREAMING_TTS || sentence.isBlank()) return@withContext false
 
-            var pendingTail = ByteArray(0)
             var wroteAudio = false
-            var sentenceSampleRate = sampleRate
             val result = runCatching {
                 Timber.i("Latency TTS stream_start chars=${sentence.length}")
                 val streamed = client.streamSynthesizeSpeech(sentence) { payload ->
                     val rawChunk = decodePcmChunk(payload.bytes)
                     if (rawChunk.pcm.isEmpty()) return@streamSynthesizeSpeech
-                    sentenceSampleRate = rawChunk.sampleRate
-                    val chunk = rawChunk.copy(pcm = amplifyPcm16Le(rawChunk.pcm))
                     if (!firstAudioLogged) {
                         firstAudioLogged = true
                         Timber.i(
                             "Latency TTS first_audio elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                                "bytes=${payload.bytes.size} mime=${payload.mimeType}",
+                            "bytes=${payload.bytes.size} mime=${payload.mimeType}",
                         )
                     }
-                    val track = ensureTrack(chunk.sampleRate, payload.mimeType, rawChunk.pcm, chunk.pcm)
-                    val pcm = chunk.pcm
-                    if (!wroteAudio) {
-                        fadeInPcm16LeInPlace(pcm, chunk.sampleRate)
-                    }
+                    appendPcm(rawChunk.pcm, rawChunk.sampleRate, payload.mimeType)
                     wroteAudio = true
-
-                    val combined = concatBytes(pendingTail, pcm)
-                    val tailBytes = fadeByteCount(chunk.sampleRate).coerceAtMost(combined.size)
-                    val writableBytes = (combined.size - tailBytes).coerceAtLeast(0)
-                    if (writableBytes > 0) {
-                        writePcm(track, combined, 0, writableBytes)
-                    }
-                    pendingTail = if (tailBytes > 0) {
-                        combined.copyOfRange(writableBytes, combined.size)
-                    } else {
-                        ByteArray(0)
-                    }
-                }
-                val track = audioTrack
-                if (track != null && pendingTail.isNotEmpty()) {
-                    fadeOutPcm16LeInPlace(pendingTail, sentenceSampleRate)
-                    writePcm(track, pendingTail, 0, pendingTail.size)
-                    bytesWritten += writeSilence(track, sentenceSampleRate, TTS_INTER_SEGMENT_SILENCE_MS)
-                    pendingTail = ByteArray(0)
                 }
                 streamed && wroteAudio && audioTrack != null
               }
@@ -1067,8 +1209,50 @@ class VoiceAgentService : Service() {
             }
         }
 
+        suspend fun prepareSentence(sentence: String): PreparedTtsAudio? = withContext(Dispatchers.IO) {
+            if (!ENABLE_STREAMING_TTS || sentence.isBlank()) return@withContext null
+
+            val output = ByteArrayOutputStream()
+            var sentenceSampleRate = sampleRate
+            var mimeType: String? = null
+            val result = runCatching {
+                Timber.i("Latency TTS prefetch_start chars=${sentence.length}")
+                val streamed = client.streamSynthesizeSpeech(sentence) { payload ->
+                    val rawChunk = decodePcmChunk(payload.bytes)
+                    if (rawChunk.pcm.isEmpty()) return@streamSynthesizeSpeech
+                    sentenceSampleRate = rawChunk.sampleRate
+                    mimeType = payload.mimeType
+                    output.write(amplifyPcm16Le(rawChunk.pcm))
+                }
+                if (streamed && output.size() > 0) {
+                    Timber.i(
+                        "Latency TTS prefetch_ready chars=${sentence.length} " +
+                            "bytes=${output.size()} sampleRate=$sentenceSampleRate",
+                    )
+                    PreparedTtsAudio(output.toByteArray(), sentenceSampleRate, mimeType)
+                } else {
+                    null
+                }
+            }
+            if (result.isFailure) {
+                val error = result.exceptionOrNull()
+                if (error is CancellationException || error is NetworkTimeoutException) throw error
+                Timber.w(error, "TTS prefetch failed")
+            }
+            result.getOrNull()
+        }
+
+        suspend fun playPrepared(prepared: PreparedTtsAudio): Boolean = withContext(Dispatchers.IO) {
+            if (prepared.pcm.isEmpty()) return@withContext false
+            appendPcm(prepared.pcm, prepared.sampleRate, prepared.mimeType, alreadyBoosted = true)
+            true
+        }
+
         suspend fun finish() = withContext(Dispatchers.IO) {
             val track = audioTrack
+            if (track != null) {
+                flushPendingTail(track)
+            }
             if (track != null && bytesWritten > 0) {
                 if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                     track.play()
@@ -1081,6 +1265,40 @@ class VoiceAgentService : Service() {
             audioTrack?.let { releaseAudioTrack(it) }
             audioTrack = null
             abandonPlaybackFocus(focus)
+        }
+
+        private fun appendPcm(
+            rawPcm: ByteArray,
+            chunkSampleRate: Int,
+            mimeType: String?,
+            alreadyBoosted: Boolean = false,
+        ) {
+            if (rawPcm.isEmpty()) return
+            val pcm = if (alreadyBoosted) rawPcm else amplifyPcm16Le(rawPcm)
+            val track = ensureTrack(chunkSampleRate, mimeType, rawPcm, pcm)
+            if (!speechStarted) {
+                fadeInPcm16LeInPlace(pcm, chunkSampleRate)
+                speechStarted = true
+            }
+
+            val combined = concatBytes(pendingTail, pcm)
+            val tailBytes = fadeByteCount(chunkSampleRate).coerceAtMost(combined.size)
+            val writableBytes = (combined.size - tailBytes).coerceAtLeast(0)
+            if (writableBytes > 0) {
+                writePcm(track, combined, 0, writableBytes)
+            }
+            pendingTail = if (tailBytes > 0) {
+                combined.copyOfRange(writableBytes, combined.size)
+            } else {
+                ByteArray(0)
+            }
+        }
+
+        private fun flushPendingTail(track: AudioTrack) {
+            if (pendingTail.isEmpty()) return
+            fadeOutPcm16LeInPlace(pendingTail, sampleRate)
+            writePcm(track, pendingTail, 0, pendingTail.size)
+            pendingTail = ByteArray(0)
         }
 
         private fun ensureTrack(
@@ -1140,6 +1358,12 @@ class VoiceAgentService : Service() {
             }
         }
     }
+
+    private data class PreparedTtsAudio(
+        val pcm: ByteArray,
+        val sampleRate: Int,
+        val mimeType: String?,
+    )
 
     private data class PcmChunk(val pcm: ByteArray, val sampleRate: Int)
     private data class WavDataChunk(
@@ -1448,6 +1672,7 @@ class VoiceAgentService : Service() {
         )
         if (dormant && loopJob == null && recorder == null) {
             if (keepForeground) ensureDormantForeground()
+            telecomSession.endListening("already_dormant_cleanup")
             DiagLog.i("agent.sleep.noop", "already_dormant", showInUi = true)
             return
         }
@@ -1480,14 +1705,31 @@ class VoiceAgentService : Service() {
     }
 
     private fun ensureDormantForeground() {
+        ensureForeground("休眠中，等待唤醒", microphoneActive = false)
+    }
+
+    private fun ensureForegroundForCurrentState() {
+        ensureForeground(
+            text = if (dormant) "休眠中，等待唤醒" else "聆听中...",
+            microphoneActive = !dormant,
+        )
+    }
+
+    private fun ensureForeground(text: String, microphoneActive: Boolean) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                if (microphoneActive) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
             startForeground(
                 NOTIFICATION_ID,
-                buildNotification("休眠中，等待唤醒"),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+                buildNotification(text),
+                types,
+            )
+            DiagLog.i(
+                "service.foreground_type",
+                "microphone=$microphoneActive types=$types dormant=$dormant",
             )
         } else {
-            startForeground(NOTIFICATION_ID, buildNotification("休眠中，等待唤醒"))
+            startForeground(NOTIFICATION_ID, buildNotification(text))
         }
     }
 
@@ -1511,7 +1753,7 @@ class VoiceAgentService : Service() {
     }
 
     private suspend fun handleConnectionLost(operation: String, error: NetworkTimeoutException) {
-        val message = "网络连接超时，已停止服务，请检查网络后重试。"
+        val message = "本轮网络响应超时，请稍后重试。助手仍保持在线。"
         Timber.w(error, "Network connection lost during $operation")
         DiagLog.w(
             "network.connection_lost",
@@ -1522,8 +1764,7 @@ class VoiceAgentService : Service() {
         EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
         emitLog(message)
         earcons.error()
-        sleepAgent()
-        updateNotification("连接已断开，请检查网络")
+        updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
     }
 
     private fun emitLog(msg: String) {

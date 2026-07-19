@@ -117,6 +117,28 @@ class ChatStreamAccumulatorTest {
         assertFalse(payload.containsKey("temperature"))
     }
 
+    @Test
+    fun `tts payload requests connected slightly faster speech and streaming`() {
+        val client = CloudSpeechClient(
+            LLMConfig(
+                apiKey = "test",
+                baseUrl = "https://example.com/v1",
+                modelName = "mimo-v2.5",
+            ),
+        )
+        val payload = client.buildTtsPayload("第一句。第二句。", stream = true)
+        val messages = payload["messages"]!!.jsonArray
+        val style = messages[0].jsonObject["content"]!!.jsonPrimitive.content
+        val audio = payload["audio"]!!.jsonObject
+
+        assertEquals(true, payload["stream"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals("pcm16", audio["format"]!!.jsonPrimitive.content)
+        assertEquals("冰糖", audio["voice"]!!.jsonPrimitive.content)
+        assertTrue(style.contains("连贯"))
+        assertTrue(style.contains("略快"))
+        assertTrue(style.contains("不要每句话重新起调"))
+    }
+
     private fun chunk(deltaJson: String, finishReason: String? = null): JsonObject {
         val finish = finishReason?.let { "\"$it\"" } ?: "null"
         return json.parseToJsonElement(

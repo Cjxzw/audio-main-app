@@ -12,6 +12,7 @@ import com.agent.voiceassistant.ui.ChatRole.BOT
 import com.agent.voiceassistant.ui.ChatRole.SYSTEM
 import com.agent.voiceassistant.ui.ChatRole.USER
 import timber.log.Timber
+import kotlin.math.roundToInt
 
 class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
 
@@ -25,6 +26,14 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
     }
 
     fun addMessage(msg: ChatMessage) {
+        if (!msg.toolCallId.isNullOrBlank()) {
+            val existing = messages.indexOfFirst { it.toolCallId == msg.toolCallId }
+            if (existing >= 0) {
+                messages[existing] = msg
+                notifyItemChanged(existing)
+                return
+            }
+        }
         messages.add(msg)
         if (messages.size > maxMessages) {
             messages.removeAt(0)
@@ -48,9 +57,33 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         private val tvRole = view.findViewById<TextView>(R.id.tvRole)
         private val tvText = view.findViewById<TextView>(R.id.tvText)
         private val tvTime = view.findViewById<TextView>(R.id.tvTime)
+        private val llToolStatus = view.findViewById<LinearLayout>(R.id.llToolStatus)
+        private val tvToolSummary = view.findViewById<TextView>(R.id.tvToolSummary)
+        private val tvToolState = view.findViewById<TextView>(R.id.tvToolState)
 
         fun bind(msg: ChatMessage) {
             val ctx = itemView.context
+            val isToolStatus = !msg.toolCallId.isNullOrBlank()
+            tvRole.visibility = if (isToolStatus) View.GONE else View.VISIBLE
+            tvTime.visibility = if (isToolStatus) View.GONE else View.VISIBLE
+            tvText.visibility = if (isToolStatus) View.GONE else View.VISIBLE
+            llToolStatus.visibility = if (isToolStatus) View.VISIBLE else View.GONE
+            if (isToolStatus) {
+                llBubble.gravity = android.view.Gravity.START
+                tvToolSummary.text = msg.text
+                tvToolState.text = when (msg.toolStatus ?: inferToolStatus(msg.text)) {
+                    ToolDisplayStatus.RUNNING -> "..."
+                    ToolDisplayStatus.SUCCEEDED -> "✅"
+                    ToolDisplayStatus.FAILED -> "❌"
+                }
+                return
+            }
+            tvText.layoutParams.width = ViewGroup.LayoutParams.WRAP_CONTENT
+            tvText.textSize = 15f
+            tvText.maxLines = Int.MAX_VALUE
+            tvText.ellipsize = null
+            tvText.setPadding(12, 12, 12, 12)
+            tvText.maxWidth = (280 * itemView.resources.displayMetrics.density).roundToInt()
             when (msg.role) {
                 USER -> {
                     llBubble.gravity = android.view.Gravity.END
@@ -73,6 +106,12 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             }
             tvText.text = msg.text
             tvTime.text = msg.timeStr
+        }
+
+        private fun inferToolStatus(text: String): ToolDisplayStatus = when {
+            text.trimEnd().endsWith("✅") -> ToolDisplayStatus.SUCCEEDED
+            text.trimEnd().endsWith("❌") -> ToolDisplayStatus.FAILED
+            else -> ToolDisplayStatus.RUNNING
         }
     }
 }

@@ -23,6 +23,13 @@ sealed interface AgentEvent {
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
+    data class AutomaticThinkingEscalated(
+        override val turnId: String,
+        val toolCallCount: Int,
+        val triggerCalls: List<CloudSpeechClient.ToolCall>,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
     data class MessageStarted(
         override val turnId: String,
         val modelCall: Int,
@@ -52,6 +59,12 @@ sealed interface AgentEvent {
         override val turnId: String,
         val toolCallId: String,
         val detail: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ParallelToolsStarted(
+        override val turnId: String,
+        val calls: List<CloudSpeechClient.ToolCall>,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 

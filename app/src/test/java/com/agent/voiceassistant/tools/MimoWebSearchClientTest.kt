@@ -46,4 +46,15 @@ class MimoWebSearchClientTest {
         assertTrue(result.answer.isEmpty())
         assertEquals("https://example.com", result.sources.single().url)
     }
+
+    @Test
+    fun returnsSourcesFromFirstStreamingAnnotationsEvent() {
+        val result = client.parseStreamEvent(
+            """data: {"choices":[{"delta":{"annotations":[{"url":"https://example.com/live","title":"实时结果","summary":"摘要"}]}}]}""",
+        )
+
+        assertEquals(1, result?.size)
+        assertEquals("实时结果", result?.single()?.title)
+        assertEquals("https://example.com/live", result?.single()?.url)
+    }
 }

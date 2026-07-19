@@ -109,9 +109,11 @@ internal object AssistantTelecomRegistry {
         startRequested = false
     }
 
-    fun detach(value: AssistantConnection) = synchronized(lock) {
-        if (connection === value) connection = null
+    fun detach(value: AssistantConnection): Boolean = synchronized(lock) {
+        if (connection !== value) return@synchronized false
+        connection = null
         startRequested = false
+        true
     }
 
     fun hasLiveConnection(): Boolean = synchronized(lock) {
@@ -147,20 +149,17 @@ internal class AssistantConnection(
 
     override fun onDisconnect() {
         DiagLog.i("telecom.connection.remote_disconnect", showInUi = true)
-        close(DisconnectCause.REMOTE, "headset_or_system")
-        com.agent.voiceassistant.service.VoiceAgentService.sleep(context)
+        sleepIfCurrent(close(DisconnectCause.REMOTE, "headset_or_system"), "disconnect")
     }
 
     override fun onAbort() {
         DiagLog.i("telecom.connection.abort", showInUi = true)
-        close(DisconnectCause.CANCELED, "abort")
-        com.agent.voiceassistant.service.VoiceAgentService.sleep(context)
+        sleepIfCurrent(close(DisconnectCause.CANCELED, "abort"), "abort")
     }
 
     override fun onReject() {
         DiagLog.i("telecom.connection.reject", showInUi = true)
-        close(DisconnectCause.REJECTED, "reject")
-        com.agent.voiceassistant.service.VoiceAgentService.sleep(context)
+        sleepIfCurrent(close(DisconnectCause.REJECTED, "reject"), "reject")
     }
 
     override fun onAnswer() {
@@ -190,11 +189,20 @@ internal class AssistantConnection(
         close(DisconnectCause.LOCAL, reason)
     }
 
-    private fun close(code: Int, reason: String) {
-        if (closed) return
+    private fun sleepIfCurrent(wasCurrent: Boolean, event: String) {
+        if (wasCurrent) {
+            com.agent.voiceassistant.service.VoiceAgentService.sleep(context)
+        } else {
+            DiagLog.i("telecom.connection.stale_ignored", "event=$event")
+        }
+    }
+
+    private fun close(code: Int, reason: String): Boolean {
+        if (closed) return false
         closed = true
-        AssistantTelecomRegistry.detach(this)
+        val wasCurrent = AssistantTelecomRegistry.detach(this)
         setDisconnected(DisconnectCause(code, reason))
         destroy()
+        return wasCurrent
     }
 }

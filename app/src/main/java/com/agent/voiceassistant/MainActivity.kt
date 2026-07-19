@@ -78,7 +78,6 @@ class MainActivity : AppCompatActivity() {
             if (isListening) {
                 VoiceAgentService.stop(this)
                 binding.btnToggle.text = getString(R.string.btn_start)
-                binding.tvStatus.text = getString(R.string.status_idle)
             } else {
                 ensurePermissionsAndStart()
             }
@@ -148,11 +147,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         lifecycleScope.launch {
-            EventBus.pendingCounts.collectLatest { count ->
-                binding.tvPendingCount.text = "待汇报: $count"
-            }
-        }
-        lifecycleScope.launch {
             EventBus.chatMessages.collectLatest { msg ->
                 chatAdapter.addMessage(msg)
                 binding.rvChat.scrollToPosition(chatAdapter.itemCount - 1)
@@ -175,15 +169,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStateDisplay(state: ServiceState) {
-        val text = when (state) {
-            ServiceState.IDLE -> getString(R.string.status_idle)
-            ServiceState.DORMANT -> getString(R.string.status_dormant)
-            ServiceState.INITIALIZING -> getString(R.string.status_initializing)
-            ServiceState.READY -> "已就绪"
-            ServiceState.LISTENING -> getString(R.string.status_listening)
-            ServiceState.FAILED -> getString(R.string.status_failed)
-        }
-        binding.tvStatus.text = text
         if (state == ServiceState.LISTENING) {
             binding.btnToggle.text = getString(R.string.btn_stop)
         } else if (state == ServiceState.IDLE || state == ServiceState.DORMANT || state == ServiceState.FAILED) {

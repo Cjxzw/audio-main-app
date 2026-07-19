@@ -1,9 +1,9 @@
 package com.agent.voiceassistant.cloud
 
 class SpeechSegmenter(
-    private val minHardChars: Int = 70,
-    private val softTargetChars: Int = 150,
-    private val maxChars: Int = 240,
+    private val minHardChars: Int = 120,
+    private val softTargetChars: Int = 180,
+    private val maxChars: Int = 300,
 ) {
     private val buffer = StringBuilder()
 
