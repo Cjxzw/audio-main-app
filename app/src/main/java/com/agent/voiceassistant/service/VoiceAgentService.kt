@@ -47,6 +47,7 @@ import com.agent.voiceassistant.cloud.SpeechSegmenter
 import com.agent.voiceassistant.cloud.SimpleVadRecorder
 import com.agent.voiceassistant.cloud.StreamingSpeechExtractor
 import com.agent.voiceassistant.data.ConversationStore
+import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.tools.LocalToolExecutor
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CodeGraphIndex
@@ -103,6 +104,7 @@ class VoiceAgentService : Service() {
         private const val STREAM_TTS_SAMPLE_RATE = 24_000
         private const val INITIAL_STREAM_BUFFER_BYTES = 9_600
         private const val ENABLE_STREAMING_TTS = true
+        private const val ENABLE_LEGACY_MEDIA_SESSION = false
         private const val ENABLE_PLAYBACK_DONE_EARCON = false
         private const val TTS_OUTPUT_GAIN = 1.2f
         private const val TTS_FADE_MS = 18
@@ -256,7 +258,10 @@ class VoiceAgentService : Service() {
         telecomSession = AssistantTelecomSession(this)
         telecomSession.register()
         createNotificationChannel()
-        setupMediaSession()
+        MainMediaLibraryService.ensureStarted(this)
+        if (ENABLE_LEGACY_MEDIA_SESSION) {
+            setupMediaSession()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -324,6 +329,7 @@ class VoiceAgentService : Service() {
 
         dormant = false
         updateMediaPlaybackState()
+        MainMediaLibraryService.publishState(this, active = true, status = "聆听中")
         telecomSession.beginListening()
         val routes = AudioRouteManager(this)
         routeManager = routes
@@ -1046,6 +1052,7 @@ class VoiceAgentService : Service() {
         try {
             for (sentence in sentences) {
                 emitLog("播报: $sentence")
+                MainMediaLibraryService.publishNowPlaying(this@VoiceAgentService, sentence, "正在播报")
                 if (playbackSession.playSentence(sentence)) {
                     streamedAny = true
                 } else {
@@ -1054,6 +1061,7 @@ class VoiceAgentService : Service() {
             }
         } finally {
             playbackSession.finish()
+            MainMediaLibraryService.publishState(this, active = !dormant, status = if (dormant) "休眠中" else "聆听中")
         }
     }
 
@@ -1687,6 +1695,7 @@ class VoiceAgentService : Service() {
         emitState(ServiceState.DORMANT)
         emitLog("Agent 已休眠")
         updateMediaPlaybackState()
+        MainMediaLibraryService.publishState(this, active = false, status = "休眠中")
         if (keepForeground) ensureDormantForeground()
         DiagLog.i(
             "agent.sleep.done",
@@ -1901,24 +1910,28 @@ class VoiceAgentService : Service() {
         )
         val actionIcon = if (dormant) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
         val actionText = if (dormant) "唤醒" else "休眠"
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("语音助手")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)
             .addAction(actionIcon, actionText, controlPi)
-            .setStyle(
+            .setOngoing(true)
+
+        if (ENABLE_LEGACY_MEDIA_SESSION) {
+            builder.setStyle(
                 androidx.media.app.NotificationCompat.MediaStyle()
                     .setMediaSession(mediaSession?.sessionToken)
-                    .setShowActionsInCompactView(0)
+                    .setShowActionsInCompactView(0),
             )
-            .setOngoing(true)
-            .build()
+        }
+        return builder.build()
     }
 
     private fun updateNotification(text: String) {
         val mgr = getSystemService(NotificationManager::class.java)
         mgr.notify(NOTIFICATION_ID, buildNotification(text))
+        MainMediaLibraryService.publishState(this, active = !dormant, status = text)
     }
 
 }
