@@ -34,6 +34,12 @@ class AgentLoop(
         val succeeded: Boolean,
     )
 
+    data class TerminalExecution(
+        val result: ToolExecution,
+        val finalText: String? = null,
+        val playedSpeech: Boolean = false,
+    )
+
     sealed interface Outcome {
         data class Completed(
             val finalText: String,
@@ -51,6 +57,14 @@ class AgentLoop(
         ): ModelTurn
 
         fun normalizeAssistant(message: CloudSpeechClient.LlmMessage): CloudSpeechClient.LlmMessage
+        fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean = false
+        suspend fun executeTerminalPresentation(call: CloudSpeechClient.ToolCall): TerminalExecution =
+            TerminalExecution(
+                result = ToolExecution(
+                    message = blockedTool(call, "当前运行时不支持终止型展示工具"),
+                    succeeded = false,
+                ),
+            )
         fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean
         fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall): String
         fun onReasoningEscalation(reason: String) = Unit
@@ -241,6 +255,29 @@ class AgentLoop(
 
                 if (assistant.toolCalls.isEmpty()) {
                     return completeAssistant(streamed, assistant)
+                }
+
+                val terminalCalls = assistant.toolCalls.filter(runtime::isTerminalPresentation)
+                if (terminalCalls.isNotEmpty()) {
+                    workingMessages += assistant
+                    if (terminalCalls.size != 1 || assistant.toolCalls.size != 1) {
+                        val reason = "终止型展示工具必须单独调用，不能和其他工具同批执行。请重新输出。"
+                        assistant.toolCalls.forEach { call ->
+                            workingMessages += runtime.blockedTool(call, reason)
+                        }
+                        consecutiveToolFailureRounds += 1
+                        return@repeat
+                    }
+                    val terminal = runtime.executeTerminalPresentation(terminalCalls.single())
+                    if (terminal.result.succeeded && !terminal.finalText.isNullOrBlank()) {
+                        playedSpeech = playedSpeech || terminal.playedSpeech
+                        eventSink(AgentEvent.TurnFinished(turnId, terminal.finalText))
+                        eventSink(AgentEvent.AgentFinished(turnId))
+                        return Outcome.Completed(terminal.finalText, playedSpeech)
+                    }
+                    workingMessages += terminal.result.message
+                    consecutiveToolFailureRounds += 1
+                    return@repeat
                 }
 
                 workingMessages += assistant

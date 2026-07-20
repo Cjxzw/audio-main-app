@@ -94,7 +94,14 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                 BOT -> {
                     llBubble.gravity = android.view.Gravity.START
                     tvRole.text = ctx.getString(R.string.chat_role_bot)
-                    tvText.background = ContextCompat.getDrawable(ctx, R.drawable.bubble_bot)
+                    tvText.background = ContextCompat.getDrawable(
+                        ctx,
+                        if (msg.presentation == ChatPresentation.PERSONALIZED_VOICE) {
+                            R.drawable.bubble_voice_reply
+                        } else {
+                            R.drawable.bubble_bot
+                        },
+                    )
                     tvText.setTextColor(ContextCompat.getColor(ctx, android.R.color.black))
                 }
                 SYSTEM -> {

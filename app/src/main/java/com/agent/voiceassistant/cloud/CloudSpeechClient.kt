@@ -39,6 +39,7 @@ import kotlin.coroutines.coroutineContext
 class CloudSpeechClient(
     private val config: LLMConfig,
 ) {
+    private val llmDelegate = OpenAiCompatibleLlmClient(config)
     enum class ThinkingMode(val wireValue: String) {
         DISABLED("disabled"),
         ENABLED("enabled"),
@@ -134,152 +135,18 @@ class CloudSpeechClient(
     suspend fun streamChat(
         request: ChatRequest,
         onEvent: suspend (ChatStreamEvent) -> Unit,
-    ): ChatCompletion {
-        var firstTimeout: FirstEventTimeoutException? = null
-        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
-            try {
-                return streamChatOnce(request, onEvent)
-            } catch (error: FirstEventTimeoutException) {
-                firstTimeout = error
-                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
-                    Timber.w("LLM first event timeout; retrying chat request")
-                }
-            }
-        }
-        throw firstTimeout ?: IOException("LLM request failed before receiving an event")
-    }
+    ): ChatCompletion = llmDelegate.streamChat(request, onEvent)
 
-    private suspend fun streamChatOnce(
-        request: ChatRequest,
-        onEvent: suspend (ChatStreamEvent) -> Unit,
-    ): ChatCompletion = coroutineScope {
-        val payload = buildChatPayload(request)
-        val accumulator = ChatStreamAccumulator()
-        val call = newJsonRequest(payload).also {
-            it.timeout().timeout(config.timeoutSeconds, TimeUnit.SECONDS)
-        }
-        val receivedEvent = AtomicBoolean(false)
-        val firstEventTimedOut = AtomicBoolean(false)
-        val cancellation = coroutineContext[Job]?.invokeOnCompletion {
-            call.cancel()
-        }
-        val firstEventWatchdog = launch(Dispatchers.IO) {
-            delay(FIRST_EVENT_TIMEOUT_MS)
-            if (!receivedEvent.get()) {
-                firstEventTimedOut.set(true)
-                call.cancel()
-            }
-        }
+    internal fun buildChatPayload(request: ChatRequest): JsonObject = llmDelegate.buildChatPayload(request)
 
-        try {
-            withContext(Dispatchers.IO) {
-                call.execute().use { response ->
-                    val responseBody = response.body ?: throw IOException("LLM response body is empty")
-                    if (!response.isSuccessful) {
-                        throw IOException("LLM HTTP ${response.code}: ${responseBody.string().take(500)}")
-                    }
-                    val contentType = responseBody.contentType()?.toString().orEmpty()
-                    if (!contentType.contains("text/event-stream", ignoreCase = true)) {
-                        val text = responseBody.string()
-                        val element = parseJsonOrNull(text)
-                            ?: throw IOException("LLM returned invalid JSON: ${text.take(200)}")
-                        val events = accumulator.accept(element)
-                        if (events.isNotEmpty()) {
-                            receivedEvent.set(true)
-                            firstEventWatchdog.cancel()
-                        }
-                        for (event in events) onEvent(event)
-                        return@withContext
-                    }
-
-                    val source = responseBody.source()
-                    while (true) {
-                        val line = source.readUtf8Line() ?: break
-                        if (!line.startsWith("data:")) continue
-                        val data = line.removePrefix("data:").trim()
-                        if (data == "[DONE]") break
-                        val element = parseJsonOrNull(data) ?: continue
-                        val events = accumulator.accept(element)
-                        if (events.isNotEmpty()) {
-                            receivedEvent.set(true)
-                            firstEventWatchdog.cancel()
-                        }
-                        for (event in events) onEvent(event)
-                    }
-                }
-            }
-            accumulator.complete()
-        } catch (error: IOException) {
-            if (firstEventTimedOut.get() && !receivedEvent.get()) {
-                throw FirstEventTimeoutException(error)
-            }
-            throw error
-        } finally {
-            firstEventWatchdog.cancelAndJoin()
-            cancellation?.dispose()
-        }
-    }
-
-    internal fun buildChatPayload(request: ChatRequest): JsonObject = buildJsonObject {
-        put("model", config.modelName)
-        put("stream", true)
-        put("max_completion_tokens", request.maxCompletionTokens)
-        putJsonObject("thinking") {
-            put("type", request.thinkingMode.wireValue)
-        }
-        if (request.thinkingMode == ThinkingMode.DISABLED) {
-            put("temperature", config.temperature)
-        }
-        putJsonArray("messages") {
-            request.messages.forEach { message -> add(message.toJson()) }
-        }
-        if (request.tools.isNotEmpty()) {
-            putJsonArray("tools") {
-                request.tools.forEach { definition ->
-                    add(buildJsonObject {
-                        put("type", "function")
-                        putJsonObject("function") {
-                            put("name", definition.name)
-                            put("description", definition.description)
-                            put("parameters", definition.parameters)
-                        }
-                    })
-                }
-            }
-            put("tool_choice", "auto")
-        }
-    }
-
-    private fun LlmMessage.toJson(): JsonObject = buildJsonObject {
-        put("role", role)
-        if (content != null) {
-            put("content", content)
-        } else if (role == "assistant" && toolCalls.isNotEmpty()) {
-            put("content", "")
-        }
-        reasoningContent?.let { put("reasoning_content", it) }
-        toolCallId?.let { put("tool_call_id", it) }
-        if (toolCalls.isNotEmpty()) {
-            putJsonArray("tool_calls") {
-                toolCalls.forEach { call ->
-                    add(buildJsonObject {
-                        put("id", call.id)
-                        put("type", "function")
-                        putJsonObject("function") {
-                            put("name", call.name)
-                            put("arguments", call.arguments)
-                        }
-                    })
-                }
-            }
-        }
-    }
-
-    suspend fun synthesizeSpeech(text: String): AudioPayload = withContext(Dispatchers.IO) {
+    suspend fun synthesizeSpeech(
+        text: String,
+        options: VoiceReplyOptions = VoiceReplyOptions(),
+    ): AudioPayload = withContext(Dispatchers.IO) {
         var lastTimeout: IOException? = null
         repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
             try {
-                val full = requestTts(text, stream = false)
+                val full = requestTts(text, stream = false, options = options)
                 if (full.bytes.isEmpty()) throw IOException("Cloud TTS returned empty audio")
                 return@withContext full
             } catch (error: IOException) {
@@ -295,12 +162,13 @@ class CloudSpeechClient(
 
     suspend fun streamSynthesizeSpeech(
         text: String,
+        options: VoiceReplyOptions = VoiceReplyOptions(),
         onAudioChunk: suspend (AudioPayload) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
         var lastTimeout: FirstAudioTimeoutException? = null
         repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
             try {
-                return@withContext streamSynthesizeSpeechOnce(text, onAudioChunk)
+                return@withContext streamSynthesizeSpeechOnce(text, options, onAudioChunk)
             } catch (error: FirstAudioTimeoutException) {
                 lastTimeout = error
                 if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
@@ -313,9 +181,11 @@ class CloudSpeechClient(
 
     private suspend fun streamSynthesizeSpeechOnce(
         text: String,
+        options: VoiceReplyOptions,
         onAudioChunk: suspend (AudioPayload) -> Unit,
     ): Boolean = coroutineScope {
-        val payload = buildTtsPayload(text, stream = true)
+        require(options.mode == VoiceReplyMode.PRESET) { "音色设计模式不支持流式返回" }
+        val payload = buildTtsPayload(text, stream = true, options = options)
         val call = newJsonRequest(payload)
         val receivedAudio = AtomicBoolean(false)
         val firstAudioTimedOut = AtomicBoolean(false)
@@ -375,14 +245,21 @@ class CloudSpeechClient(
     }
 
     fun shutdown() {
+        llmDelegate.close()
         client.dispatcher.cancelAll()
         client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
     }
 
-    private fun requestTts(text: String, stream: Boolean): AudioPayload {
-        val payload = buildTtsPayload(text, stream)
+    private fun requestTts(text: String, stream: Boolean, options: VoiceReplyOptions): AudioPayload {
+        val payload = buildTtsPayload(text, stream, options)
 
-        newJsonRequest(payload, REQUEST_TIMEOUT_SECONDS).execute().use { response ->
+        val timeoutSeconds = if (options.mode == VoiceReplyMode.DESIGN) {
+            VOICE_DESIGN_TIMEOUT_SECONDS
+        } else {
+            REQUEST_TIMEOUT_SECONDS
+        }
+        newJsonRequest(payload, timeoutSeconds).execute().use { response ->
             val body = response.body ?: throw IOException("TTS response body is empty")
             if (!response.isSuccessful) {
                 throw IOException("TTS HTTP ${response.code}: ${body.string().take(500)}")
@@ -404,25 +281,42 @@ class CloudSpeechClient(
         }
     }
 
-    internal fun buildTtsPayload(text: String, stream: Boolean): JsonObject = buildJsonObject {
-        put("model", "mimo-v2.5-tts")
-        if (stream) put("stream", true)
+    internal fun buildTtsPayload(
+        text: String,
+        stream: Boolean,
+        options: VoiceReplyOptions = VoiceReplyOptions(),
+    ): JsonObject = buildJsonObject {
+        val voiceDesign = options.mode == VoiceReplyMode.DESIGN
+        require(!voiceDesign || !stream) { "音色设计模式不支持流式返回" }
+        put("model", if (voiceDesign) "mimo-v2.5-tts-voicedesign" else "mimo-v2.5-tts")
+        if (stream && !voiceDesign) put("stream", true)
         putJsonArray("messages") {
             add(buildJsonObject {
                 put("role", "user")
                 put(
                     "content",
-                    "请用自然、连贯、略快的中文口语语气朗读。保持前后内容的语气连续，不要每句话重新起调。停顿自然，不要刻意拖长语速。只朗读正文，不要添加说明。",
+                    if (voiceDesign) {
+                        options.voicePrompt.orEmpty()
+                    } else {
+                        options.stylePrompt ?: DEFAULT_TTS_STYLE_PROMPT
+                    },
                 )
             })
             add(buildJsonObject {
                 put("role", "assistant")
-                put("content", text)
+                put(
+                    "content",
+                    if (options.performance == VoicePerformance.SINGING) "(唱歌)$text" else text,
+                )
             })
         }
         putJsonObject("audio") {
-            put("format", if (stream) "pcm16" else "wav")
-            put("voice", TTS_VOICE)
+            put("format", if (stream && !voiceDesign) "pcm16" else "wav")
+            if (voiceDesign) {
+                put("optimize_text_preview", false)
+            } else {
+                put("voice", options.voice)
+            }
         }
     }
 
@@ -654,11 +548,12 @@ class CloudSpeechClient(
 
     private companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-        private const val FIRST_EVENT_TIMEOUT_MS = 15_000L
         private const val FIRST_AUDIO_TIMEOUT_MS = 5_000L
         private const val REQUEST_TIMEOUT_SECONDS = 5L
+        private const val VOICE_DESIGN_TIMEOUT_SECONDS = 60L
         private const val MAX_NETWORK_ATTEMPTS = 2
-        private const val TTS_VOICE = "冰糖"
+        private const val DEFAULT_TTS_STYLE_PROMPT =
+            "请用自然、连贯、略快的中文口语语气朗读。保持前后内容的语气连续，不要每句话重新起调。停顿自然，不要刻意拖长语速。只朗读正文，不要添加说明。"
 
         private fun isTimeout(error: IOException): Boolean =
             error is java.io.InterruptedIOException ||

@@ -41,6 +41,7 @@ class MainToolRegistry(
         add(locationReverseGeocode())
         add(weatherCurrent())
         add(webSearch())
+        add(voiceReply())
         add(readFile())
         add(writeFile())
         add(execCommand())
@@ -57,6 +58,9 @@ class MainToolRegistry(
 
     fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean =
         call.name == TOOL_REQUEST_DEEP_REASONING
+
+    fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean =
+        call.name == TOOL_VOICE_REPLY
 
     fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall): String =
         (parseArguments(call.arguments)["reason"] as? JsonPrimitive)
@@ -116,6 +120,7 @@ class MainToolRegistry(
         TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
         TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
         TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
+        TOOL_VOICE_REPLY -> "个性化播报"
         TOOL_PROTOCOL_REPAIR -> "修正工具调用格式"
         else -> toolName
     }
@@ -149,7 +154,9 @@ class MainToolRegistry(
     }
 
     fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
-        call.name != TOOL_REQUEST_DEEP_REASONING && call.name != TOOL_PROTOCOL_REPAIR
+        call.name != TOOL_REQUEST_DEEP_REASONING &&
+            call.name != TOOL_PROTOCOL_REPAIR &&
+            call.name != TOOL_VOICE_REPLY
 
     private fun parseArguments(raw: String): JsonObject {
         if (raw.isBlank()) return JsonObject(emptyMap())
@@ -244,6 +251,41 @@ class MainToolRegistry(
         putJsonObject("reason") {
             put("type", "string")
             put("description", "需要深度思考的简短原因，不向用户播报")
+        }
+    }
+
+    private fun voiceReply() = tool(
+        name = TOOL_VOICE_REPLY,
+        description = "终止型个性化语音回复。仅在用户明确要求唱歌、临时更换音色、模仿特殊说话风格或设计新音色时使用。调用即作为本回合最终答复：正文必须为空，完整可见且可播报的回复全部写入 text，App 不会再请求模型总结。preset 支持四种内置音色及唱歌；design 根据 voice_prompt 临时设计音色，但不支持唱歌。普通问答不要调用。",
+        required = listOf("text", "mode"),
+    ) {
+        putJsonObject("text") {
+            put("type", "string")
+            put("description", "本回合完整最终回复；不得在普通正文中重复输出")
+        }
+        putJsonObject("mode") {
+            put("type", "string")
+            put("enum", buildJsonArray { add(JsonPrimitive("preset")); add(JsonPrimitive("design")) })
+        }
+        putJsonObject("voice") {
+            put("type", "string")
+            put("enum", buildJsonArray {
+                listOf("冰糖", "茉莉", "苏打", "白桦").forEach { add(JsonPrimitive(it)) }
+            })
+            put("description", "preset 模式的内置音色，省略时使用冰糖")
+        }
+        putJsonObject("performance") {
+            put("type", "string")
+            put("enum", buildJsonArray { add(JsonPrimitive("speech")); add(JsonPrimitive("singing")) })
+            put("description", "preset 可选；design 只能 speech")
+        }
+        putJsonObject("style_prompt") {
+            put("type", "string")
+            put("description", "preset 模式的语气、节奏、情绪要求")
+        }
+        putJsonObject("voice_prompt") {
+            put("type", "string")
+            put("description", "design 模式必填，描述目标音色、年龄感、音调和说话风格")
         }
     }
 
@@ -409,6 +451,7 @@ class MainToolRegistry(
         const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
         const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
+        const val TOOL_VOICE_REPLY = "voice_reply"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
 
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48

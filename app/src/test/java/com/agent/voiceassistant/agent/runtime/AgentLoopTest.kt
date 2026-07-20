@@ -320,6 +320,44 @@ class AgentLoopTest {
         assertTrue(runtime.requests.last().tools.isEmpty())
     }
 
+    @Test
+    fun `terminal presentation completes turn without another model request`() = runBlocking {
+        val terminal = CloudSpeechClient.ToolCall("voice-1", "voice_reply", "{\"text\":\"唱给你听\"}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(listOf(message(toolCalls = listOf(terminal)))),
+            terminalToolNames = setOf("voice_reply"),
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("唱给你听", true), outcome)
+        assertEquals(listOf("voice-1"), runtime.terminalCalls)
+        assertTrue(events.none { it is AgentEvent.ToolStarted })
+        assertEquals(1, runtime.requests.size)
+    }
+
+    @Test
+    fun `terminal presentation must be the only tool in its batch`() = runBlocking {
+        val terminal = CloudSpeechClient.ToolCall("voice-1", "voice_reply", "{}")
+        val read = CloudSpeechClient.ToolCall("read-1", "read", "{}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(terminal, read)),
+                    message(content = "我重新回答"),
+                ),
+            ),
+            terminalToolNames = setOf("voice_reply"),
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("我重新回答", true), outcome)
+        assertTrue(runtime.terminalCalls.isEmpty())
+        assertEquals(setOf("voice-1", "read-1"), runtime.blockedCalls.toSet())
+    }
+
     private fun config(maxToolRounds: Int = 2) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
         initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
@@ -343,12 +381,14 @@ class AgentLoopTest {
         private val failedCallIds: Set<String> = emptySet(),
         private val parallelToolNames: Set<String> = emptySet(),
         private val toolDelayMs: Long = 0,
+        private val terminalToolNames: Set<String> = emptySet(),
     ) : AgentLoop.Runtime {
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
         val blockedCalls = mutableListOf<String>()
         val automaticEscalations = mutableListOf<Pair<Int, List<String>>>()
         val modelEscalations = mutableListOf<String>()
+        val terminalCalls = mutableListOf<String>()
         private val activeTools = AtomicInteger(0)
         val maxActiveTools = AtomicInteger(0)
 
@@ -371,6 +411,23 @@ class AgentLoopTest {
         }
 
         override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) = message
+
+        override fun isTerminalPresentation(call: CloudSpeechClient.ToolCall) =
+            call.name in terminalToolNames
+
+        override suspend fun executeTerminalPresentation(
+            call: CloudSpeechClient.ToolCall,
+        ): AgentLoop.TerminalExecution {
+            terminalCalls += call.id
+            return AgentLoop.TerminalExecution(
+                result = AgentLoop.ToolExecution(
+                    CloudSpeechClient.LlmMessage("tool", "done", toolCallId = call.id),
+                    succeeded = true,
+                ),
+                finalText = "唱给你听",
+                playedSpeech = true,
+            )
+        }
 
         override fun isReasoningEscalation(call: CloudSpeechClient.ToolCall) =
             call.name == "request_deep_reasoning"

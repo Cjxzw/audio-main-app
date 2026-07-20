@@ -1,11 +1,13 @@
 package com.agent.voiceassistant.media
 
 import android.os.Looper
+import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
+import androidx.media3.common.util.UnstableApi
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 
@@ -13,6 +15,7 @@ import com.google.common.util.concurrent.ListenableFuture
  * A media-session-facing player for the always-available Main voice session.
  * It exposes a real playable media item without producing silent audio or holding audio focus.
  */
+@OptIn(markerClass = [UnstableApi::class])
 class AssistantMediaPlayer(
     looper: Looper,
     private val callbacks: Callbacks,

@@ -9,8 +9,11 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 使用 Android `ForegroundService` 保持后台运行。
 - 使用 `AudioRouteManager` 优先选择可用的外部通信设备，并为 `AudioRecord`、`AudioTrack` 设置首选设备；无外设时回退手机音频。
 - 使用 MiMo 云端 ASR 将录音 WAV 转文字。
-- 使用 MiMo/OpenAI 兼容 LLM 接口进行流式对话。
+- 聊天模型与 MiMo 语音链路已解耦：设置中心可切换 MiMo 或通用 OpenAI Chat Completions 供应商，ASR/TTS 保持使用内置 MiMo 配置。
+- 自定义供应商支持多配置、连接测试和按回合热切换；API Key 使用 Android Keystore 加密，不写入普通配置或模型上下文。
 - 使用 MiMo 云端流式 TTS 按句播放回复。
+- 支持终止型 `voice_reply` 个性化播报：预设音色可流式整段播报和唱歌，VoiceDesign 可按自然语言临时设计音色；该回复以淡紫色气泡显示，不产生普通工具卡或二次总结。
+- 设置中心采用“总设置 -> 模型与供应商/语音与播报 -> 具体编辑页”的多级结构，当前可配置聊天模型与 50%–150% TTS 增益。
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
 - 工具阶段与最终回复使用独立预算；达到上限或连续失败后仍会保留一次无工具总结。
@@ -90,10 +93,12 @@ adb install -r app\build\outputs\apk\debug\app-debug-ort1171.apk
 ```text
 app/src/main/java/com/agent/voiceassistant/
 ├── service/VoiceAgentService.kt        # Android 生命周期、语音采集和 TTS 播放
-├── cloud/CloudSpeechClient.kt          # MiMo ASR / LLM / TTS 调用
+├── cloud/CloudSpeechClient.kt          # MiMo ASR / TTS 调用
+├── cloud/LlmClient.kt                  # 可替换的聊天模型客户端
 ├── cloud/SimpleVadRecorder.kt          # 轻量录音端点检测与 WAV 生成
 ├── audio/AudioRouteManager.kt          # 外部音频设备选择、路由和释放
 ├── ui/                                # 主界面、聊天列表、音量条
+├── settings/                          # 多级设置、供应商管理与加密配置
 ├── agent/runtime/                     # Harness、AgentLoop、事件和 Skill 索引
 ├── agent/                             # Agent 提示词、逐回合推理策略和旧兼容封装
 ├── tools/                             # 工具注册、Android 执行环境与虚拟文件系统
@@ -104,6 +109,7 @@ app/src/main/java/com/agent/voiceassistant/
 ## 当前限制
 
 - Hub 工具尚未接入新工具注册表，当前 `CONNECTED` Profile 只预留结构。
+- 自定义聊天供应商只影响 LLM；当前 ASR、标准 TTS 和个性化 TTS 仍依赖 APK 内置的 MiMo Key。
 - 主动汇报相关早期模型尚未接入当前 AgentLoop。
 - 语音打断和完整用户状态机尚未实现。
 - 自管理 Telecom 仅在 Agent 唤醒期间注册；与不同厂商系统及第三方 VoIP 的蓝牙路由兼容性仍需持续实机验证。

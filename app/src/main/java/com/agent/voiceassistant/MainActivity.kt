@@ -1,6 +1,7 @@
 package com.agent.voiceassistant
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +18,7 @@ import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.ServiceState
 import com.agent.voiceassistant.service.VoiceAgentService
+import com.agent.voiceassistant.settings.SettingsActivity
 import com.agent.voiceassistant.ui.ChatAdapter
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -83,6 +85,15 @@ class MainActivity : AppCompatActivity() {
             itemAnimator = DefaultItemAnimator().apply { addDuration = 150 }
         }
         loadPersistedChat()
+
+        binding.topAppBar.setOnMenuItemClickListener { item ->
+            if (item.itemId == R.id.action_settings) {
+                startActivity(Intent(this, SettingsActivity::class.java))
+                true
+            } else {
+                false
+            }
+        }
 
         binding.btnToggle.setOnClickListener {
             val isListening = binding.btnToggle.text == getString(R.string.btn_stop)

@@ -6,6 +6,18 @@
     android:layout_height="match_parent"
     android:padding="@dimen/margin_md">
 
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/topAppBar"
+        android:layout_width="0dp"
+        android:layout_height="52dp"
+        android:background="@color/white"
+        app:menu="@menu/menu_main"
+        app:title="@string/main_title"
+        app:titleTextColor="@color/black"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/rvChat"
         android:layout_width="0dp"
@@ -14,7 +26,7 @@
         android:background="@color/white"
         android:padding="@dimen/margin_sm"
         android:clipToPadding="false"
-        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/topAppBar"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintBottom_toTopOf="@id/svLog" />

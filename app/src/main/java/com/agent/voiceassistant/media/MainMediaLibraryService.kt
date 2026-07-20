@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
+import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -15,6 +16,8 @@ import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionResult
+import androidx.media3.session.SessionError
+import androidx.media3.common.util.UnstableApi
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.service.DiagLog
 import com.agent.voiceassistant.service.VoiceAgentService
@@ -26,6 +29,7 @@ import com.google.common.collect.ImmutableList
  * Standard Android media entry point for Main. External controllers such as watches,
  * headsets and car systems can discover this service without using the Telecom stack.
  */
+@OptIn(markerClass = [UnstableApi::class])
 class MainMediaLibraryService : MediaLibraryService() {
 
     private lateinit var assistantPlayer: AssistantMediaPlayer
@@ -92,7 +96,7 @@ class MainMediaLibraryService : MediaLibraryService() {
                 return if (mediaId == MEDIA_ID) {
                     Futures.immediateFuture(LibraryResult.ofItem(currentItem(), null))
                 } else {
-                    Futures.immediateFuture(LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE))
+                    Futures.immediateFuture(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE))
                 }
             }
 

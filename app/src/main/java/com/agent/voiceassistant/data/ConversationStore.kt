@@ -3,6 +3,7 @@ package com.agent.voiceassistant.data
 import android.content.Context
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.ui.ChatMessage
+import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
 import com.agent.voiceassistant.ui.ToolDisplayStatus
 import kotlinx.serialization.Serializable
@@ -62,6 +63,7 @@ class ConversationStore(context: Context) {
         timestamp: Long = System.currentTimeMillis(),
         toolCallId: String? = null,
         toolStatus: ToolDisplayStatus? = null,
+        presentation: ChatPresentation = ChatPresentation.STANDARD,
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -75,6 +77,7 @@ class ConversationStore(context: Context) {
             timestamp = timestamp,
             toolCallId = toolCallId,
             toolStatus = toolStatus?.name,
+            presentation = presentation.name,
         )
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -338,6 +341,9 @@ class ConversationStore(context: Context) {
             timestamp = timestamp,
             toolCallId = toolCallId,
             toolStatus = status,
+            presentation = presentation?.let {
+                runCatching { ChatPresentation.valueOf(it) }.getOrNull()
+            } ?: ChatPresentation.STANDARD,
         )
     }
 
@@ -394,6 +400,7 @@ data class StoredMessage(
     val toolStatus: String? = null,
     val llmVisible: Boolean? = null,
     val chatVisible: Boolean? = null,
+    val presentation: String? = null,
 )
 
 @Serializable

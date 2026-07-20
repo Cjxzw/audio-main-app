@@ -14,7 +14,8 @@ data class LLMConfig(
     val temperature: Double = 0.7,
     val maxTokens: Int = 1024,
     /** 请求超时秒 */
-    val timeoutSeconds: Long = 60
+    val timeoutSeconds: Long = 60,
+    val providerMode: LlmProviderMode = LlmProviderMode.MIMO,
 ) {
     companion object {
         private val PLACEHOLDERS = setOf("", "YOUR_KEY_HERE", "YOUR_STEPFUN_KEY_HERE", "YOUR_OPENAI_KEY_HERE")
@@ -30,7 +31,8 @@ data class LLMConfig(
         fun openAI(): LLMConfig = LLMConfig(
             apiKey = BuildConfig.OPENAI_API_KEY,
             baseUrl = BuildConfig.OPENAI_BASE_URL,
-            modelName = BuildConfig.OPENAI_MODEL
+            modelName = BuildConfig.OPENAI_MODEL,
+            providerMode = LlmProviderMode.OPENAI_COMPATIBLE,
         )
 
         /** 自动选择：检查 .env 是否已填写真实 key */
@@ -40,6 +42,11 @@ data class LLMConfig(
             return openAI()
         }
     }
+}
+
+enum class LlmProviderMode {
+    MIMO,
+    OPENAI_COMPATIBLE,
 }
 
 /**
@@ -87,6 +94,8 @@ fun buildMainSystemPrompt(): String = """
 16. 工具失败后先根据错误调整参数；连续失败时停止机械重试，基于已有结果向用户说明当前进展，并明确区分已确认事实、合理推断和未验证假设。
 17. request_deep_reasoning 是当前用户回合的一次性控制工具。是否申请由当前用户消息附带的本回合引导决定；启用后只在当前回合生效。
 18. 同一步需要读取多个独立文件时，优先在一次 read 调用中使用 paths 数组，不要拆成多个并行 read；所有读取路径必须使用 /source、/logs、/workspace 或 /skills 虚拟路径。
+19. voice_reply 是终止型个性化语音回复工具，只在用户明确要求唱歌、临时换音色、特殊表演语气或设计音色时使用。调用时普通正文必须为空，完整最终回复只写入 text；它必须单独调用，不能和任何其他工具同批出现。调用成功即结束本回合，不会再生成总结。普通聊天与普通播报不得使用。
+20. voice_reply 的 preset 模式可选冰糖、茉莉、苏打、白桦，支持 speech 或 singing；design 模式必须提供详细 voice_prompt，只支持 speech。不要把内部的唱歌标记写入 text。
 
 正文与屏幕详情：
 1. 普通正文必须是可直接播报的自然语言，不得裸露输出 XML、JSON、工具标签、命令或代码。

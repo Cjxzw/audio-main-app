@@ -180,6 +180,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("androidx.lifecycle:lifecycle-service:2.8.4")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.4")
+    implementation("androidx.preference:preference-ktx:1.2.1")
     implementation("androidx.media:media:1.7.0")
     implementation("androidx.media3:media3-common:1.4.1")
     implementation("androidx.media3:media3-session:1.4.1")
