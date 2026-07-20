@@ -59,7 +59,7 @@ class AssistantMediaPlayer(
             .build()
 
         return State.Builder()
-            .setAvailableCommands(Player.Commands.Builder().addAllCommands().build())
+            .setAvailableCommands(SUPPORTED_COMMANDS)
             .setPlayWhenReady(active, Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
             .setPlaybackState(Player.STATE_READY)
             .setPlaylist(listOf(item))
@@ -67,6 +67,12 @@ class AssistantMediaPlayer(
             .setContentPositionMs(0L)
             .setVolume(volume)
             .build()
+    }
+
+    override fun handlePrepare(): ListenableFuture<*> {
+        // Some standard controllers prepare the session before issuing play.
+        invalidateState()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
@@ -107,4 +113,18 @@ class AssistantMediaPlayer(
         .setIsBrowsable(false)
         .setIsPlayable(true)
         .build()
+
+    companion object {
+        val SUPPORTED_COMMANDS: Player.Commands = Player.Commands.Builder()
+            .add(Player.COMMAND_PLAY_PAUSE)
+            .add(Player.COMMAND_PREPARE)
+            .add(Player.COMMAND_STOP)
+            .add(Player.COMMAND_GET_CURRENT_MEDIA_ITEM)
+            .add(Player.COMMAND_GET_TIMELINE)
+            .add(Player.COMMAND_GET_MEDIA_ITEMS_METADATA)
+            .add(Player.COMMAND_CHANGE_MEDIA_ITEMS)
+            .add(Player.COMMAND_GET_VOLUME)
+            .add(Player.COMMAND_SET_VOLUME)
+            .build()
+    }
 }

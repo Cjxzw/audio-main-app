@@ -82,6 +82,19 @@ class AssistantTelecomSession(context: Context) {
         AssistantTelecomRegistry.disconnectFromApp(reason)
     }
 
+    fun unregister() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || telecomManager == null) return
+        runCatching {
+            telecomManager.unregisterPhoneAccount(accountHandle)
+            DiagLog.i("telecom.account.unregistered", "id=$ACCOUNT_ID")
+        }.onFailure {
+            DiagLog.w(
+                "telecom.account.unregister_failed",
+                "${it.javaClass.simpleName}:${it.message}",
+            )
+        }
+    }
+
     companion object {
         private const val ACCOUNT_ID = "voice-assistant-session"
         private const val ACCOUNT_LABEL = "语音助手"

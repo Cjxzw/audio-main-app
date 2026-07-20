@@ -11,7 +11,7 @@ class AssistEntryActivity : Activity() {
         super.onCreate(savedInstanceState)
         Timber.i("AssistEntryActivity invoked: action=${intent?.action}")
         DiagLog.i("assist.entry", "action=${intent?.action}", showInUi = true)
-        VoiceAgentService.toggle(this)
+        VoiceAgentService.wake(this)
         finish()
         overridePendingTransition(0, 0)
     }

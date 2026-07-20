@@ -2,7 +2,6 @@ package com.agent.voiceassistant.service
 
 import android.annotation.SuppressLint
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -48,6 +47,7 @@ import com.agent.voiceassistant.cloud.SimpleVadRecorder
 import com.agent.voiceassistant.cloud.StreamingSpeechExtractor
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.media.MainMediaLibraryService
+import com.agent.voiceassistant.media.AssistantNotificationContract
 import com.agent.voiceassistant.tools.LocalToolExecutor
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CodeGraphIndex
@@ -99,8 +99,6 @@ import kotlin.random.Random
 class VoiceAgentService : Service() {
 
     companion object {
-        private const val CHANNEL_ID = "voice_agent_channel"
-        private const val NOTIFICATION_ID = 1
         private const val STREAM_TTS_SAMPLE_RATE = 24_000
         private const val INITIAL_STREAM_BUFFER_BYTES = 9_600
         private const val ENABLE_STREAMING_TTS = true
@@ -144,6 +142,7 @@ class VoiceAgentService : Service() {
         )
 
         const val ACTION_START = "com.agent.voiceassistant.START"
+        const val ACTION_BOOTSTRAP = "com.agent.voiceassistant.BOOTSTRAP"
         const val ACTION_STOP = "com.agent.voiceassistant.STOP"
         const val ACTION_WAKE = "com.agent.voiceassistant.WAKE"
         const val ACTION_SLEEP = "com.agent.voiceassistant.SLEEP"
@@ -154,6 +153,16 @@ class VoiceAgentService : Service() {
         fun start(ctx: Context) {
             DiagLog.i("api.start", "ctx=${ctx.javaClass.simpleName}")
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_START)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+        }
+
+        fun bootstrap(ctx: Context) {
+            DiagLog.i("api.bootstrap", "ctx=${ctx.javaClass.simpleName}")
+            val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_BOOTSTRAP)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)
             } else {
@@ -256,7 +265,6 @@ class VoiceAgentService : Service() {
         locationProvider.refreshInBackground("service_start")
         earcons = EarconPlayer { routeManager }
         telecomSession = AssistantTelecomSession(this)
-        telecomSession.register()
         createNotificationChannel()
         MainMediaLibraryService.ensureStarted(this)
         if (ENABLE_LEGACY_MEDIA_SESSION) {
@@ -271,6 +279,7 @@ class VoiceAgentService : Service() {
             showInUi = true,
         )
         when (intent?.action) {
+            ACTION_BOOTSTRAP -> sleepAgent()
             ACTION_START, ACTION_WAKE -> wakeAgent()
             ACTION_SLEEP -> sleepAgent()
             ACTION_TOGGLE -> toggleAgent()
@@ -294,6 +303,7 @@ class VoiceAgentService : Service() {
     override fun onDestroy() {
         hardStopAgent(keepForeground = false)
         telecomSession.endListening("service_destroy")
+        telecomSession.unregister()
         mediaSession?.release()
         mediaSession = null
         serviceScope.cancel()
@@ -1681,6 +1691,7 @@ class VoiceAgentService : Service() {
         if (dormant && loopJob == null && recorder == null) {
             if (keepForeground) ensureDormantForeground()
             telecomSession.endListening("already_dormant_cleanup")
+            telecomSession.unregister()
             DiagLog.i("agent.sleep.noop", "already_dormant", showInUi = true)
             return
         }
@@ -1710,6 +1721,7 @@ class VoiceAgentService : Service() {
                 routeManager = null
             }
             telecomSession.endListening("agent_sleep")
+            telecomSession.unregister()
         }
     }
 
@@ -1729,7 +1741,7 @@ class VoiceAgentService : Service() {
             val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
                 if (microphoneActive) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
             startForeground(
-                NOTIFICATION_ID,
+                AssistantNotificationContract.NOTIFICATION_ID,
                 buildNotification(text),
                 types,
             )
@@ -1738,7 +1750,7 @@ class VoiceAgentService : Service() {
                 "microphone=$microphoneActive types=$types dormant=$dormant",
             )
         } else {
-            startForeground(NOTIFICATION_ID, buildNotification(text))
+            startForeground(AssistantNotificationContract.NOTIFICATION_ID, buildNotification(text))
         }
     }
 
@@ -1879,19 +1891,15 @@ class VoiceAgentService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "语音助手",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "语音助手运行中"
-            }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
+        AssistantNotificationContract.ensureChannel(this)
     }
 
     private fun buildNotification(text: String): Notification {
+        MainMediaLibraryService.buildForegroundNotification(
+            active = !dormant,
+            status = text,
+        )?.let { return it }
+
         val intent = Intent(this, MainActivity::class.java)
         val pi = PendingIntent.getActivity(
             this,
@@ -1910,8 +1918,8 @@ class VoiceAgentService : Service() {
         )
         val actionIcon = if (dormant) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
         val actionText = if (dormant) "唤醒" else "休眠"
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("语音助手")
+        val builder = NotificationCompat.Builder(this, AssistantNotificationContract.CHANNEL_ID)
+            .setContentTitle("枢卫 Main")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)
@@ -1930,7 +1938,7 @@ class VoiceAgentService : Service() {
 
     private fun updateNotification(text: String) {
         val mgr = getSystemService(NotificationManager::class.java)
-        mgr.notify(NOTIFICATION_ID, buildNotification(text))
+        mgr.notify(AssistantNotificationContract.NOTIFICATION_ID, buildNotification(text))
         MainMediaLibraryService.publishState(this, active = !dormant, status = text)
     }
 

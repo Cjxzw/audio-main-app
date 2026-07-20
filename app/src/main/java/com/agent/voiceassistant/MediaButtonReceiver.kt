@@ -29,13 +29,17 @@ class MediaButtonReceiver : BroadcastReceiver() {
         Timber.i("MediaButtonReceiver keyCode=${event.keyCode}")
         when (event.keyCode) {
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_HEADSETHOOK,
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+            KeyEvent.KEYCODE_HEADSETHOOK -> {
                 DiagLog.i("media.receiver.toggle", "key=${KeyEvent.keyCodeToString(event.keyCode)}", showInUi = true)
                 VoiceAgentService.toggle(context)
                 if (isOrderedBroadcast) abortBroadcast()
             }
+            KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                DiagLog.i("media.receiver.wake", "key=${KeyEvent.keyCodeToString(event.keyCode)}", showInUi = true)
+                VoiceAgentService.wake(context)
+                if (isOrderedBroadcast) abortBroadcast()
+            }
+            KeyEvent.KEYCODE_MEDIA_PAUSE,
             KeyEvent.KEYCODE_MEDIA_STOP -> {
                 DiagLog.i("media.receiver.sleep", "key=${KeyEvent.keyCodeToString(event.keyCode)}", showInUi = true)
                 VoiceAgentService.sleep(context)

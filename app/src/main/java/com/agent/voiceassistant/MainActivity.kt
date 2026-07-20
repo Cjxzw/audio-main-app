@@ -13,6 +13,7 @@ import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.databinding.ActivityMainBinding
+import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.ServiceState
 import com.agent.voiceassistant.service.VoiceAgentService
@@ -58,11 +59,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            VoiceAgentService.bootstrap(this)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = ConversationStore(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        MainMediaLibraryService.ensureStarted(this)
+        ensureNotificationPermissionAndBootstrap()
 
         binding.rvChat.apply {
             layoutManager = LinearLayoutManager(this@MainActivity).apply {
@@ -126,6 +137,16 @@ class MainActivity : AppCompatActivity() {
             startAgentService()
         } else {
             permLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun ensureNotificationPermissionAndBootstrap() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            VoiceAgentService.bootstrap(this)
         }
     }
 

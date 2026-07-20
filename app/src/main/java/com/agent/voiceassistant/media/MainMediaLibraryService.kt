@@ -1,19 +1,21 @@
 package com.agent.voiceassistant.media
 
+import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
+import androidx.core.app.NotificationCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.MediaStyleNotificationHelper
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionResult
 import com.agent.voiceassistant.MainActivity
-import com.agent.voiceassistant.R
 import com.agent.voiceassistant.service.DiagLog
 import com.agent.voiceassistant.service.VoiceAgentService
 import com.google.common.util.concurrent.Futures
@@ -28,16 +30,12 @@ class MainMediaLibraryService : MediaLibraryService() {
 
     private lateinit var assistantPlayer: AssistantMediaPlayer
     private lateinit var librarySession: MediaLibrarySession
+    private var currentActive = false
+    private var currentStatus = "休眠中，等待唤醒"
 
     override fun onCreate() {
         super.onCreate()
-        setMediaNotificationProvider(
-            DefaultMediaNotificationProvider.Builder(this)
-                .setNotificationId(NOTIFICATION_ID)
-                .setChannelId(CHANNEL_ID)
-                .setChannelName(R.string.app_name)
-                .build(),
-        )
+        AssistantNotificationContract.ensureChannel(this)
 
         assistantPlayer = AssistantMediaPlayer(Looper.getMainLooper(), object : AssistantMediaPlayer.Callbacks {
             override fun onPlayRequested() {
@@ -55,8 +53,6 @@ class MainMediaLibraryService : MediaLibraryService() {
                 VoiceAgentService.sleep(this@MainMediaLibraryService)
             }
         })
-        assistantPlayer.setAssistantState(active = false, status = "休眠中")
-
         val sessionActivity = PendingIntent.getActivity(
             this,
             12,
@@ -105,35 +101,97 @@ class MainMediaLibraryService : MediaLibraryService() {
                 controller: MediaSession.ControllerInfo,
                 playerCommand: Int,
             ): Int {
-                DiagLog.i("media3.control.command", "command=$playerCommand", showInUi = true)
-                return SessionResult.RESULT_SUCCESS
+                val supported = AssistantMediaPlayer.SUPPORTED_COMMANDS.contains(playerCommand)
+                DiagLog.i(
+                    "media3.control.command",
+                    "command=$playerCommand supported=$supported controller=${controller.packageName}",
+                    showInUi = true,
+                )
+                return if (supported) {
+                    SessionResult.RESULT_SUCCESS
+                } else {
+                    SessionResult.RESULT_ERROR_NOT_SUPPORTED
+                }
             }
         })
             .setId(SESSION_ID)
             .setSessionActivity(sessionActivity)
             .build()
+        addSession(librarySession)
+        activeInstance = this
+        assistantPlayer.setAssistantState(active = false, status = "休眠中")
+        publishUnifiedNotification()
         DiagLog.i("media3.service.ready", "session=$SESSION_ID", showInUi = true)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession = librarySession
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val result = super.onStartCommand(intent, flags, startId)
         if (intent?.action == ACTION_UPDATE_STATE) {
             val status = intent.getStringExtra(EXTRA_STATUS) ?: "休眠中"
+            currentActive = intent.getBooleanExtra(EXTRA_ACTIVE, false)
+            currentStatus = status
             assistantPlayer.setAssistantState(
-                active = intent.getBooleanExtra(EXTRA_ACTIVE, false),
+                active = currentActive,
                 status = status,
             )
             intent.getStringExtra(EXTRA_TITLE)?.let { assistantPlayer.setNowPlaying(it, status) }
+            publishUnifiedNotification()
         }
-        return START_STICKY
+        return result
+    }
+
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        // VoiceAgentService owns the foreground-service lifecycle; both services share this card.
+        publishUnifiedNotification()
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) activeInstance = null
         librarySession.release()
         assistantPlayer.release()
         DiagLog.i("media3.service.destroyed")
         super.onDestroy()
+    }
+
+    private fun publishUnifiedNotification() {
+        getSystemService(NotificationManager::class.java).notify(
+            AssistantNotificationContract.NOTIFICATION_ID,
+            buildUnifiedNotification(currentActive, currentStatus),
+        )
+    }
+
+    private fun buildUnifiedNotification(active: Boolean, status: String): Notification {
+        val sessionActivity = PendingIntent.getActivity(
+            this,
+            12,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val controlIntent = Intent(this, VoiceAgentService::class.java)
+            .setAction(if (active) VoiceAgentService.ACTION_SLEEP else VoiceAgentService.ACTION_WAKE)
+        val controlAction = PendingIntent.getService(
+            this,
+            if (active) 42 else 41,
+            controlIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val actionIcon = if (active) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val actionText = if (active) "休眠" else "唤醒"
+
+        return NotificationCompat.Builder(this, AssistantNotificationContract.CHANNEL_ID)
+            .setContentTitle("枢卫 Main")
+            .setContentText(status)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(sessionActivity)
+            .addAction(actionIcon, actionText, controlAction)
+            .setStyle(MediaStyleNotificationHelper.MediaStyle(librarySession).setShowActionsInCompactView(0))
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .build()
     }
 
     private fun rootItem(): MediaItem = MediaItem.Builder()
@@ -161,8 +219,9 @@ class MainMediaLibraryService : MediaLibraryService() {
         .build()
 
     companion object {
-        private const val CHANNEL_ID = "main_media_session"
-        private const val NOTIFICATION_ID = 41
+        @Volatile
+        private var activeInstance: MainMediaLibraryService? = null
+
         private const val SESSION_ID = "shordway-main"
         private const val ROOT_ID = "shordway-root"
         private const val MEDIA_ID = "shordway-main-session"
@@ -173,6 +232,11 @@ class MainMediaLibraryService : MediaLibraryService() {
 
         fun ensureStarted(context: android.content.Context) {
             context.startService(Intent(context, MainMediaLibraryService::class.java))
+        }
+
+        fun buildForegroundNotification(active: Boolean, status: String): Notification? {
+            val service = activeInstance ?: return null
+            return service.buildUnifiedNotification(active, status)
         }
 
         fun publishState(context: android.content.Context, active: Boolean, status: String) {

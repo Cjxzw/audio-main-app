@@ -20,7 +20,9 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 支持 Agent Skills 渐进加载：上下文只注入 Skill 名称、描述和路径，匹配任务后再读取全文。
 - 会话与本地记忆持久化，支持 `/new` 开启新话题。
 - 每个用户回合默认关闭深度思考；模型或用户可为当前回合升级一次，下一回合自动恢复关闭。
-- 使用 `MediaSessionCompat` 接收播放/暂停类控制，作为唤醒和休眠入口。
+- 使用标准 Media3 `MediaLibraryService` 注册为媒体应用，支持手机控制面板、手表、耳机和音频眼镜的播放/暂停控制。
+- 冷启动即发布持久 MediaStyle 卡片；卡片与前台服务共用同一个通知，提供唤醒/休眠按钮且不产生重复通知。
+- 保留 Android 语音助手 Activity 入口作为兼容层，媒体控制仍是主要的跨设备入口。
 - 支持息屏后台继续响应。
 - 本地 ASR/TTS 模型资产已从当前构建链路移除，避免 APK 过大。
 
@@ -77,7 +79,7 @@ adb install -r app\build\outputs\apk\debug\app-debug-ort1171.apk
 
 1. 打开 App。
 2. 授权麦克风权限。
-3. 点击启动/唤醒 Agent。
+3. 点击启动/唤醒 Agent，或使用媒体卡片及外部设备的播放/暂停按键唤醒。
 4. 说话后等待识别、回复和播报。
 5. 点击休眠或使用媒体播放/暂停控制让 Agent 进入休眠。
 
@@ -104,7 +106,7 @@ app/src/main/java/com/agent/voiceassistant/
 - Hub 工具尚未接入新工具注册表，当前 `CONNECTED` Profile 只预留结构。
 - 主动汇报相关早期模型尚未接入当前 AgentLoop。
 - 语音打断和完整用户状态机尚未实现。
-- 自管理 Telecom 与第三方 VoIP 的蓝牙路由兼容性仍需受控实机验证。
+- 自管理 Telecom 仅在 Agent 唤醒期间注册；与不同厂商系统及第三方 VoIP 的蓝牙路由兼容性仍需持续实机验证。
 - 延迟已有关键埋点，但仍需持续采集实机数据调优。
 - `/source` 和 `/logs` 的只读限制由虚拟文件工具强制执行；`exec` 仍拥有 Android App UID 沙箱内的完整权限，不能把它当作独立安全沙箱。
 
