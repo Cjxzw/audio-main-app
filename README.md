@@ -13,6 +13,7 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 自定义供应商支持多配置、连接测试和按回合热切换；API Key 使用 Android Keystore 加密，不写入普通配置或模型上下文。
 - 使用 MiMo 云端流式 TTS 按句播放回复。
 - 支持终止型 `voice_reply` 个性化播报：预设音色可流式整段播报和唱歌，VoiceDesign 可按自然语言临时设计音色；该回复以淡紫色气泡显示，不产生普通工具卡或二次总结。
+- 支持终止型 `agent_sleep` 语义休眠：用户明确表示结束交互时直接复用完整休眠流程，不再等待静默超时。
 - 设置中心采用“总设置 -> 模型与供应商/语音与播报 -> 具体编辑页”的多级结构，当前可配置聊天模型与 50%–150% TTS 增益。
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
@@ -27,6 +28,7 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 冷启动即发布持久 MediaStyle 卡片；卡片与前台服务共用同一个通知，提供唤醒/休眠按钮且不产生重复通知。
 - 保留 Android 语音助手 Activity 入口作为兼容层，媒体控制仍是主要的跨设备入口。
 - 支持息屏后台继续响应。
+- 静默监听采用 15 秒总截止时间：第 10 秒播放 APK 内置语音“即将休眠”，剩余时间继续监听；第 15 秒仍无有效语音则直接休眠。该提示不依赖网络或云端 TTS。
 - 本地 ASR/TTS 模型资产已从当前构建链路移除，避免 APK 过大。
 
 ## 环境要求
@@ -112,7 +114,10 @@ app/src/main/java/com/agent/voiceassistant/
 - 自定义聊天供应商只影响 LLM；当前 ASR、标准 TTS 和个性化 TTS 仍依赖 APK 内置的 MiMo Key。
 - 主动汇报相关早期模型尚未接入当前 AgentLoop。
 - 语音打断和完整用户状态机尚未实现。
-- 自管理 Telecom 仅在 Agent 唤醒期间注册；与不同厂商系统及第三方 VoIP 的蓝牙路由兼容性仍需持续实机验证。
+- App 已移除自管理 Telecom/PhoneAccount/ConnectionService，媒体键和通知由标准 Media3 会话统一管理；蓝牙麦克风由 `AudioManager` 通信路由直接建立。
+- Android 14+ 从后台媒体命令升级到麦克风前台服务仍存在厂商差异；系统拒绝时会保留休眠状态，并要求用户点击通知或打开 App 后重试。
+- 休眠唤醒后的蓝牙通信路由会主动等待并核验，路由失败不会伪装成已开始监听。
+- 经典蓝牙设备启用 SCO 麦克风后，多功能键可能由 AVRCP 播放/暂停切换为 HFP 接听/挂断；系统不会把这类挂断事件交给纯媒体 App，需使用独立 BLE/HID 控制或避免持续占用 SCO。
 - 延迟已有关键埋点，但仍需持续采集实机数据调优。
 - `/source` 和 `/logs` 的只读限制由虚拟文件工具强制执行；`exec` 仍拥有 Android App UID 沙箱内的完整权限，不能把它当作独立安全沙箱。
 
@@ -133,6 +138,7 @@ app/src/main/java/com/agent/voiceassistant/
 - `write(path, content, mode?)`，只允许写 `/workspace`
 - `exec(command, cwd?, timeout_seconds?)`，`cwd` 使用虚拟目录，默认 30 秒、最大 120 秒
 - `http_request(method, url, body?, credential_profile?)`
+- `agent_sleep()`，仅用于用户明确要求助手离开或休眠的终止型操作
 
 `exec` 默认工作目录是 `/workspace` 对应的物理目录，也可直接把 `cwd` 设为 `/source`、`/logs` 或 `/skills`。兼容环境变量 `SOURCE_ROOT`、`LOGS_ROOT`、`WORKSPACE_ROOT`、`SKILLS_ROOT` 仍然保留。命令有超时和输出上限，不支持交互式或长期驻留任务。
 

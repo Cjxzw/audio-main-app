@@ -22,6 +22,14 @@ import kotlin.math.sqrt
 class SimpleVadRecorder(
     private val routeManager: AudioRouteManager? = null,
 ) {
+    sealed interface CaptureResult {
+        data class Recorded(val recording: Recording) : CaptureResult
+        data class RouteUnavailable(val summary: String) : CaptureResult
+        data object InactivityWarning : CaptureResult
+        data object InactivitySleep : CaptureResult
+        data object Stopped : CaptureResult
+    }
+
     data class Recording(
         val wavBytes: ByteArray,
         val durationMs: Long,
@@ -35,7 +43,11 @@ class SimpleVadRecorder(
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    suspend fun recordNextUtterance(): Recording? = withContext(Dispatchers.IO) {
+    suspend fun recordNextUtterance(
+        inactivityWarningMs: Long = INACTIVITY_WARNING_MS,
+        inactivitySleepMs: Long = INACTIVITY_SLEEP_MS,
+        warningAlreadyPlayed: Boolean = false,
+    ): CaptureResult = withContext(Dispatchers.IO) {
         stopped.set(false)
         val record = createAudioRecord()
         val frames = ArrayList<ShortArray>(256)
@@ -50,18 +62,27 @@ class SimpleVadRecorder(
         var noiseFloor = START_RMS_BASE
         var startThreshold = START_RMS_BASE
         var stopThreshold = STOP_RMS_BASE
+        var speechPeakRms = 0f
         var lastVolumeEmitMs = 0L
+        val listenStartedAt = System.currentTimeMillis()
 
         try {
             routeManager?.applyInputRouting(record)
             record.startRecording()
             Timber.i("CloudRecorder: started, source=${record.audioSource}, buffer=${record.bufferSizeInFrames} frames")
             routeManager?.logRecordRoute(record, "started")
+            if (routeManager?.awaitInputRoute(record) == false) {
+                return@withContext CaptureResult.RouteUnavailable("蓝牙麦克风路由未建立")
+            }
 
             val buffer = ShortArray(FRAME_SAMPLES)
             while (!stopped.get()) {
                 coroutineContext.ensureActive()
                 val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+                if (read < 0) {
+                    Timber.w("CloudRecorder: AudioRecord read failed code=$read")
+                    return@withContext CaptureResult.RouteUnavailable("麦克风读取失败，错误码 $read")
+                }
                 if (read <= 0) continue
 
                 val frame = if (read == buffer.size) buffer.copyOf() else buffer.copyOf(read)
@@ -71,12 +92,33 @@ class SimpleVadRecorder(
                 if (!speechStarted && noiseFrames < CALIBRATION_FRAMES) {
                     noiseSum += rms
                     noiseFrames++
-                    noiseFloor = noiseSum / noiseFrames
+                    noiseFloor = VadThresholdPolicy.boundedNoiseFloor(noiseSum, noiseFrames)
                     startThreshold = max(START_RMS_BASE, noiseFloor * START_NOISE_MULTIPLIER)
                     stopThreshold = max(STOP_RMS_BASE, noiseFloor * STOP_NOISE_MULTIPLIER)
                 }
 
                 val now = System.currentTimeMillis()
+                if (!speechStarted) {
+                    val inactiveMs = now - listenStartedAt
+                    when (
+                        ListeningInactivityPolicy.action(
+                            elapsedMs = inactiveMs,
+                            warningAlreadyPlayed = warningAlreadyPlayed,
+                            warningMs = inactivityWarningMs,
+                            sleepMs = inactivitySleepMs,
+                        )
+                    ) {
+                        ListeningInactivityPolicy.Action.WARN -> {
+                            Timber.i("CloudRecorder: inactivity warning after ${inactiveMs}ms")
+                            return@withContext CaptureResult.InactivityWarning
+                        }
+                        ListeningInactivityPolicy.Action.SLEEP -> {
+                            Timber.i("CloudRecorder: inactivity sleep after ${inactiveMs}ms")
+                            return@withContext CaptureResult.InactivitySleep
+                        }
+                        ListeningInactivityPolicy.Action.CONTINUE -> Unit
+                    }
+                }
                 if (now - lastVolumeEmitMs >= VOLUME_EMIT_INTERVAL_MS) {
                     val visibleLevel = if (noiseFrames >= CALIBRATION_FRAMES) {
                         ((smoothedRms - noiseFloor).coerceAtLeast(0f) * VOLUME_UI_GAIN)
@@ -98,6 +140,7 @@ class SimpleVadRecorder(
                         startFrames++
                         if (startFrames >= START_FRAMES_REQUIRED) {
                             speechStarted = true
+                            speechPeakRms = smoothedRms
                             while (preRoll.isNotEmpty()) {
                                 val pre = preRoll.removeFirst()
                                 frames += pre
@@ -116,8 +159,10 @@ class SimpleVadRecorder(
 
                 frames += frame
                 capturedSamples += read
+                speechPeakRms = max(speechPeakRms, smoothedRms)
 
-                if (smoothedRms < stopThreshold) {
+                val effectiveStopThreshold = VadThresholdPolicy.stopThreshold(stopThreshold, speechPeakRms)
+                if (smoothedRms < effectiveStopThreshold) {
                     silenceFrames++
                 } else {
                     silenceFrames = 0
@@ -126,26 +171,28 @@ class SimpleVadRecorder(
                 val capturedMs = capturedSamples * 1000L / SAMPLE_RATE
                 if (capturedMs >= MIN_UTTERANCE_MS && silenceFrames >= END_SILENCE_FRAMES) {
                     trimTrailingSilence(frames, silenceFrames)
-                    buildRecording(frames)?.let { return@withContext it }
+                    buildRecording(frames)?.let { return@withContext CaptureResult.Recorded(it) }
                     frames.clear()
                     preRoll.clear()
                     speechStarted = false
                     startFrames = 0
                     silenceFrames = 0
                     capturedSamples = 0
+                    speechPeakRms = 0f
                 }
                 if (capturedMs >= MAX_UTTERANCE_MS) {
                     Timber.i("CloudRecorder: max utterance reached (${capturedMs}ms)")
-                    buildRecording(frames, truncated = true)?.let { return@withContext it }
+                    buildRecording(frames, truncated = true)?.let { return@withContext CaptureResult.Recorded(it) }
                     frames.clear()
                     preRoll.clear()
                     speechStarted = false
                     startFrames = 0
                     silenceFrames = 0
                     capturedSamples = 0
+                    speechPeakRms = 0f
                 }
             }
-            null
+            CaptureResult.Stopped
         } finally {
             runCatching { record.stop() }
             record.release()
@@ -261,10 +308,41 @@ class SimpleVadRecorder(
         private const val KEEP_TRAILING_SILENCE_MS = 180L
         private const val PRE_ROLL_MS = 450L
         private const val VOLUME_EMIT_INTERVAL_MS = 100L
+        private const val INACTIVITY_WARNING_MS = 10_000L
+        private const val INACTIVITY_SLEEP_MS = 5_000L
         private const val FRAME_MS = FRAME_SAMPLES * 1000 / SAMPLE_RATE
         private const val CALIBRATION_FRAMES = CALIBRATION_MS.toInt() / FRAME_MS
         private const val END_SILENCE_FRAMES = END_SILENCE_MS.toInt() / FRAME_MS
         private const val KEEP_TRAILING_SILENCE_FRAMES = KEEP_TRAILING_SILENCE_MS.toInt() / FRAME_MS
         private const val PRE_ROLL_FRAMES = PRE_ROLL_MS.toInt() / FRAME_MS
     }
+}
+
+internal object VadThresholdPolicy {
+    private const val MAX_CALIBRATION_NOISE_FLOOR = 0.0030f
+    private const val PEAK_STOP_RATIO = 0.18f
+
+    fun boundedNoiseFloor(noiseSum: Float, frameCount: Int): Float =
+        (noiseSum / frameCount.coerceAtLeast(1)).coerceAtMost(MAX_CALIBRATION_NOISE_FLOOR)
+
+    fun stopThreshold(calibratedThreshold: Float, speechPeakRms: Float): Float =
+        max(calibratedThreshold, speechPeakRms * PEAK_STOP_RATIO)
+}
+
+internal object ListeningInactivityPolicy {
+    enum class Action { CONTINUE, WARN, SLEEP }
+
+    fun action(
+        elapsedMs: Long,
+        warningAlreadyPlayed: Boolean,
+        warningMs: Long,
+        sleepMs: Long,
+    ): Action = when {
+        warningAlreadyPlayed && elapsedMs >= sleepMs -> Action.SLEEP
+        !warningAlreadyPlayed && elapsedMs >= warningMs -> Action.WARN
+        else -> Action.CONTINUE
+    }
+
+    fun remainingUntilSleep(totalMs: Long, elapsedMs: Long): Long =
+        (totalMs - elapsedMs).coerceAtLeast(0L)
 }

@@ -30,7 +30,11 @@ internal class VirtualPathResolver(
 
     fun normalize(path: String): String {
         val normalized = path.trim().replace('\\', '/')
-        require(normalized.startsWith('/')) { "必须使用绝对虚拟路径" }
+        val looksLikeVirtualPath = normalized.startsWith("/source") ||
+            normalized.startsWith("/logs") ||
+            normalized.startsWith("/workspace") ||
+            normalized.startsWith("/skills")
+        require(looksLikeVirtualPath || File(path).isAbsolute) { "必须使用绝对虚拟路径或已知物理路径" }
         require(!normalized.split('/').contains("..")) { "路径不能包含 .." }
         val absolute = normalized.replace(Regex("/+"), "/").removeSuffix("/").ifEmpty { "/" }
 

@@ -34,7 +34,7 @@ fun llmProp(key: String, default: String): String =
 
 val gitCommit = providers.exec {
     workingDir(rootProject.projectDir)
-    commandLine("git", "rev-parse", "--short=12", "HEAD")
+    commandLine("git", "describe", "--always", "--dirty", "--abbrev=12")
 }.standardOutput.asText.map(String::trim).getOrElse("unknown")
 
 val generatedAgentAssets = layout.buildDirectory.dir("generated/agentAssets")
@@ -181,7 +181,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.8.4")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.4")
     implementation("androidx.preference:preference-ktx:1.2.1")
-    implementation("androidx.media:media:1.7.0")
     implementation("androidx.media3:media3-common:1.4.1")
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")

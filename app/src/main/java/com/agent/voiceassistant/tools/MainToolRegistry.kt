@@ -41,6 +41,7 @@ class MainToolRegistry(
         add(locationReverseGeocode())
         add(weatherCurrent())
         add(webSearch())
+        add(agentSleep())
         add(voiceReply())
         add(readFile())
         add(writeFile())
@@ -60,7 +61,10 @@ class MainToolRegistry(
         call.name == TOOL_REQUEST_DEEP_REASONING
 
     fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean =
-        call.name == TOOL_VOICE_REPLY
+        call.name == TOOL_VOICE_REPLY || call.name == TOOL_AGENT_SLEEP
+
+    fun isAgentSleep(call: CloudSpeechClient.ToolCall): Boolean =
+        call.name == TOOL_AGENT_SLEEP
 
     fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall): String =
         (parseArguments(call.arguments)["reason"] as? JsonPrimitive)
@@ -120,6 +124,7 @@ class MainToolRegistry(
         TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
         TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
         TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
+        TOOL_AGENT_SLEEP -> "进入休眠"
         TOOL_VOICE_REPLY -> "个性化播报"
         TOOL_PROTOCOL_REPAIR -> "修正工具调用格式"
         else -> toolName
@@ -156,6 +161,7 @@ class MainToolRegistry(
     fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
         call.name != TOOL_REQUEST_DEEP_REASONING &&
             call.name != TOOL_PROTOCOL_REPAIR &&
+            call.name != TOOL_AGENT_SLEEP &&
             call.name != TOOL_VOICE_REPLY
 
     private fun parseArguments(raw: String): JsonObject {
@@ -288,6 +294,11 @@ class MainToolRegistry(
             put("description", "design 模式必填，描述目标音色、年龄感、音调和说话风格")
         }
     }
+
+    private fun agentSleep() = tool(
+        name = TOOL_AGENT_SLEEP,
+        description = "终止型休眠操作。仅当用户当前明确要求助手离开、结束交互或进入休眠时调用，例如‘退下吧’、‘没事了’、‘休眠’、‘你走吧’、‘再见’、‘滚蛋’及语义明确的同类表达。用户只是讨论、引用、询问这些词语，或意图不明确时不得调用。调用时正文必须为空，必须单独调用，成功后 App 立即执行完整休眠流程。",
+    ) {}
 
     private fun readFile() = tool(
         name = TOOL_READ,
@@ -451,6 +462,7 @@ class MainToolRegistry(
         const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
         const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
+        const val TOOL_AGENT_SLEEP = "agent_sleep"
         const val TOOL_VOICE_REPLY = "voice_reply"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
 

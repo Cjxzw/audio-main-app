@@ -10,9 +10,17 @@ import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.SystemClock
+import kotlinx.coroutines.delay
 import timber.log.Timber
 
 class AudioRouteManager(context: Context) {
+    data class RouteReadiness(
+        val ready: Boolean,
+        val elapsedMs: Long,
+        val summary: String,
+    )
+
     private val audioManager = context.getSystemService(AudioManager::class.java)
 
     @Volatile private var configured = false
@@ -58,6 +66,52 @@ class AudioRouteManager(context: Context) {
     fun ensureConfigured(): String? {
         if (configured) return null
         return configureForVoiceSession()
+    }
+
+    suspend fun awaitVoiceRoute(
+        timeoutMs: Long = ROUTE_READY_TIMEOUT_MS,
+        pollMs: Long = ROUTE_READY_POLL_MS,
+    ): RouteReadiness {
+        ensureConfigured()
+        val startedAt = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - startedAt < timeoutMs) {
+            if (communicationRouteReady()) {
+                val summary = configureForVoiceSession()
+                val elapsed = SystemClock.elapsedRealtime() - startedAt
+                Timber.i("AudioRoute: communication route ready elapsedMs=$elapsed $summary")
+                return RouteReadiness(true, elapsed, summary)
+            }
+            delay(pollMs)
+        }
+        val elapsed = SystemClock.elapsedRealtime() - startedAt
+        val summary = currentRouteSummary()
+        Timber.w("AudioRoute: communication route timeout elapsedMs=$elapsed $summary")
+        return RouteReadiness(false, elapsed, summary)
+    }
+
+    suspend fun awaitInputRoute(
+        record: AudioRecord,
+        timeoutMs: Long = INPUT_ROUTE_TIMEOUT_MS,
+        pollMs: Long = ROUTE_READY_POLL_MS,
+    ): Boolean {
+        val expected = detectedInput
+        if (expected?.isPreferredExternalInput() != true) return true
+        val startedAt = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - startedAt < timeoutMs) {
+            val routed = runCatching { record.routedDevice }.getOrNull()
+            if (routed != null && routed.type == expected.type) {
+                Timber.i(
+                    "AudioRoute: input route ready elapsedMs=${SystemClock.elapsedRealtime() - startedAt} " +
+                        "expected=${deviceLabel(expected)} routed=${deviceLabel(routed)}"
+                )
+                return true
+            }
+            applyInputRouting(record)
+            delay(pollMs)
+        }
+        val routed = runCatching { record.routedDevice }.getOrNull()
+        Timber.w("AudioRoute: input route timeout expected=${deviceLabel(expected)} routed=${deviceLabel(routed)}")
+        return false
     }
 
     fun preferredAudioSource(): Int {
@@ -172,6 +226,22 @@ class AudioRouteManager(context: Context) {
         }
     }
 
+    private fun communicationRouteReady(): Boolean {
+        val expected = detectedOutput
+        if (expected?.isPreferredExternalOutput() != true) return true
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { audioManager.communicationDevice?.type == expected.type }.getOrDefault(false)
+        } else if (expected.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            @Suppress("DEPRECATION")
+            audioManager.isBluetoothScoOn
+        } else {
+            true
+        }
+    }
+
+    private fun currentRouteSummary(): String =
+        "候选输入=${deviceLabel(detectedInput)}，候选输出=${deviceLabel(detectedOutput)}"
+
     private fun getDevices(flags: Int): Array<AudioDeviceInfo> {
         return runCatching { audioManager.getDevices(flags) }
             .onFailure { Timber.w(it, "AudioRoute: getDevices($flags) failed") }
@@ -246,4 +316,10 @@ class AudioRouteManager(context: Context) {
 
     private fun hearingAidType(): Int =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) AudioDeviceInfo.TYPE_HEARING_AID else Int.MIN_VALUE + 2
+
+    private companion object {
+        private const val ROUTE_READY_TIMEOUT_MS = 1_800L
+        private const val INPUT_ROUTE_TIMEOUT_MS = 1_500L
+        private const val ROUTE_READY_POLL_MS = 100L
+    }
 }

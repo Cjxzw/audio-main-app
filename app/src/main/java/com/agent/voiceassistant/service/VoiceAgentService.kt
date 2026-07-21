@@ -5,7 +5,6 @@ import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -18,15 +17,11 @@ import android.media.MediaPlayer
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
-import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.telephony.TelephonyManager
-import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
-import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
 import com.agent.voiceassistant.MainActivity
-import com.agent.voiceassistant.MediaButtonReceiver
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.StructuredOutputParser
@@ -42,6 +37,7 @@ import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.LlmClient
+import com.agent.voiceassistant.cloud.ListeningInactivityPolicy
 import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.cloud.SpeechSegmenter
@@ -61,7 +57,6 @@ import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CodeGraphIndex
 import com.agent.voiceassistant.tools.LocationProvider
 import com.agent.voiceassistant.tools.MainToolRegistry
-import com.agent.voiceassistant.telecom.AssistantTelecomSession
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
@@ -75,6 +70,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
@@ -83,10 +79,12 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.time.ZonedDateTime
@@ -103,6 +101,7 @@ import kotlin.math.sqrt
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
 class VoiceAgentService : Service() {
@@ -111,8 +110,9 @@ class VoiceAgentService : Service() {
         private const val STREAM_TTS_SAMPLE_RATE = 24_000
         private const val INITIAL_STREAM_BUFFER_BYTES = 9_600
         private const val ENABLE_STREAMING_TTS = true
-        private const val ENABLE_LEGACY_MEDIA_SESSION = false
         private const val ENABLE_PLAYBACK_DONE_EARCON = false
+        private const val SLOW_NETWORK_FEEDBACK_MS = 3_000L
+        private const val TOTAL_INACTIVITY_SLEEP_MS = 15_000L
         private const val TTS_FADE_MS = 18
         private const val TTS_FINAL_SILENCE_MS = 90
         private const val DEEP_MAX_TOOL_ROUNDS = 10
@@ -158,7 +158,6 @@ class VoiceAgentService : Service() {
         const val ACTION_STOP = "com.agent.voiceassistant.STOP"
         const val ACTION_WAKE = "com.agent.voiceassistant.WAKE"
         const val ACTION_SLEEP = "com.agent.voiceassistant.SLEEP"
-        const val ACTION_TOGGLE = "com.agent.voiceassistant.TOGGLE"
         const val ACTION_TEXT_INPUT = "com.agent.voiceassistant.TEXT_INPUT"
         private const val EXTRA_TEXT = "text"
 
@@ -191,10 +190,23 @@ class VoiceAgentService : Service() {
         fun wake(ctx: Context) {
             DiagLog.i("api.wake", "ctx=${ctx.javaClass.simpleName}")
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_WAKE)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(intent)
+                } else {
+                    ctx.startService(intent)
+                }
+            }.onFailure { error ->
+                DiagLog.w(
+                    "api.wake.denied",
+                    "${error.javaClass.simpleName}:${error.message}",
+                    showInUi = true,
+                )
+                MainMediaLibraryService.publishState(
+                    ctx,
+                    active = false,
+                    status = "请点击通知或打开 App 后唤醒",
+                )
             }
         }
 
@@ -202,16 +214,6 @@ class VoiceAgentService : Service() {
             DiagLog.i("api.sleep", "ctx=${ctx.javaClass.simpleName}")
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_SLEEP)
             ctx.startService(intent)
-        }
-
-        fun toggle(ctx: Context) {
-            DiagLog.i("api.toggle", "ctx=${ctx.javaClass.simpleName}")
-            val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_TOGGLE)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
-            }
         }
 
         fun sendText(ctx: Context, text: String) {
@@ -242,7 +244,6 @@ class VoiceAgentService : Service() {
     private var recorder: SimpleVadRecorder? = null
     private var routeManager: AudioRouteManager? = null
     private var player: MediaPlayer? = null
-    private var mediaSession: MediaSessionCompat? = null
     private lateinit var store: ConversationStore
     private lateinit var llmProviderRepository: LlmProviderRepository
     private lateinit var speechPreferences: SpeechPreferences
@@ -252,7 +253,6 @@ class VoiceAgentService : Service() {
     private lateinit var skillRegistry: SkillRegistry
     private val agentHarness = MainAgentHarness()
     private lateinit var earcons: EarconPlayer
-    private lateinit var telecomSession: AssistantTelecomSession
     private var dormant = true
     private val turnMutex = Mutex()
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
@@ -280,12 +280,8 @@ class VoiceAgentService : Service() {
         )
         locationProvider.refreshInBackground("service_start")
         earcons = EarconPlayer { routeManager }
-        telecomSession = AssistantTelecomSession(this)
         createNotificationChannel()
         MainMediaLibraryService.ensureStarted(this)
-        if (ENABLE_LEGACY_MEDIA_SESSION) {
-            setupMediaSession()
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -295,11 +291,10 @@ class VoiceAgentService : Service() {
             showInUi = true,
         )
         when (intent?.action) {
+            null -> sleepAgent()
             ACTION_BOOTSTRAP -> sleepAgent()
             ACTION_START, ACTION_WAKE -> wakeAgent()
             ACTION_SLEEP -> sleepAgent()
-            ACTION_TOGGLE -> toggleAgent()
-            Intent.ACTION_MEDIA_BUTTON -> handleMediaButtonIntent(intent)
             ACTION_TEXT_INPUT -> {
                 ensureForegroundForCurrentState()
                 val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
@@ -318,33 +313,33 @@ class VoiceAgentService : Service() {
 
     override fun onDestroy() {
         hardStopAgent(keepForeground = false)
-        telecomSession.endListening("service_destroy")
-        telecomSession.unregister()
-        mediaSession?.release()
-        mediaSession = null
         serviceScope.cancel()
         locationProvider.close()
         super.onDestroy()
     }
 
-    private fun toggleAgent() {
-        DiagLog.i(
-            "agent.toggle.begin",
-            "dormant=$dormant loop=${loopJob?.isActive == true} recorder=${recorder != null}",
-            showInUi = true,
-        )
-        if (dormant) wakeAgent() else sleepAgent()
-        DiagLog.i(
-            "agent.toggle.end",
-            "dormant=$dormant loop=${loopJob?.isActive == true} recorder=${recorder != null}",
-            showInUi = true,
-        )
-    }
-
     private fun wakeAgent() {
         DiagLog.i("agent.wake.begin", "dormant=$dormant loop=${loopJob?.isActive == true}", showInUi = true)
-        ensureForeground("唤醒中...", microphoneActive = true)
         if (loopJob?.isActive == true && !dormant) return
+        val foregroundReady = runCatching {
+            ensureForeground("唤醒中...", microphoneActive = true)
+        }.onFailure { error ->
+            DiagLog.w(
+                "agent.wake.foreground_denied",
+                "${error.javaClass.simpleName}:${error.message}",
+                showInUi = true,
+            )
+        }.isSuccess
+        if (!foregroundReady) {
+            dormant = true
+            _state.value = State.READY
+            emitState(ServiceState.DORMANT)
+            emitLog("系统不允许从当前后台状态启动麦克风，请点击通知或打开 App 后重试")
+            MainMediaLibraryService.publishState(this, active = false, status = "点击 App 后唤醒")
+            ensureDormantForeground()
+            serviceScope.launch { earcons.error() }
+            return
+        }
 
         val config = LLMConfig.auto()
         if (config.apiKey.isBlank()) {
@@ -354,9 +349,7 @@ class VoiceAgentService : Service() {
         }
 
         dormant = false
-        updateMediaPlaybackState()
         MainMediaLibraryService.publishState(this, active = true, status = "聆听中")
-        telecomSession.beginListening()
         val routes = AudioRouteManager(this)
         routeManager = routes
         val routeSummary = routes.configureForVoiceSession()
@@ -378,60 +371,97 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun handleMediaButtonIntent(intent: Intent): Boolean {
-        val event = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
-        if (event == null) {
-            DiagLog.w("media.service.no_event", showInUi = true)
-            return true
-        }
-        DiagLog.i(
-            "media.service.event",
-            "key=${KeyEvent.keyCodeToString(event.keyCode)} action=${event.action} repeat=${event.repeatCount}",
-            showInUi = true,
-        )
-        if (event.action != KeyEvent.ACTION_DOWN) return true
-        Timber.i("Service media button: keyCode=${event.keyCode}")
-        return when (event.keyCode) {
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_HEADSETHOOK,
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                DiagLog.i("media.service.toggle", "key=${KeyEvent.keyCodeToString(event.keyCode)}", showInUi = true)
-                toggleAgent()
-                true
-            }
-            KeyEvent.KEYCODE_MEDIA_STOP -> {
-                DiagLog.i("media.service.sleep", showInUi = true)
-                sleepAgent()
-                true
-            }
-            else -> {
-                DiagLog.i("media.service.unhandled", "key=${KeyEvent.keyCodeToString(event.keyCode)}")
-                false
-            }
-        }
-    }
-
     @SuppressLint("MissingPermission")
     private suspend fun runConversationLoop() {
         while (coroutineContext.isActive && !dormant) {
             try {
+                val readiness = routeManager?.awaitVoiceRoute()
+                if (readiness?.ready == false) {
+                    handleAudioRouteFailure(readiness.summary)
+                    break
+                }
+                readiness?.let {
+                    DiagLog.i(
+                        "audio.route.ready",
+                        "elapsedMs=${it.elapsedMs} ${it.summary.take(140)}",
+                        showInUi = true,
+                    )
+                }
                 updateNotification("聆听中...")
                 emitState(ServiceState.LISTENING)
                 emitLog("请说话")
                 earcons.listening()
-                val recording = recorder?.recordNextUtterance() ?: break
-                earcons.captureDone()
-                emitLog("录音完成 ${recording.durationMs}ms，停止收音")
-                processTurn(recording)
+                val inactivityStartedAt = SystemClock.elapsedRealtime()
+                when (val capture = recorder?.recordNextUtterance() ?: SimpleVadRecorder.CaptureResult.Stopped) {
+                    is SimpleVadRecorder.CaptureResult.Recorded -> {
+                        earcons.captureDone()
+                        emitLog("录音完成 ${capture.recording.durationMs}ms，停止收音")
+                        processTurn(capture.recording)
+                    }
+                    is SimpleVadRecorder.CaptureResult.RouteUnavailable -> {
+                        handleAudioRouteFailure(capture.summary)
+                    }
+                    SimpleVadRecorder.CaptureResult.InactivityWarning -> {
+                        emitLog("10 秒未检测到语音，即将进入休眠")
+                        updateNotification("即将进入休眠...")
+                        val announcementBudgetMs = ListeningInactivityPolicy.remainingUntilSleep(
+                            totalMs = TOTAL_INACTIVITY_SLEEP_MS,
+                            elapsedMs = SystemClock.elapsedRealtime() - inactivityStartedAt,
+                        )
+                        val announcementFinished = withTimeoutOrNull(announcementBudgetMs) {
+                            announceInactivitySleep()
+                            true
+                        } ?: false
+                        if (!announcementFinished) {
+                            emitLog("即将休眠播报达到总超时截止点")
+                        }
+                        val remainingMs = ListeningInactivityPolicy.remainingUntilSleep(
+                            totalMs = TOTAL_INACTIVITY_SLEEP_MS,
+                            elapsedMs = SystemClock.elapsedRealtime() - inactivityStartedAt,
+                        )
+                        val followUp = if (remainingMs == 0L) {
+                            SimpleVadRecorder.CaptureResult.InactivitySleep
+                        } else {
+                            recorder?.recordNextUtterance(
+                                inactivitySleepMs = remainingMs,
+                                warningAlreadyPlayed = true,
+                            ) ?: SimpleVadRecorder.CaptureResult.Stopped
+                        }
+                        when (followUp) {
+                            is SimpleVadRecorder.CaptureResult.Recorded -> {
+                                earcons.captureDone()
+                                emitLog("录音完成 ${followUp.recording.durationMs}ms，停止收音")
+                                processTurn(followUp.recording)
+                            }
+                            is SimpleVadRecorder.CaptureResult.RouteUnavailable -> {
+                                handleAudioRouteFailure(followUp.summary)
+                            }
+                            SimpleVadRecorder.CaptureResult.InactivitySleep -> {
+                                emitLog("休眠提示后 5 秒仍未检测到语音，进入休眠")
+                                sleepAgent()
+                            }
+                            SimpleVadRecorder.CaptureResult.Stopped -> break
+                            SimpleVadRecorder.CaptureResult.InactivityWarning -> Unit
+                        }
+                    }
+                    SimpleVadRecorder.CaptureResult.InactivitySleep -> {
+                        emitLog("持续未检测到语音，进入休眠")
+                        sleepAgent()
+                    }
+                    SimpleVadRecorder.CaptureResult.Stopped -> break
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: NetworkTimeoutException) {
                 handleConnectionLost("voice", e)
                 continue
+            } catch (e: IOException) {
+                handleConnectionLost("voice", NetworkTimeoutException("voice network", e))
+                continue
             } catch (e: Exception) {
                 Timber.e(e, "Voice loop failed")
                 emitLog("本轮失败: ${e.message}")
+                earcons.error()
             }
         }
     }
@@ -495,6 +525,8 @@ class VoiceAgentService : Service() {
                 throw e
             } catch (e: NetworkTimeoutException) {
                 handleConnectionLost("agent", e)
+            } catch (e: IOException) {
+                handleConnectionLost("agent", NetworkTimeoutException("agent network", e))
             } catch (e: Exception) {
                 Timber.e(e, "processUserText failed")
                 val message = "本轮失败: ${e.message ?: e.javaClass.simpleName}"
@@ -588,6 +620,26 @@ class VoiceAgentService : Service() {
                 override suspend fun executeTerminalPresentation(
                     call: CloudSpeechClient.ToolCall,
                 ): AgentLoop.TerminalExecution {
+                    if (toolRegistry.isAgentSleep(call)) {
+                        val finalText = "好的，我先休眠了。"
+                        store.addMessage("assistant", finalText)
+                        EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, finalText))
+                        emitLog("语义休眠：用户明确结束交互")
+                        DiagLog.i("agent.semantic_sleep", "toolCallId=${call.id}", showInUi = true)
+                        sleepAgent(cancelConversationLoop = false)
+                        return AgentLoop.TerminalExecution(
+                            result = AgentLoop.ToolExecution(
+                                message = CloudSpeechClient.LlmMessage(
+                                    role = "tool",
+                                    content = "助手已进入休眠",
+                                    toolCallId = call.id,
+                                ),
+                                succeeded = true,
+                            ),
+                            finalText = finalText,
+                            playedSpeech = false,
+                        )
+                    }
                     return runCatching {
                         val directive = VoiceReplyDirectiveParser.parse(call.arguments)
                         awaitReasoningFeedback()
@@ -921,6 +973,16 @@ class VoiceAgentService : Service() {
         var firstSegmentLogged = false
         var reasoningStarted = false
         var streamedSpeech = false
+        val firstModelEvent = AtomicBoolean(false)
+        val waitFeedbackPlayed = AtomicBoolean(false)
+        val slowNetworkFeedback = launch {
+            delay(SLOW_NETWORK_FEEDBACK_MS)
+            if (!firstModelEvent.get() && waitFeedbackPlayed.compareAndSet(false, true)) {
+                DiagLog.i("network.wait_feedback", "elapsedMs=$SLOW_NETWORK_FEEDBACK_MS")
+                emitLog("网络响应较慢，仍在等待")
+                earcons.waiting()
+            }
+        }
 
         val promptChars = request.messages.sumOf { message -> message.content.orEmpty().length }
         val systemHash = Integer.toHexString(request.messages.firstOrNull()?.content.orEmpty().hashCode())
@@ -971,6 +1033,8 @@ class VoiceAgentService : Service() {
 
         try {
             val completion = llmClient.streamChat(request) { event ->
+                firstModelEvent.set(true)
+                slowNetworkFeedback.cancel()
                 onStreamEvent(event)
                 when (event) {
                     is CloudSpeechClient.ChatStreamEvent.ReasoningDelta -> {
@@ -1019,6 +1083,7 @@ class VoiceAgentService : Service() {
             playbackJob.join()
             return@coroutineScope AgentLoop.ModelTurn(completion, streamedSpeech)
         } finally {
+            slowNetworkFeedback.cancel()
             ttsQueue.close()
         }
     }
@@ -1170,6 +1235,14 @@ class VoiceAgentService : Service() {
             resources.openRawResource(resourceId).use { it.readBytes() }
         }
         emitLog("思考反馈音: $resourceName")
+        playAudio(CloudSpeechClient.AudioPayload(audioBytes, "audio/wav"))
+    }
+
+    private suspend fun announceInactivitySleep() {
+        val audioBytes = withContext(Dispatchers.IO) {
+            resources.openRawResource(R.raw.inactivity_sleep).use { it.readBytes() }
+        }
+        emitLog("本地休眠提示：即将休眠")
         playAudio(CloudSpeechClient.AudioPayload(audioBytes, "audio/wav"))
     }
 
@@ -1656,6 +1729,13 @@ class VoiceAgentService : Service() {
     private suspend fun playAudio(audio: CloudSpeechClient.AudioPayload) {
         if (audio.bytes.isEmpty()) return
         val boostedBytes = boostEncodedAudioIfPossible(audio.bytes)
+        if (boostedBytes.startsWith("RIFF")) {
+            val pcm = decodePcmChunk(boostedBytes)
+            if (pcm.pcm.isNotEmpty()) {
+                playPcmAudio(pcm)
+                return
+            }
+        }
         val file = withContext(Dispatchers.IO) {
             val ext = audioExtension(audio)
             File(cacheDir, "tts-${System.nanoTime()}.$ext").apply {
@@ -1700,6 +1780,27 @@ class VoiceAgentService : Service() {
                     if (cont.isActive) cont.resumeWithException(it)
                 }
             }
+        }
+    }
+
+    private suspend fun playPcmAudio(chunk: PcmChunk) = withContext(Dispatchers.IO) {
+        val focus = requestPlaybackFocus()
+        val track = createPcmTrack(chunk.sampleRate)
+        try {
+            routeManager?.applyOutputRouting(track)
+            track.play()
+            var offset = 0
+            while (offset < chunk.pcm.size) {
+                coroutineContext.ensureActive()
+                val written = track.write(chunk.pcm, offset, chunk.pcm.size - offset)
+                if (written <= 0) error("AudioTrack write failed: $written")
+                offset += written
+            }
+            val totalBytes = offset + writeSilenceTail(track, chunk.sampleRate)
+            waitForAudioTrack(track, totalBytes, chunk.sampleRate)
+        } finally {
+            releaseAudioTrack(track)
+            abandonPlaybackFocus(focus)
         }
     }
 
@@ -1805,7 +1906,10 @@ class VoiceAgentService : Service() {
         return (bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8)
     }
 
-    private fun sleepAgent(keepForeground: Boolean = true) {
+    private fun sleepAgent(
+        keepForeground: Boolean = true,
+        cancelConversationLoop: Boolean = true,
+    ) {
         DiagLog.i(
             "agent.sleep.begin",
             "keepForeground=$keepForeground dormant=$dormant loop=${loopJob?.isActive == true} recorder=${recorder != null}",
@@ -1813,13 +1917,11 @@ class VoiceAgentService : Service() {
         )
         if (dormant && loopJob == null && recorder == null) {
             if (keepForeground) ensureDormantForeground()
-            telecomSession.endListening("already_dormant_cleanup")
-            telecomSession.unregister()
             DiagLog.i("agent.sleep.noop", "already_dormant", showInUi = true)
             return
         }
         dormant = true
-        loopJob?.cancel()
+        if (cancelConversationLoop) loopJob?.cancel()
         loopJob = null
         recorder?.stop()
         recorder = null
@@ -1828,7 +1930,6 @@ class VoiceAgentService : Service() {
         _state.value = State.READY
         emitState(ServiceState.DORMANT)
         emitLog("Agent 已休眠")
-        updateMediaPlaybackState()
         MainMediaLibraryService.publishState(this, active = false, status = "休眠中")
         if (keepForeground) ensureDormantForeground()
         DiagLog.i(
@@ -1843,8 +1944,6 @@ class VoiceAgentService : Service() {
             if (routeManager === routesToRelease) {
                 routeManager = null
             }
-            telecomSession.endListening("agent_sleep")
-            telecomSession.unregister()
         }
     }
 
@@ -1860,7 +1959,7 @@ class VoiceAgentService : Service() {
     }
 
     private fun ensureForeground(text: String, microphoneActive: Boolean) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
                 if (microphoneActive) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
             startForeground(
@@ -1911,6 +2010,17 @@ class VoiceAgentService : Service() {
         updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
     }
 
+    private suspend fun handleAudioRouteFailure(details: String) {
+        val message = "蓝牙麦克风连接失败，助手已返回休眠。请确认设备连接后重新唤醒。"
+        DiagLog.w("audio.route.failed", details, showInUi = true)
+        store.addMessage("system", message)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+        emitLog(message)
+        updateNotification("蓝牙麦克风不可用")
+        earcons.error()
+        sleepAgent()
+    }
+
     private fun emitLog(msg: String) {
         Timber.i("LogBus: $msg")
         EventBus.emitLog(msg)
@@ -1918,74 +2028,6 @@ class VoiceAgentService : Service() {
 
     private fun emitState(state: ServiceState) {
         EventBus.emitState(state)
-    }
-
-    private fun setupMediaSession() {
-        val mediaButtonReceiver = ComponentName(this, MediaButtonReceiver::class.java)
-        DiagLog.i("media.session.setup", "receiver=${mediaButtonReceiver.flattenToShortString()}", showInUi = true)
-        val mediaButtonIntent = PendingIntent.getBroadcast(
-            this,
-            2,
-            Intent(Intent.ACTION_MEDIA_BUTTON).setComponent(mediaButtonReceiver),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val session = MediaSessionCompat(this, "VoiceAgentSession", mediaButtonReceiver, mediaButtonIntent).apply {
-            setCallback(object : MediaSessionCompat.Callback() {
-                override fun onPlay() {
-                    Timber.i("MediaSession onPlay -> toggle")
-                    DiagLog.i("media.session.on_play", showInUi = true)
-                    toggleAgent()
-                }
-
-                override fun onPause() {
-                    Timber.i("MediaSession onPause -> toggle")
-                    DiagLog.i("media.session.on_pause", showInUi = true)
-                    toggleAgent()
-                }
-
-                override fun onStop() {
-                    Timber.i("MediaSession onStop -> sleep")
-                    DiagLog.i("media.session.on_stop", showInUi = true)
-                    sleepAgent()
-                }
-
-                override fun onMediaButtonEvent(mediaButtonEvent: Intent): Boolean {
-                    DiagLog.i("media.session.on_media_button", "action=${mediaButtonEvent.action}", showInUi = true)
-                    return handleMediaButtonIntent(mediaButtonEvent)
-                }
-
-                override fun onCustomAction(action: String?, extras: Bundle?) {
-                    DiagLog.i("media.session.on_custom", "action=$action", showInUi = true)
-                    when (action) {
-                        ACTION_WAKE -> wakeAgent()
-                        ACTION_SLEEP -> sleepAgent()
-                    }
-                }
-            })
-            setFlags(
-                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
-                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
-            )
-            isActive = true
-        }
-        mediaSession = session
-        updateMediaPlaybackState()
-        DiagLog.i("media.session.ready", "active=${session.isActive}", showInUi = true)
-    }
-
-    private fun updateMediaPlaybackState() {
-        val state = if (dormant) PlaybackStateCompat.STATE_PAUSED else PlaybackStateCompat.STATE_PLAYING
-        val actions = PlaybackStateCompat.ACTION_PLAY or
-            PlaybackStateCompat.ACTION_PAUSE or
-            PlaybackStateCompat.ACTION_PLAY_PAUSE or
-            PlaybackStateCompat.ACTION_STOP
-        mediaSession?.setPlaybackState(
-            PlaybackStateCompat.Builder()
-                .setActions(actions)
-                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1f)
-                .build()
-        )
-        DiagLog.i("media.session.state", "state=${if (dormant) "PAUSED" else "PLAYING"}")
     }
 
     private fun requestPlaybackFocus(): AudioFocusRequest? {
@@ -2049,13 +2091,6 @@ class VoiceAgentService : Service() {
             .addAction(actionIcon, actionText, controlPi)
             .setOngoing(true)
 
-        if (ENABLE_LEGACY_MEDIA_SESSION) {
-            builder.setStyle(
-                androidx.media.app.NotificationCompat.MediaStyle()
-                    .setMediaSession(mediaSession?.sessionToken)
-                    .setShowActionsInCompactView(0),
-            )
-        }
         return builder.build()
     }
 

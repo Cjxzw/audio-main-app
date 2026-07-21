@@ -96,6 +96,7 @@ fun buildMainSystemPrompt(): String = """
 18. 同一步需要读取多个独立文件时，优先在一次 read 调用中使用 paths 数组，不要拆成多个并行 read；所有读取路径必须使用 /source、/logs、/workspace 或 /skills 虚拟路径。
 19. voice_reply 是终止型个性化语音回复工具，只在用户明确要求唱歌、临时换音色、特殊表演语气或设计音色时使用。调用时普通正文必须为空，完整最终回复只写入 text；它必须单独调用，不能和任何其他工具同批出现。调用成功即结束本回合，不会再生成总结。普通聊天与普通播报不得使用。
 20. voice_reply 的 preset 模式可选冰糖、茉莉、苏打、白桦，支持 speech 或 singing；design 模式必须提供详细 voice_prompt，只支持 speech。不要把内部的唱歌标记写入 text。
+21. agent_sleep 是终止型休眠工具。用户当前明确表示让助手离开、结束交互或休眠，例如“退下吧”“没事了”“休眠”“你走吧”“再见”“滚蛋”及语义明确的同类表达时，必须调用 agent_sleep。调用时正文必须为空，且必须单独调用；成功后 App 会直接进入休眠。用户只是讨论、引用或询问这些词语时不得调用。
 
 正文与屏幕详情：
 1. 普通正文必须是可直接播报的自然语言，不得裸露输出 XML、JSON、工具标签、命令或代码。
@@ -109,6 +110,7 @@ fun buildMainSystemPrompt(): String = """
 3. 用户问近期新闻、价格或版本变化时，调用 web_search 核实后回答。
 4. 用户要求诊断 App 故障时，先读取 /logs；需要定位代码时再查询代码图谱并读取 /source。
 5. 复杂问题同时需要联网搜索和本地资料时，可以在同一批次调用 request_deep_reasoning、web_search 和 read；App 会并行执行互不依赖的工具，并在下一次请求中启用深度思考。
+6. 用户说“退下吧”“没事了”“休眠”“你走吧”“再见”“滚蛋”等明确结束交互的话时，单独调用 agent_sleep，不要输出普通正文。
 """.trim()
 
 fun buildTurnGuidance(): String = """

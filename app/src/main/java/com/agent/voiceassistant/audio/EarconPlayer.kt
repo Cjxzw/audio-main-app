@@ -15,13 +15,22 @@ class EarconPlayer(
     private val routeManagerProvider: () -> AudioRouteManager?,
 ) {
 
-    suspend fun listening() = playTone(listOf(660.0, 880.0), 90)
-    suspend fun captureDone() = playTone(listOf(880.0, 660.0), 90)
-    suspend fun sleep() = playTone(listOf(660.0, 440.0), 120, gain = 0.42)
+    suspend fun listening() = playTone("listening", listOf(660.0, 880.0), 130, gain = 0.58)
+    suspend fun captureDone() = playTone("capture_done", listOf(880.0, 660.0), 130, gain = 0.58)
+    suspend fun waiting() = playTone("waiting", listOf(760.0, 760.0), 150, gain = 0.50)
+    suspend fun preSleep() = playTone("pre_sleep", listOf(620.0, 520.0), 180, gain = 0.56)
+    suspend fun sleep() = playTone("sleep", listOf(660.0, 440.0), 150, gain = 0.58)
     suspend fun playbackDone() = playTone(listOf(784.0, 988.0), 120, gain = 0.45)
-    suspend fun error() = playTone(listOf(220.0, 180.0), 160, gain = 0.55)
+    suspend fun error() = playTone("error", listOf(240.0, 180.0, 240.0), 180, gain = 0.70)
 
     private suspend fun playTone(
+        frequencies: List<Double>,
+        segmentMs: Int,
+        gain: Double = 0.38,
+    ) = playTone("feedback", frequencies, segmentMs, gain)
+
+    private suspend fun playTone(
+        label: String,
         frequencies: List<Double>,
         segmentMs: Int,
         gain: Double = 0.38,
@@ -30,11 +39,13 @@ class EarconPlayer(
         val track = createTrack(pcm.size)
         try {
             routeManagerProvider()?.applyOutputRouting(track)
-            track.write(pcm, 0, pcm.size)
+            val written = track.write(pcm, 0, pcm.size)
             track.play()
+            Timber.i("Earcon: $label started bytes=$written session=${track.audioSessionId}")
             Thread.sleep(frequencies.size * segmentMs + 80L)
+            Timber.i("Earcon: $label finished")
         } catch (e: Exception) {
-            Timber.d(e, "Earcon playback failed")
+            Timber.w(e, "Earcon: $label playback failed")
         } finally {
             runCatching { track.stop() }
             track.release()
@@ -64,7 +75,7 @@ class EarconPlayer(
 
     private fun createTrack(bufferSize: Int): AudioTrack {
         val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
         val format = AudioFormat.Builder()

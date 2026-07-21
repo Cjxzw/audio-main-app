@@ -2,6 +2,7 @@ package com.agent.voiceassistant.media
 
 import android.app.NotificationManager
 import android.content.ComponentName
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import androidx.media3.common.Player
@@ -19,6 +20,24 @@ import java.util.concurrent.TimeUnit
 
 @RunWith(AndroidJUnit4::class)
 class MainMediaSessionInstrumentedTest {
+
+    @Test
+    fun packageUsesMediaOnlyIdentity() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val flags = PackageManager.GET_PERMISSIONS.toLong() or PackageManager.GET_SERVICES.toLong()
+        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.PackageInfoFlags.of(flags),
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, flags.toInt())
+        }
+
+        assertFalse(packageInfo.requestedPermissions.orEmpty().contains("android.permission.MANAGE_OWN_CALLS"))
+        assertFalse(packageInfo.services.orEmpty().any { it.name.contains("telecom", ignoreCase = true) })
+    }
 
     @Test
     fun dormantBootstrapPublishesPersistentStatusNotification() {

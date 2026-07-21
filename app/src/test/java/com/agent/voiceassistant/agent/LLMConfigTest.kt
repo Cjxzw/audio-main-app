@@ -13,6 +13,8 @@ class LLMConfigTest {
         assertFalse(prompt.contains("本回合思考策略"))
         assertFalse(prompt.contains("当前时间"))
         assertFalse(prompt.contains("当前是快速模式"))
+        assertTrue(prompt.contains("agent_sleep"))
+        assertTrue(prompt.contains("用户只是讨论、引用或询问这些词语时不得调用"))
     }
 
     @Test
