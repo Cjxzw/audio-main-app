@@ -44,12 +44,6 @@ generate() {
   printf '%-36s %8s bytes\n' "$name.wav" "$(wc -c < "$output_dir/$name.wav" | tr -d ' ')"
 }
 
-generate thinking_um_long '嗯——' \
-  '像真人突然遇到需要认真思考的问题，自然地发出一个鼻音“嗯”。把声音平稳拉长约一秒，起音轻，音高缓慢下沉，尾音自然减弱收住。不是答应别人，也不是撒娇。不要说其他内容。'
-generate thinking_er_long '呃——' \
-  '像真人一时没有想好答案，短暂卡壳时自然发出“呃”。拉长约一秒，带少量气声，音高先轻微上扬再回落，尾音渐弱。不要夸张，不要说其他内容。'
-generate thinking_zhege '这个……' \
-  '像真人碰到稍微棘手的问题，带一点为难和斟酌，快速说出“这个”，随后自然停住。语气真实克制，不要拖慢每个字，不要补充其他内容。'
 generate thinking_wo_xiang_yixia '我想一下。' \
   '像聊天时意识到问题需要思考，简短自然地说“我想一下”。语速略快，语气随和，尾音轻轻收住，总体不要拖沓。只说这句话。'
 generate thinking_wo_xiangxiang '我想想。' \

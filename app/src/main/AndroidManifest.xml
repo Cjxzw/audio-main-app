@@ -43,6 +43,20 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
 
         <activity
@@ -52,6 +66,28 @@
         <activity
             android:name=".settings.LlmProviderEditorActivity"
             android:exported="false" />
+
+        <activity
+            android:name=".settings.ContextAssetsActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".workspace.WorkspaceActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".workspace.WorkspacePreviewActivity"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/workspace_file_paths" />
+        </provider>
 
         <activity
             android:name=".AssistEntryActivity"

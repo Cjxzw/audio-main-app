@@ -206,7 +206,24 @@ class OpenAiCompatibleLlmClient(
 
     private fun CloudSpeechClient.LlmMessage.toJson(): JsonObject = buildJsonObject {
         put("role", role)
-        if (content != null) {
+        if (imageInputs.isNotEmpty()) {
+            putJsonArray("content") {
+                content?.takeIf { it.isNotBlank() }?.let { text ->
+                    add(buildJsonObject {
+                        put("type", "text")
+                        put("text", text)
+                    })
+                }
+                imageInputs.forEach { image ->
+                    add(buildJsonObject {
+                        put("type", "image_url")
+                        putJsonObject("image_url") {
+                            put("url", "data:${image.mimeType};base64,${image.base64Data}")
+                        }
+                    })
+                }
+            }
+        } else if (content != null) {
             put("content", content)
         } else if (role == "assistant" && toolCalls.isNotEmpty()) {
             put("content", "")

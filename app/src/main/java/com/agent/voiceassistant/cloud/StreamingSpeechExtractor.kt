@@ -50,6 +50,7 @@ class StreamingSpeechExtractor {
     }
 
     private fun feedText(ch: Char, out: StringBuilder) {
+        if (ch == '*' || ch == '_') return
         if (ch == '`') {
             backtickBuffer.append(ch)
             if (backtickBuffer.length == 3) {

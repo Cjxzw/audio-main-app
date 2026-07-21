@@ -86,4 +86,15 @@ class SpeechSegmenterTest {
 
         assertEquals("", speech)
     }
+
+    @Test
+    fun `inline markdown emphasis markers are not spoken`() {
+        val extractor = StreamingSpeechExtractor()
+        val speech = buildString {
+            append(extractor.feed("**结论**是保持_main_在线。"))
+            append(extractor.finish())
+        }
+
+        assertEquals("结论是保持main在线。", speech)
+    }
 }

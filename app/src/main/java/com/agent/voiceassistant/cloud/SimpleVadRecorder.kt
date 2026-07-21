@@ -6,6 +6,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.SystemClock
 import androidx.annotation.RequiresPermission
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.service.EventBus
@@ -14,6 +15,10 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.util.ArrayDeque
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.coroutineContext
 import kotlin.math.max
@@ -37,6 +42,7 @@ class SimpleVadRecorder(
     )
 
     private val stopped = AtomicBoolean(false)
+    @Volatile private var pendingCleanup: Future<*>? = null
 
     fun stop() {
         stopped.set(true)
@@ -49,6 +55,9 @@ class SimpleVadRecorder(
         warningAlreadyPlayed: Boolean = false,
     ): CaptureResult = withContext(Dispatchers.IO) {
         stopped.set(false)
+        if (!awaitPreviousCleanup()) {
+            return@withContext CaptureResult.RouteUnavailable("上一轮麦克风资源仍在释放，请稍后重试")
+        }
         val record = createAudioRecord()
         val frames = ArrayList<ShortArray>(256)
         val preRoll = ArrayDeque<ShortArray>()
@@ -194,11 +203,54 @@ class SimpleVadRecorder(
             }
             CaptureResult.Stopped
         } finally {
-            runCatching { record.stop() }
-            record.release()
             EventBus.emitVolume(0f)
-            Timber.i("CloudRecorder: stopped")
+            scheduleCleanup(record)
         }
+    }
+
+    private fun awaitPreviousCleanup(): Boolean {
+        val cleanup = pendingCleanup ?: return true
+        if (cleanup.isDone) return true
+        val startedAt = SystemClock.elapsedRealtime()
+        return try {
+            cleanup.get(PREVIOUS_CLEANUP_WAIT_MS, TimeUnit.MILLISECONDS)
+            Timber.i("CloudRecorder: previous cleanup joined elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
+            true
+        } catch (_: TimeoutException) {
+            Timber.w(
+                "CloudRecorder: previous cleanup still running after ${SystemClock.elapsedRealtime() - startedAt}ms",
+            )
+            false
+        } catch (error: Exception) {
+            Timber.w(error, "CloudRecorder: previous cleanup failed")
+            true
+        }
+    }
+
+    private fun scheduleCleanup(record: AudioRecord) {
+        val scheduledAt = SystemClock.elapsedRealtime()
+        pendingCleanup = RECORD_CLEANUP_EXECUTOR.submit {
+            val startedAt = SystemClock.elapsedRealtime()
+            val stopStartedAt = SystemClock.elapsedRealtime()
+            val stopResult = runCatching {
+                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) record.stop()
+            }
+            val stopElapsedMs = SystemClock.elapsedRealtime() - stopStartedAt
+
+            val releaseStartedAt = SystemClock.elapsedRealtime()
+            val releaseResult = runCatching { record.release() }
+            val releaseElapsedMs = SystemClock.elapsedRealtime() - releaseStartedAt
+            val totalElapsedMs = SystemClock.elapsedRealtime() - startedAt
+            val queueElapsedMs = startedAt - scheduledAt
+            Timber.i(
+                "CloudRecorder: cleanup finished queueMs=$queueElapsedMs stopMs=$stopElapsedMs " +
+                    "releaseMs=$releaseElapsedMs totalMs=$totalElapsedMs " +
+                    "stopOk=${stopResult.isSuccess} releaseOk=${releaseResult.isSuccess}",
+            )
+            stopResult.exceptionOrNull()?.let { Timber.w(it, "CloudRecorder: stop failed") }
+            releaseResult.exceptionOrNull()?.let { Timber.w(it, "CloudRecorder: release failed") }
+        }
+        Timber.i("CloudRecorder: cleanup scheduled")
     }
 
     private fun trimTrailingSilence(frames: ArrayList<ShortArray>, silenceFrames: Int) {
@@ -310,11 +362,15 @@ class SimpleVadRecorder(
         private const val VOLUME_EMIT_INTERVAL_MS = 100L
         private const val INACTIVITY_WARNING_MS = 10_000L
         private const val INACTIVITY_SLEEP_MS = 5_000L
+        private const val PREVIOUS_CLEANUP_WAIT_MS = 800L
         private const val FRAME_MS = FRAME_SAMPLES * 1000 / SAMPLE_RATE
         private const val CALIBRATION_FRAMES = CALIBRATION_MS.toInt() / FRAME_MS
         private const val END_SILENCE_FRAMES = END_SILENCE_MS.toInt() / FRAME_MS
         private const val KEEP_TRAILING_SILENCE_FRAMES = KEEP_TRAILING_SILENCE_MS.toInt() / FRAME_MS
         private const val PRE_ROLL_FRAMES = PRE_ROLL_MS.toInt() / FRAME_MS
+        private val RECORD_CLEANUP_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "audio-record-cleanup").apply { isDaemon = true }
+        }
     }
 }
 

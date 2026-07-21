@@ -3,6 +3,8 @@ package com.agent.voiceassistant.cloud
 import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LlmProviderMode
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -24,6 +26,30 @@ class LlmClientTest {
         assertTrue(payload.containsKey("max_tokens"))
         assertFalse(payload.containsKey("thinking"))
         assertFalse(payload.containsKey("max_completion_tokens"))
+    }
+
+    @Test
+    fun `image input uses openai multimodal content array`() {
+        val request = CloudSpeechClient.ChatRequest(
+            messages = listOf(
+                CloudSpeechClient.LlmMessage(
+                    role = "user",
+                    content = "看一下图片",
+                    imageInputs = listOf(CloudSpeechClient.ImageInput("image/jpeg", "YWJj")),
+                ),
+            ),
+            tools = emptyList(),
+            thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+            maxCompletionTokens = 128,
+        )
+
+        val content = client(LlmProviderMode.MIMO).buildChatPayload(request)
+            .getValue("messages").jsonArray.single().jsonObject
+            .getValue("content").jsonArray
+
+        assertTrue(content.any { it.jsonObject["type"]?.jsonPrimitive?.content == "text" })
+        val image = content.first { it.jsonObject["type"]?.jsonPrimitive?.content == "image_url" }.jsonObject
+        assertTrue(image.getValue("image_url").jsonObject.getValue("url").jsonPrimitive.content.startsWith("data:image/jpeg;base64,"))
     }
 
     private fun request() = CloudSpeechClient.ChatRequest(

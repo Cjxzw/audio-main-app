@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:minHeight="76dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="16dp"
+    android:paddingTop="8dp"
+    android:paddingEnd="8dp"
+    android:paddingBottom="8dp">
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchContextAsset"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="?android:attr/textColorPrimary"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/tvContextAssetSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:paddingEnd="8dp"
+            android:textColor="?android:attr/textColorSecondary"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <ImageButton
+        android:id="@+id/btnEditContextAsset"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/context_asset_edit"
+        android:padding="10dp"
+        android:src="@drawable/ic_edit_24" />
+
+    <ImageButton
+        android:id="@+id/btnDeleteContextAsset"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/context_asset_delete"
+        android:padding="10dp"
+        android:src="@drawable/ic_delete_24" />
+</LinearLayout>

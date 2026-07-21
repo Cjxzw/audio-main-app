@@ -91,6 +91,12 @@
                 android:layout_width="match_parent"
                 android:layout_height="48dp" />
 
+            <com.google.android.material.checkbox.MaterialCheckBox
+                android:id="@+id/checkProviderImages"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:text="@string/provider_supports_images" />
+
             <com.google.android.material.textfield.TextInputLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

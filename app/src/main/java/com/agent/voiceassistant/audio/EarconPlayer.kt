@@ -5,7 +5,9 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
+import android.os.SystemClock
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import kotlin.math.PI
@@ -35,20 +37,36 @@ class EarconPlayer(
         segmentMs: Int,
         gain: Double = 0.38,
     ) = withContext(Dispatchers.IO) {
+        val startedAt = SystemClock.elapsedRealtime()
         val pcm = buildPcm(frequencies, segmentMs, gain)
-        val track = createTrack(pcm.size)
+        val routes = routeManagerProvider()
+        val createStartedAt = SystemClock.elapsedRealtime()
+        val track = createTrack(pcm.size, communicationSession = routes != null)
+        val createElapsedMs = SystemClock.elapsedRealtime() - createStartedAt
         try {
-            routeManagerProvider()?.applyOutputRouting(track)
+            if (SystemClock.elapsedRealtime() - startedAt > MAX_START_LATENCY_MS) {
+                Timber.w("Earcon: $label dropped after slow create elapsedMs=$createElapsedMs")
+                return@withContext
+            }
+            routes?.applyOutputRouting(track)
             val written = track.write(pcm, 0, pcm.size)
             track.play()
-            Timber.i("Earcon: $label started bytes=$written session=${track.audioSessionId}")
-            Thread.sleep(frequencies.size * segmentMs + 80L)
-            Timber.i("Earcon: $label finished")
+            Timber.i(
+                "Earcon: $label started bytes=$written session=${track.audioSessionId} " +
+                    "domain=${if (routes != null) "communication" else "media"} createMs=$createElapsedMs",
+            )
+            delay(frequencies.size * segmentMs + 80L)
+            Timber.i("Earcon: $label finished totalMs=${SystemClock.elapsedRealtime() - startedAt}")
         } catch (e: Exception) {
             Timber.w(e, "Earcon: $label playback failed")
         } finally {
+            val releaseStartedAt = SystemClock.elapsedRealtime()
             runCatching { track.stop() }
-            track.release()
+            runCatching { track.release() }
+            val releaseElapsedMs = SystemClock.elapsedRealtime() - releaseStartedAt
+            if (releaseElapsedMs >= SLOW_RELEASE_WARNING_MS) {
+                Timber.w("Earcon: $label slow release elapsedMs=$releaseElapsedMs")
+            }
         }
     }
 
@@ -73,9 +91,15 @@ class EarconPlayer(
         return bytes
     }
 
-    private fun createTrack(bufferSize: Int): AudioTrack {
+    private fun createTrack(bufferSize: Int, communicationSession: Boolean): AudioTrack {
         val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
+            .setUsage(
+                if (communicationSession) {
+                    AudioAttributes.USAGE_VOICE_COMMUNICATION
+                } else {
+                    AudioAttributes.USAGE_MEDIA
+                },
+            )
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
         val format = AudioFormat.Builder()
@@ -106,5 +130,7 @@ class EarconPlayer(
     private companion object {
         private const val SAMPLE_RATE = 24_000
         private const val FADE_SAMPLES = 480
+        private const val MAX_START_LATENCY_MS = 700L
+        private const val SLOW_RELEASE_WARNING_MS = 300L
     }
 }

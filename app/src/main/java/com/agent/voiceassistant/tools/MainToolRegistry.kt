@@ -49,6 +49,7 @@ class MainToolRegistry(
         add(httpRequest())
         add(codeGraphSearch())
         add(codeGraphExplain())
+        add(skillRegister())
         if (allowReasoningEscalation) add(reasoningEscalation())
 
         // Hub tools are added here once the connected profile has a live Hub client.
@@ -100,6 +101,7 @@ class MainToolRegistry(
             TOOL_HTTP_REQUEST -> "http_request"
             TOOL_CODE_GRAPH_SEARCH -> "code.graph.search"
             TOOL_CODE_GRAPH_EXPLAIN -> "code.graph.explain"
+            TOOL_SKILL_REGISTER -> "skill.register"
             else -> call.name
         }
         val action = AgentAction(
@@ -123,6 +125,7 @@ class MainToolRegistry(
         TOOL_HTTP_REQUEST -> "发送网络请求"
         TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
         TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
+        TOOL_SKILL_REGISTER -> "注册 Skill"
         TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
         TOOL_AGENT_SLEEP -> "进入休眠"
         TOOL_VOICE_REPLY -> "个性化播报"
@@ -148,6 +151,7 @@ class MainToolRegistry(
             TOOL_HTTP_REQUEST -> payload.text("url")
             TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
             TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
+            TOOL_SKILL_REGISTER -> payload.text("name")
             TOOL_REQUEST_DEEP_REASONING -> "当前回合"
             else -> null
         }
@@ -190,6 +194,40 @@ class MainToolRegistry(
         putJsonObject("tags") {
             put("type", "array")
             put("description", "可选的简短分类标签")
+            put("items", buildJsonObject { put("type", "string") })
+        }
+    }
+
+    private fun skillRegister() = tool(
+        name = TOOL_SKILL_REGISTER,
+        description = "将已在 /workspace 中完成审查和兼容性转换的 Skill 注册到 App。调用前必须先完整读取候选目录和核心文件，确认其主要是知识或流程说明；纯脚本型、依赖 Python/Node/二进制运行时且无法改写为 read/write/exec/http_request 流程的 Skill 不得注册。注册成功后候选文件会移出工作区。",
+        required = listOf("source_path", "name", "description", "core_file", "compatibility_notes", "reviewed_files"),
+    ) {
+        putJsonObject("source_path") {
+            put("type", "string")
+            put("description", "候选 Skill 在 /workspace 下的文件或目录")
+        }
+        putJsonObject("name") {
+            put("type", "string")
+            put("description", "转换后的 Skill 名称")
+        }
+        putJsonObject("description") {
+            put("type", "string")
+            put("description", "用途和触发场景简述")
+        }
+        putJsonObject("core_file") {
+            put("type", "string")
+            put("description", "相对候选目录的核心 Markdown 文件，例如 SKILL.md")
+        }
+        putJsonObject("compatibility_notes") {
+            put("type", "string")
+            put("description", "已检查的文件范围、脚本依赖以及如何适配本 App 的结论")
+        }
+        putJsonObject("reviewed_files") {
+            put("type", "array")
+            put("minItems", 1)
+            put("maxItems", 50)
+            put("description", "已经逐项读取或检查的候选目录相对文件路径；必须完整覆盖全部文件")
             put("items", buildJsonObject { put("type", "string") })
         }
     }
@@ -461,6 +499,7 @@ class MainToolRegistry(
         const val TOOL_HTTP_REQUEST = "http_request"
         const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
         const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
+        const val TOOL_SKILL_REGISTER = "skill_register"
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
         const val TOOL_AGENT_SLEEP = "agent_sleep"
         const val TOOL_VOICE_REPLY = "voice_reply"

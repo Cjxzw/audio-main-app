@@ -24,6 +24,7 @@ import androidx.core.app.NotificationCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.agent.LLMConfig
+import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.agent.buildCurrentTurnUserContent
@@ -37,6 +38,7 @@ import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.LlmClient
+import com.agent.voiceassistant.cloud.MultimodalImageEncoder
 import com.agent.voiceassistant.cloud.ListeningInactivityPolicy
 import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
@@ -48,6 +50,7 @@ import com.agent.voiceassistant.cloud.VoiceReplyDirectiveParser
 import com.agent.voiceassistant.cloud.VoiceReplyMode
 import com.agent.voiceassistant.cloud.VoiceReplyOptions
 import com.agent.voiceassistant.data.ConversationStore
+import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.media.AssistantNotificationContract
 import com.agent.voiceassistant.settings.LlmProviderRepository
@@ -119,13 +122,14 @@ class VoiceAgentService : Service() {
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
         private const val MAX_TOOL_RESULT_CHARS = 12_000
+        private const val MAX_IMAGE_HISTORY_TURNS = 3
+        private const val MAX_IMAGE_INPUTS = 4
+        private const val LEGACY_STREAM_BLUETOOTH_SCO = 6
+        private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif")
         private const val SESSION_GREETING_MESSAGE_ID = "__session_greeting__"
         private const val SESSION_GREETING_TRIGGER =
             "这是 Main Agent 的内部会话事件：用户刚刚开启了一个新话题。请只向用户发送一句简短、自然的中文问候，并邀请用户提出新的话题。不要调用工具，不要提及这个内部事件。"
         private val THINKING_FEEDBACK_AUDIO = intArrayOf(
-            R.raw.thinking_um_long,
-            R.raw.thinking_er_long,
-            R.raw.thinking_zhege,
             R.raw.thinking_wo_xiang_yixia,
             R.raw.thinking_wo_xiangxiang,
             R.raw.thinking_lvilv,
@@ -160,6 +164,7 @@ class VoiceAgentService : Service() {
         const val ACTION_SLEEP = "com.agent.voiceassistant.SLEEP"
         const val ACTION_TEXT_INPUT = "com.agent.voiceassistant.TEXT_INPUT"
         private const val EXTRA_TEXT = "text"
+        private const val EXTRA_ATTACHMENTS = "attachments"
 
         fun start(ctx: Context) {
             DiagLog.i("api.start", "ctx=${ctx.javaClass.simpleName}")
@@ -216,10 +221,11 @@ class VoiceAgentService : Service() {
             ctx.startService(intent)
         }
 
-        fun sendText(ctx: Context, text: String) {
+        fun sendText(ctx: Context, text: String, attachments: List<String> = emptyList()) {
             val intent = Intent(ctx, VoiceAgentService::class.java)
                 .setAction(ACTION_TEXT_INPUT)
                 .putExtra(EXTRA_TEXT, text)
+                .putStringArrayListExtra(EXTRA_ATTACHMENTS, ArrayList(attachments))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)
             } else {
@@ -251,6 +257,7 @@ class VoiceAgentService : Service() {
     private lateinit var toolRegistry: MainToolRegistry
     private lateinit var executionEnv: AndroidExecutionEnv
     private lateinit var skillRegistry: SkillRegistry
+    private lateinit var imageEncoder: MultimodalImageEncoder
     private val agentHarness = MainAgentHarness()
     private lateinit var earcons: EarconPlayer
     private var dormant = true
@@ -269,13 +276,20 @@ class VoiceAgentService : Service() {
         speechPreferences = SpeechPreferences(this)
         locationProvider = LocationProvider(this, store)
         executionEnv = AndroidExecutionEnv(this)
-        skillRegistry = SkillRegistry(executionEnv.skillsRoot)
+        skillRegistry = SkillRegistry(
+            executionEnv.skillsRoot,
+            executionEnv.disabledSkillsRoot,
+            executionEnv.deletedSkillsManifest,
+            executionEnv.modifiedSkillsManifest,
+        )
+        imageEncoder = MultimodalImageEncoder(executionEnv.workspaceRoot)
         toolRegistry = MainToolRegistry(
             LocalToolExecutor(
                 store = store,
                 locationProvider = locationProvider,
                 executionEnv = executionEnv,
                 codeGraph = CodeGraphIndex(this),
+                skillRegistry = skillRegistry,
             ),
         )
         locationProvider.refreshInBackground("service_start")
@@ -298,8 +312,9 @@ class VoiceAgentService : Service() {
             ACTION_TEXT_INPUT -> {
                 ensureForegroundForCurrentState()
                 val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
+                val attachments = intent.getStringArrayListExtra(EXTRA_ATTACHMENTS).orEmpty()
                 if (text.isNotBlank()) {
-                    serviceScope.launch { processUserText(text.trim(), source = "text") }
+                    serviceScope.launch { processUserText(text.trim(), source = "text", attachments = attachments) }
                 }
             }
             ACTION_STOP -> {
@@ -394,9 +409,7 @@ class VoiceAgentService : Service() {
                 val inactivityStartedAt = SystemClock.elapsedRealtime()
                 when (val capture = recorder?.recordNextUtterance() ?: SimpleVadRecorder.CaptureResult.Stopped) {
                     is SimpleVadRecorder.CaptureResult.Recorded -> {
-                        earcons.captureDone()
-                        emitLog("录音完成 ${capture.recording.durationMs}ms，停止收音")
-                        processTurn(capture.recording)
+                        handleRecordedCapture(capture.recording)
                     }
                     is SimpleVadRecorder.CaptureResult.RouteUnavailable -> {
                         handleAudioRouteFailure(capture.summary)
@@ -429,9 +442,7 @@ class VoiceAgentService : Service() {
                         }
                         when (followUp) {
                             is SimpleVadRecorder.CaptureResult.Recorded -> {
-                                earcons.captureDone()
-                                emitLog("录音完成 ${followUp.recording.durationMs}ms，停止收音")
-                                processTurn(followUp.recording)
+                                handleRecordedCapture(followUp.recording)
                             }
                             is SimpleVadRecorder.CaptureResult.RouteUnavailable -> {
                                 handleAudioRouteFailure(followUp.summary)
@@ -466,6 +477,16 @@ class VoiceAgentService : Service() {
         }
     }
 
+    private suspend fun handleRecordedCapture(recording: SimpleVadRecorder.Recording) {
+        updateNotification("识别中...")
+        emitLog("录音完成 ${recording.durationMs}ms，停止收音")
+        serviceScope.launch {
+            runCatching { earcons.captureDone() }
+                .onFailure { Timber.w(it, "Capture-done earcon failed") }
+        }
+        processTurn(recording)
+    }
+
     private suspend fun processTurn(recording: SimpleVadRecorder.Recording) {
         val client = speechClient ?: return
         updateNotification("识别中...")
@@ -488,6 +509,7 @@ class VoiceAgentService : Service() {
         userText: String,
         source: String,
         turnNote: String? = null,
+        attachments: List<String> = emptyList(),
     ) {
         turnMutex.withLock {
             try {
@@ -495,13 +517,21 @@ class VoiceAgentService : Service() {
                 val client = ensureSpeechClient() ?: return
                 val llmClient = createLlmClient()
 
-                val currentUserMessage = store.addMessage("user", userText)
-                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, userText))
+                val displayText = buildString {
+                    append(userText)
+                    if (attachments.isNotEmpty()) {
+                        append("\n")
+                        attachments.forEach { append("\n附件：$it") }
+                    }
+                }
+                val storedAttachments = attachments.map { StoredAttachment(it, attachmentMimeType(it)) }
+                val currentUserMessage = store.addMessage("user", displayText, attachments = storedAttachments)
+                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, displayText))
                 turnNote?.let {
                     store.addMessage("system", it)
                     EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, it))
                 }
-                emitLog("你($source): $userText")
+                emitLog("你($source): $userText attachments=${attachments.size}")
                 updateNotification("正在回应...")
 
                 val outcome = runAgentLoop(
@@ -512,6 +542,7 @@ class VoiceAgentService : Service() {
                         currentUserMessageId = currentUserMessage.id,
                         source = source,
                         turnNote = turnNote,
+                        attachments = attachments,
                     ),
                     initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
@@ -870,7 +901,7 @@ class VoiceAgentService : Service() {
 
         val execution = toolRegistry.execute(call)
         val result = execution.result
-        emitLog("工具结果: ${result.contextText}")
+        emitLog("工具结果: ${compactDiagnosticText(result.contextText)}")
         return AgentLoop.ToolExecution(
             message = CloudSpeechClient.LlmMessage(
                 role = "tool",
@@ -1118,25 +1149,48 @@ class VoiceAgentService : Service() {
         return spoken
     }
 
-    private fun buildMessages(
+    private suspend fun buildMessages(
         userText: String,
         currentUserMessageId: String,
         source: String,
         turnNote: String? = null,
-    ): List<CloudSpeechClient.LlmMessage> = buildList {
+        attachments: List<String> = emptyList(),
+    ): List<CloudSpeechClient.LlmMessage> {
+        val history = store.llmHistory(excludeMessageId = currentUserMessageId)
+        val currentAttachmentPaths = attachments.filter(::isImageAttachment)
+        val providerSupportsImages = llmProviderRepository.activeProfile().supportsImages
+        val selectedImagePaths = if (providerSupportsImages) {
+            (history.filter { it.role == "user" && it.attachmentPaths.any(::isImageAttachment) }
+                .takeLast(MAX_IMAGE_HISTORY_TURNS)
+                .flatMap { it.attachmentPaths.filter(::isImageAttachment) } + currentAttachmentPaths)
+                .takeLast(MAX_IMAGE_INPUTS)
+                .toSet()
+        } else {
+            emptySet()
+        }
+        val hydratedHistory = history.map { message -> hydrateImages(message, selectedImagePaths) }
+        val currentImages = if (providerSupportsImages) {
+            currentAttachmentPaths.filter { it in selectedImagePaths }.mapNotNull { path ->
+                runCatching { imageEncoder.encode(path) }
+                    .onFailure { Timber.w(it, "Image encoding failed path=$path") }
+                    .getOrNull()
+            }
+        } else {
+            emptyList()
+        }
+
+        return buildList {
         add(CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()))
         val runtimeContext = buildString {
             append("Agent 虚拟文件系统：\n")
             append(executionEnv.virtualRootSummary())
-            append("\n\nSkill 索引：\n")
-            append(skillRegistry.promptSummary())
             append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
             append(executionEnv.credentialProfileSummary())
-            append("\n\n本地上下文：\n")
-            append(store.contextSummary())
+            append("\n\n会话上下文资产快照：\n")
+            append(store.sessionContextSnapshot(skillRegistry.promptSummary()))
         }.trim()
         add(CloudSpeechClient.LlmMessage("system", runtimeContext))
-        addAll(store.llmHistory(excludeMessageId = currentUserMessageId))
+        addAll(hydratedHistory)
         val timestamp = ZonedDateTime.now().format(
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss EEEE XXX", Locale.CHINA),
         )
@@ -1154,9 +1208,41 @@ class VoiceAgentService : Service() {
                     network = currentNetworkLabel(),
                     recentUserTiming = store.recentUserTimingSummary(),
                     turnNote = turnNote,
-                ),
+                ) + buildString {
+                    if (attachments.isNotEmpty()) append("\n本轮附件：\n${attachments.joinToString("\n") { "- $it" }}")
+                    if (!providerSupportsImages && currentAttachmentPaths.isNotEmpty()) {
+                        append("\n当前聊天模型未启用图片输入能力，只能看到图片路径，不能直接理解画面。")
+                    }
+                },
+                attachmentPaths = attachments,
+                imageInputs = currentImages,
             ),
         )
+        }
+    }
+
+    private suspend fun hydrateImages(
+        message: CloudSpeechClient.LlmMessage,
+        selectedPaths: Set<String>,
+    ): CloudSpeechClient.LlmMessage {
+        if (message.role != "user") return message
+        val images = message.attachmentPaths.filter { it in selectedPaths }.mapNotNull { path ->
+            runCatching { imageEncoder.encode(path) }
+                .onFailure { Timber.w(it, "Historical image encoding failed path=$path") }
+                .getOrNull()
+        }
+        return message.copy(imageInputs = images)
+    }
+
+    private fun isImageAttachment(path: String): Boolean =
+        path.substringAfterLast('.', "").lowercase(Locale.ROOT) in IMAGE_EXTENSIONS
+
+    private fun attachmentMimeType(path: String): String? = when (path.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "webp" -> "image/webp"
+        "gif" -> "image/gif"
+        else -> null
     }
 
     @SuppressLint("MissingPermission")
@@ -1247,12 +1333,14 @@ class VoiceAgentService : Service() {
     }
 
     private suspend fun handleLocalConversationCommand(text: String): Boolean {
-        val normalized = text.trim().lowercase()
-        val compact = normalized.replace(" ", "")
-        val isNew = compact == "/new" ||
-            compact in setOf("开启新话题", "新建会话", "新开话题", "重新开始一个话题", "重新开始")
-        if (!isNew) return false
+        return when (LocalConversationCommandPolicy.classify(text)) {
+            LocalConversationCommandPolicy.Command.NEW_TOPIC -> startNewConversation(text)
+            LocalConversationCommandPolicy.Command.SLEEP -> handleLocalSleepCommand(text)
+            null -> false
+        }
+    }
 
+    private suspend fun startNewConversation(text: String): Boolean {
         store.startNewConversation(reason = text)
         locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
@@ -1289,6 +1377,20 @@ class VoiceAgentService : Service() {
             emitSessionGreetingFallback(client)
             true
         }
+    }
+
+    private fun handleLocalSleepCommand(text: String): Boolean {
+        store.addMessage("user", text)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, text))
+        emitLog("你(local): $text")
+
+        val confirmation = "好的，我先休眠了。"
+        store.addMessage("assistant", confirmation)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, confirmation))
+        emitLog("本地语义休眠：$text")
+        DiagLog.i("agent.semantic_sleep.local", "text=${text.take(40)}", showInUi = true)
+        sleepAgent(cancelConversationLoop = false)
+        return true
     }
 
     private suspend fun emitSessionGreetingFallback(client: CloudSpeechClient?) {
@@ -1554,6 +1656,7 @@ class VoiceAgentService : Service() {
                 track.playState != AudioTrack.PLAYSTATE_PLAYING
             ) {
                 track.play()
+                routeManager?.logTrackRoute(track, "playback_started")
                 logPlaybackStarted()
             }
         }
@@ -1623,9 +1726,10 @@ class VoiceAgentService : Service() {
             AudioFormat.ENCODING_PCM_16BIT,
         ).coerceAtLeast(INITIAL_STREAM_BUFFER_BYTES * 2)
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        val attributes = playbackAudioAttributes()
+        val track = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             AudioTrack.Builder()
-                .setAudioAttributes(playbackAudioAttributes())
+                .setAudioAttributes(attributes)
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setSampleRate(sampleRate)
@@ -1647,6 +1751,8 @@ class VoiceAgentService : Service() {
                 AudioTrack.MODE_STREAM,
             )
         }
+        logPlaybackAudioDomain(track, attributes)
+        return track
     }
 
     private suspend fun waitForAudioTrack(track: AudioTrack, bytesWritten: Int, sampleRate: Int) {
@@ -1831,10 +1937,34 @@ class VoiceAgentService : Service() {
     }
 
     private fun playbackAudioAttributes(): AudioAttributes {
+        val communicationSession = routeManager != null
         return AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setUsage(
+                if (communicationSession) {
+                    AudioAttributes.USAGE_VOICE_COMMUNICATION
+                } else {
+                    AudioAttributes.USAGE_MEDIA
+                },
+            )
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun logPlaybackAudioDomain(track: AudioTrack, attributes: AudioAttributes) {
+        val manager = getSystemService(AudioManager::class.java)
+        val communicationDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            manager.communicationDevice?.type
+        } else {
+            null
+        }
+        Timber.i(
+            "AudioDomain: usage=${attributes.usage} stream=${track.streamType} mode=${manager.mode} " +
+                "communicationDevice=$communicationDevice " +
+                "music=${manager.getStreamVolume(AudioManager.STREAM_MUSIC)} " +
+                "voice=${manager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)} " +
+                "sco=${manager.getStreamVolume(LEGACY_STREAM_BLUETOOTH_SCO)}",
+        )
     }
 
     private fun boostEncodedAudioIfPossible(bytes: ByteArray): ByteArray {
@@ -1873,6 +2003,11 @@ class VoiceAgentService : Service() {
 
     private fun currentTtsGain(): Float =
         if (::speechPreferences.isInitialized) speechPreferences.ttsGain else 1.2f
+
+    private fun compactDiagnosticText(text: String, maxChars: Int = 320): String {
+        val compact = text.replace(Regex("\\s+"), " ").trim()
+        return if (compact.length <= maxChars) compact else compact.take(maxChars - 1) + "…"
+    }
 
     private fun describePcm(bytes: ByteArray, start: Int = 0, endExclusive: Int = bytes.size): String {
         var i = start
@@ -2032,11 +2167,14 @@ class VoiceAgentService : Service() {
 
     private fun requestPlaybackFocus(): AudioFocusRequest? {
         val mgr = getSystemService(AudioManager::class.java)
+        routeManager?.ensureCommunicationMode("playback_focus")
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attributes = playbackAudioAttributes()
             val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(playbackAudioAttributes())
+                .setAudioAttributes(attributes)
                 .build()
-            mgr.requestAudioFocus(request)
+            val result = mgr.requestAudioFocus(request)
+            Timber.i("AudioDomain: focus usage=${attributes.usage} result=$result mode=${mgr.mode}")
             request
         } else {
             @Suppress("DEPRECATION")

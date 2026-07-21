@@ -11,6 +11,7 @@ import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.SeekBarPreference
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.databinding.ActivitySettingsBinding
+import com.agent.voiceassistant.workspace.WorkspaceActivity
 
 class SettingsActivity : AppCompatActivity() {
     private lateinit var binding: ActivitySettingsBinding
@@ -64,6 +65,22 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 setIcon(R.drawable.ic_volume_24)
                 setOnPreferenceClickListener {
                     (activity as SettingsActivity).open(VoiceSettingsFragment(), getString(R.string.settings_voice))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_context_assets)
+                summary = getString(R.string.settings_context_assets_summary)
+                setOnPreferenceClickListener {
+                    startActivity(Intent(requireContext(), ContextAssetsActivity::class.java))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_workspace)
+                summary = getString(R.string.settings_workspace_summary)
+                setOnPreferenceClickListener {
+                    startActivity(Intent(requireContext(), WorkspaceActivity::class.java))
                     true
                 }
             })

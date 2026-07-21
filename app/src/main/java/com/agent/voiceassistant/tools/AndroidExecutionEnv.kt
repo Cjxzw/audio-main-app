@@ -68,10 +68,13 @@ class AndroidExecutionEnv(
     val logsRoot = File(runtimeRoot, "logs")
     val workspaceRoot = File(runtimeRoot, "workspace")
     val skillsRoot = File(runtimeRoot, "skills")
+    val disabledSkillsRoot = File(runtimeRoot, "skills-disabled")
+    val deletedSkillsManifest = File(runtimeRoot, "skills-deleted")
+    val modifiedSkillsManifest = File(runtimeRoot, "skills-user-modified")
     private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot, skillsRoot)
 
     init {
-        listOf(runtimeRoot, logsRoot, workspaceRoot, skillsRoot).forEach(File::mkdirs)
+        listOf(runtimeRoot, logsRoot, workspaceRoot, skillsRoot, disabledSkillsRoot).forEach(File::mkdirs)
         installAssetTree("source", sourceRoot, marker = fingerprintAssetTree("source"))
         installBundledSkills()
     }
@@ -288,14 +291,21 @@ class AndroidExecutionEnv(
 
         val previousNames = manifestFile.readLinesOrEmpty().filter(String::isNotBlank).toSet()
         val bundledNames = appContext.assets.list("skills").orEmpty().toSet()
+        val deletedNames = deletedSkillsManifest.readLinesOrEmpty().filter(String::isNotBlank).toSet()
+        val modifiedNames = modifiedSkillsManifest.readLinesOrEmpty().filter(String::isNotBlank).toSet()
         (previousNames - bundledNames).forEach { name ->
-            File(skillsRoot, name).apply {
-                makeWritable(this)
-                deleteRecursively()
+            listOf(File(skillsRoot, name), File(disabledSkillsRoot, name)).forEach { target ->
+                target.apply {
+                    makeWritable(this)
+                    deleteRecursively()
+                }
             }
         }
         bundledNames.forEach { name ->
-            val target = File(skillsRoot, name)
+            if (name in deletedNames) return@forEach
+            if (name in modifiedNames) return@forEach
+            val disabled = File(disabledSkillsRoot, name)
+            val target = if (disabled.exists()) disabled else File(skillsRoot, name)
             makeWritable(target)
             target.deleteRecursively()
             copyAssetTree("skills/$name", target)

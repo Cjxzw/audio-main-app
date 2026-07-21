@@ -36,6 +36,7 @@ class LlmProviderEditorActivity : AppCompatActivity() {
             binding.etBaseUrl.setText(profile.baseUrl)
             binding.etModelId.setText(profile.modelId)
             binding.spinnerProviderMode.setSelection(if (profile.mode == LlmProviderMode.MIMO) 0 else 1)
+            binding.checkProviderImages.isChecked = profile.supportsImages
             binding.btnDeleteProvider.visibility = View.VISIBLE
         }
         binding.etBaseUrl.addTextChangedListener(object : TextWatcher {
@@ -71,6 +72,7 @@ class LlmProviderEditorActivity : AppCompatActivity() {
                 modelId = profile.modelId,
                 mode = profile.mode,
                 apiKey = binding.etApiKey.text?.toString(),
+                supportsImages = binding.checkProviderImages.isChecked,
             )
         }.onSuccess {
             repository.setActive(it.id)
@@ -92,6 +94,7 @@ class LlmProviderEditorActivity : AppCompatActivity() {
             baseUrl = binding.etBaseUrl.text?.toString()?.trim().orEmpty().also { require(it.isNotBlank()) { "请输入 Base URL" } },
             modelId = binding.etModelId.text?.toString()?.trim().orEmpty().also { require(it.isNotBlank()) { "请输入模型 ID" } },
             mode = if (binding.spinnerProviderMode.selectedItemPosition == 0) LlmProviderMode.MIMO else LlmProviderMode.OPENAI_COMPATIBLE,
+            supportsImages = binding.checkProviderImages.isChecked,
         )
     }.onFailure { showError(it.message ?: "配置不完整") }.getOrNull()
 

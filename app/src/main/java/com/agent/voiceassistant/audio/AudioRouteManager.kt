@@ -73,10 +73,11 @@ class AudioRouteManager(context: Context) {
         pollMs: Long = ROUTE_READY_POLL_MS,
     ): RouteReadiness {
         ensureConfigured()
+        ensureCommunicationMode("await_voice_route")
         val startedAt = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - startedAt < timeoutMs) {
             if (communicationRouteReady()) {
-                val summary = configureForVoiceSession()
+                val summary = currentRouteSummary()
                 val elapsed = SystemClock.elapsedRealtime() - startedAt
                 Timber.i("AudioRoute: communication route ready elapsedMs=$elapsed $summary")
                 return RouteReadiness(true, elapsed, summary)
@@ -123,6 +124,7 @@ class AudioRouteManager(context: Context) {
     }
 
     fun applyInputRouting(record: AudioRecord) {
+        ensureCommunicationMode("audio_record")
         val target = detectedInput
         if (target == null) {
             Timber.i("AudioRoute: no preferred input device; AudioRecord uses system default input route")
@@ -139,11 +141,18 @@ class AudioRouteManager(context: Context) {
         Timber.i("AudioRoute: AudioRecord $label routed=${deviceLabel(routed)}")
     }
 
+    fun logTrackRoute(track: AudioTrack, label: String) {
+        val routed = runCatching { track.routedDevice }.getOrNull()
+        Timber.i("AudioRoute: AudioTrack $label routed=${deviceLabel(routed)}")
+    }
+
     fun applyOutputRouting(track: AudioTrack) {
+        ensureCommunicationMode("audio_track")
         applyOutputRouting(track as AudioRouting, "AudioTrack")
     }
 
     fun applyOutputRouting(player: MediaPlayer) {
+        ensureCommunicationMode("media_player")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             applyOutputRouting(player as AudioRouting, "MediaPlayer")
         } else {
@@ -172,6 +181,26 @@ class AudioRouteManager(context: Context) {
         communicationDeviceSet = false
         scoStarted = false
         Timber.i("AudioRoute released")
+    }
+
+    fun ensureCommunicationMode(reason: String): Boolean {
+        if (!configured) return false
+        val current = audioManager.mode
+        val protectedCallMode = current == AudioManager.MODE_IN_CALL ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && current == AudioManager.MODE_CALL_SCREENING)
+        if (protectedCallMode) {
+            Timber.w("AudioRoute: keep system call mode=$current reason=$reason")
+            return false
+        }
+        if (current == AudioManager.MODE_IN_COMMUNICATION) return true
+        return runCatching {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            val applied = audioManager.mode == AudioManager.MODE_IN_COMMUNICATION
+            Timber.i("AudioRoute: communication mode reasserted from=$current applied=$applied reason=$reason")
+            applied
+        }.onFailure {
+            Timber.w(it, "AudioRoute: communication mode reassert failed from=$current reason=$reason")
+        }.getOrDefault(false)
     }
 
     private fun applyOutputRouting(routing: AudioRouting, owner: String) {

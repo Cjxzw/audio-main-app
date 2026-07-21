@@ -18,6 +18,7 @@ data class LlmProviderProfile(
     val modelId: String,
     val mode: LlmProviderMode,
     val builtIn: Boolean = false,
+    val supportsImages: Boolean = false,
 )
 
 class LlmProviderRepository(context: Context) {
@@ -47,6 +48,7 @@ class LlmProviderRepository(context: Context) {
         modelId: String,
         mode: LlmProviderMode,
         apiKey: String?,
+        supportsImages: Boolean = false,
     ): LlmProviderProfile {
         val profileId = id?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
         require(profileId != BUILT_IN_ID) { "内置供应商不能修改" }
@@ -57,6 +59,7 @@ class LlmProviderRepository(context: Context) {
             baseUrl = normalized,
             modelId = modelId.trim().also { require(it.isNotBlank()) { "请输入模型 ID" } },
             mode = mode,
+            supportsImages = supportsImages,
         )
         val normalizedApiKey = apiKey?.trim()?.takeIf { it.isNotBlank() }
         require(normalizedApiKey != null || hasApiKey(profileId)) { "请输入 API Key" }
@@ -116,6 +119,7 @@ class LlmProviderRepository(context: Context) {
             modelId = config.modelName,
             mode = LlmProviderMode.MIMO,
             builtIn = true,
+            supportsImages = true,
         )
     }
 

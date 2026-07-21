@@ -40,7 +40,7 @@
         android:padding="@dimen/margin_sm"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/llTextInput">
+        app:layout_constraintBottom_toTopOf="@id/tvPendingAttachments">
 
         <TextView
             android:id="@+id/tvLog"
@@ -82,6 +82,23 @@
             android:layout_marginStart="@dimen/margin_sm"
             android:text="@string/btn_send_text" />
     </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvPendingAttachments"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="4dp"
+        android:background="@color/gray_200"
+        android:ellipsize="end"
+        android:maxLines="2"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="6dp"
+        android:textColor="@color/gray_500"
+        android:textSize="12sp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@id/llTextInput"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <com.agent.voiceassistant.ui.VoiceBarView
         android:id="@+id/voiceBar"

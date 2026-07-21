@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.tools
 
 import com.agent.voiceassistant.agent.AgentAction
+import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.data.ConversationStore
 import kotlinx.serialization.json.JsonArray
@@ -18,6 +19,7 @@ class LocalToolExecutor(
     private val webSearchClient: ExaWebSearchClient = ExaWebSearchClient(),
     private val executionEnv: AndroidExecutionEnv? = null,
     private val codeGraph: CodeGraphIndex? = null,
+    private val skillRegistry: SkillRegistry? = null,
 ) {
 
     data class ToolResult(
@@ -43,6 +45,7 @@ class LocalToolExecutor(
             "http_request" -> httpRequest(action.payload)
             "code.graph.search" -> codeGraphSearch(action.payload)
             "code.graph.explain" -> codeGraphExplain(action.payload)
+            "skill.register" -> registerSkill(action.payload)
             else -> ToolResult(
                 actionType = action.actionType,
                 displayText = "未知本地工具：${action.actionType}",
@@ -268,6 +271,7 @@ class LocalToolExecutor(
         val env = executionEnv ?: return unavailable("read")
         val results = paths.map { path ->
             path to runCatching {
+                skillRegistry?.unavailableReason(path)?.let(::error)
                 env.read(
                     path = path,
                     offset = payload.int("offset"),
@@ -486,6 +490,48 @@ class LocalToolExecutor(
         } else {
             "定位缓存可用，但尚未解析成街道地址。$accuracy$provider${internalCoord}定位记录生成于 ${ageSeconds} 秒前。${refresh}请不要向用户播报经纬度；用户询问具体地址时再调用 location_reverse_geocode。"
         }
+    }
+
+    private fun registerSkill(payload: JsonObject): ToolResult {
+        val env = executionEnv ?: return unavailable("skill.register")
+        val registry = skillRegistry ?: return unavailable("skill.register")
+        val sourcePath = payload.string("source_path")
+            ?: return invalidArguments("skill.register", "缺少 source_path")
+        val name = payload.string("name")
+            ?: return invalidArguments("skill.register", "缺少 name")
+        val description = payload.string("description")
+            ?: return invalidArguments("skill.register", "缺少 description")
+        val coreFile = payload.string("core_file") ?: "SKILL.md"
+        val compatibilityNotes = payload.string("compatibility_notes")
+            ?: return invalidArguments("skill.register", "缺少 compatibility_notes")
+        val reviewedFiles = payload.stringList("reviewed_files")
+        if (reviewedFiles.isEmpty()) return invalidArguments("skill.register", "缺少 reviewed_files")
+        return runCatching {
+            registry.registerFromWorkspace(
+                workspaceRoot = env.workspaceRoot,
+                sourcePath = sourcePath,
+                name = name,
+                description = description,
+                coreFile = coreFile,
+                compatibilityNotes = compatibilityNotes,
+                reviewedFiles = reviewedFiles,
+            )
+        }.fold(
+            onSuccess = { registration ->
+                ToolResult(
+                    actionType = "skill.register",
+                    displayText = "注册 Skill：${registration.skill.name}",
+                    contextText = buildString {
+                        appendLine("Skill 注册成功：${registration.skill.name}")
+                        appendLine("路径：${registration.skill.virtualPath}")
+                        appendLine("兼容性说明：${registration.compatibilityNotes}")
+                        append("该 Skill 以知识和流程说明方式运行，不保证原项目的脚本能力可用。")
+                    },
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("skill.register", "Skill 注册失败", error) },
+        )
     }
 
     private companion object {

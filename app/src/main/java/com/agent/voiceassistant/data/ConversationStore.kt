@@ -15,6 +15,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class ConversationStore(context: Context) {
 
@@ -25,8 +26,15 @@ class ConversationStore(context: Context) {
     private val file = File(context.filesDir, "main-agent-store.json")
     private val toolTraceDir = File(context.filesDir, "agent-runtime/tool-traces").apply { mkdirs() }
 
-    private val lock = Any()
-    private var state = loadState()
+    private val shared = SHARED_STORES.computeIfAbsent(file.canonicalPath) {
+        SharedConversationState(loadState())
+    }
+    private val lock: Any = shared
+    private var state: StoreState
+        get() = shared.state
+        set(value) {
+            shared.state = value
+        }
 
     val currentConversationId: String
         get() = synchronized(lock) { state.currentConversationId }
@@ -53,6 +61,7 @@ class ConversationStore(context: Context) {
                         CloudSpeechClient.ToolCall(call.id, call.name, call.arguments)
                     },
                     toolCallId = message.toolCallId,
+                    attachmentPaths = message.attachments.map(StoredAttachment::virtualPath),
                 )
             }
     }
@@ -64,6 +73,7 @@ class ConversationStore(context: Context) {
         toolCallId: String? = null,
         toolStatus: ToolDisplayStatus? = null,
         presentation: ChatPresentation = ChatPresentation.STANDARD,
+        attachments: List<StoredAttachment> = emptyList(),
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -78,6 +88,7 @@ class ConversationStore(context: Context) {
             toolCallId = toolCallId,
             toolStatus = toolStatus?.name,
             presentation = presentation.name,
+            attachments = attachments,
         )
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -208,10 +219,11 @@ class ConversationStore(context: Context) {
 
     fun searchMemories(query: String, limit: Int = 5): List<StoredMemory> = synchronized(lock) {
         val q = query.trim()
+        val enabled = state.memories.filter { it.enabled }
         if (q.isBlank()) {
-            state.memories.takeLast(limit).asReversed()
+            enabled.takeLast(limit).asReversed()
         } else {
-            state.memories
+            enabled
                 .asReversed()
                 .filter { memory ->
                     memory.content.contains(q, ignoreCase = true) ||
@@ -219,6 +231,38 @@ class ConversationStore(context: Context) {
                 }
                 .take(limit)
         }
+    }
+
+    fun memories(): List<StoredMemory> = synchronized(lock) {
+        state.memories.sortedByDescending { it.updatedAt }
+    }
+
+    fun updateMemory(id: String, content: String, tags: List<String>): StoredMemory? = synchronized(lock) {
+        val index = state.memories.indexOfFirst { it.id == id }
+        if (index < 0) return@synchronized null
+        val updated = state.memories[index].copy(
+            content = content.trim(),
+            tags = tags.map(String::trim).filter(String::isNotBlank).distinct(),
+            updatedAt = System.currentTimeMillis(),
+        )
+        state.memories[index] = updated
+        persistLocked()
+        updated
+    }
+
+    fun setMemoryEnabled(id: String, enabled: Boolean): StoredMemory? = synchronized(lock) {
+        val index = state.memories.indexOfFirst { it.id == id }
+        if (index < 0) return@synchronized null
+        val updated = state.memories[index].copy(enabled = enabled, updatedAt = System.currentTimeMillis())
+        state.memories[index] = updated
+        persistLocked()
+        updated
+    }
+
+    fun deleteMemory(id: String): Boolean = synchronized(lock) {
+        val removed = state.memories.removeAll { it.id == id }
+        if (removed) persistLocked()
+        removed
     }
 
     fun setLocation(location: StoredLocation) {
@@ -231,8 +275,27 @@ class ConversationStore(context: Context) {
     fun lastLocation(): StoredLocation? = synchronized(lock) { state.lastLocation }
 
     fun contextSummary(): String = synchronized(lock) {
+        memorySummaryLocked()
+    }
+
+    fun sessionContextSnapshot(skillSummary: String): String = synchronized(lock) {
+        val session = currentSessionLocked()
+        session.contextSnapshot?.let { return@synchronized it }
+        val snapshot = buildString {
+            appendLine("Skill 索引：")
+            appendLine(skillSummary)
+            appendLine()
+            appendLine("本地上下文：")
+            append(memorySummaryLocked())
+        }.trim()
+        session.contextSnapshot = snapshot
+        persistLocked()
+        snapshot
+    }
+
+    private fun memorySummaryLocked(): String =
         buildString {
-            val memories = state.memories.takeLast(5)
+            val memories = state.memories.filter { it.enabled }.takeLast(5)
             if (memories.isNotEmpty()) {
                 appendLine("用户记忆：")
                 memories.forEach { appendLine("- ${it.content}") }
@@ -240,7 +303,6 @@ class ConversationStore(context: Context) {
                 appendLine("用户记忆：暂无")
             }
         }.trim()
-    }
 
     fun recentUserTimingSummary(limit: Int = 4, now: Long = System.currentTimeMillis()): String =
         synchronized(lock) {
@@ -350,6 +412,7 @@ class ConversationStore(context: Context) {
     private companion object {
         private const val MAX_MEMORIES = 500
         private const val MAX_TOOL_TRACE_FILES = 500
+        private val SHARED_STORES = ConcurrentHashMap<String, SharedConversationState>()
     }
 
     private fun compactLegacyToolDisplay(content: String): String {
@@ -358,6 +421,8 @@ class ConversationStore(context: Context) {
         return if (rawJsonStart > 0) withoutStatus.substring(0, rawJsonStart) else withoutStatus
     }
 }
+
+private data class SharedConversationState(var state: StoreState)
 
 internal object ToolHistoryPolicy {
     const val MAX_PERSISTED_RESULT_CHARS = 3_000
@@ -387,6 +452,7 @@ data class ConversationSession(
     val createdAt: Long = System.currentTimeMillis(),
     var updatedAt: Long = System.currentTimeMillis(),
     val messages: MutableList<StoredMessage> = mutableListOf(),
+    var contextSnapshot: String? = null,
 )
 
 @Serializable
@@ -401,6 +467,13 @@ data class StoredMessage(
     val llmVisible: Boolean? = null,
     val chatVisible: Boolean? = null,
     val presentation: String? = null,
+    val attachments: List<StoredAttachment> = emptyList(),
+)
+
+@Serializable
+data class StoredAttachment(
+    val virtualPath: String,
+    val mimeType: String? = null,
 )
 
 @Serializable
@@ -429,6 +502,7 @@ data class StoredMemory(
     val sourceMessageId: String? = null,
     val createdAt: Long,
     val updatedAt: Long,
+    val enabled: Boolean = true,
 )
 
 @Serializable

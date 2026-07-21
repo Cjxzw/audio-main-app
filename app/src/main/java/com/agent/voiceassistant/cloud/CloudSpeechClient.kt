@@ -63,6 +63,13 @@ class CloudSpeechClient(
         val reasoningContent: String? = null,
         val toolCalls: List<ToolCall> = emptyList(),
         val toolCallId: String? = null,
+        val attachmentPaths: List<String> = emptyList(),
+        val imageInputs: List<ImageInput> = emptyList(),
+    )
+
+    data class ImageInput(
+        val mimeType: String,
+        val base64Data: String,
     )
 
     data class ChatRequest(
