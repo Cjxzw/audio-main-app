@@ -57,9 +57,9 @@ class AudioRouteManager(context: Context) {
                 "communication=${communicationOutputs.joinToString { deviceLabel(it) }}"
         )
         return if (external) {
-            "检测到外部音频设备: $summary"
+            "已优先使用外部音频设备: $summary"
         } else {
-            "未检测到外部音频设备，使用手机音频: $summary"
+            "使用手机麦克风和扬声器；建议连接外部麦克风以获得更好的收音和对话效果: $summary"
         }
     }
 
@@ -85,9 +85,14 @@ class AudioRouteManager(context: Context) {
             delay(pollMs)
         }
         val elapsed = SystemClock.elapsedRealtime() - startedAt
-        val summary = currentRouteSummary()
-        Timber.w("AudioRoute: communication route timeout elapsedMs=$elapsed $summary")
-        return RouteReadiness(false, elapsed, summary)
+        val failedRoute = currentRouteSummary()
+        Timber.w("AudioRoute: communication route timeout elapsedMs=$elapsed $failedRoute")
+        val fallback = fallbackToPhoneAudio("communication_route_timeout")
+        return RouteReadiness(
+            ready = fallback != null,
+            elapsedMs = elapsed,
+            summary = fallback ?: failedRoute,
+        )
     }
 
     suspend fun awaitInputRoute(
@@ -112,6 +117,23 @@ class AudioRouteManager(context: Context) {
         }
         val routed = runCatching { record.routedDevice }.getOrNull()
         Timber.w("AudioRoute: input route timeout expected=${deviceLabel(expected)} routed=${deviceLabel(routed)}")
+        val fallback = fallbackToPhoneAudio("input_route_timeout") ?: return false
+        if (!applyInputRouting(record)) return false
+
+        val fallbackInput = detectedInput
+        val fallbackStartedAt = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - fallbackStartedAt < PHONE_INPUT_READY_TIMEOUT_MS) {
+            val fallbackRouted = runCatching { record.routedDevice }.getOrNull()
+            if (fallbackRouted != null && fallbackRouted.type == fallbackInput?.type) {
+                Timber.i(
+                    "AudioRoute: phone input route ready elapsedMs=${SystemClock.elapsedRealtime() - fallbackStartedAt} " +
+                        "routed=${deviceLabel(fallbackRouted)} $fallback"
+                )
+                return true
+            }
+            delay(pollMs)
+        }
+        Timber.w("AudioRoute: phone input route unavailable routed=${deviceLabel(record.routedDevice)}")
         return false
     }
 
@@ -123,17 +145,18 @@ class AudioRouteManager(context: Context) {
         }
     }
 
-    fun applyInputRouting(record: AudioRecord) {
+    fun applyInputRouting(record: AudioRecord): Boolean {
         ensureCommunicationMode("audio_record")
         val target = detectedInput
         if (target == null) {
             Timber.i("AudioRoute: no preferred input device; AudioRecord uses system default input route")
-            return
+            return true
         }
         val ok = runCatching { record.setPreferredDevice(target) }
             .onFailure { Timber.w(it, "AudioRoute: AudioRecord setPreferredDevice failed target=${deviceLabel(target)}") }
             .getOrDefault(false)
         Timber.i("AudioRoute: AudioRecord setPreferredDevice target=${deviceLabel(target)} ok=$ok")
+        return ok
     }
 
     fun logRecordRoute(record: AudioRecord, label: String) {
@@ -203,6 +226,25 @@ class AudioRouteManager(context: Context) {
         }.getOrDefault(false)
     }
 
+    @Synchronized
+    fun fallbackToPhoneAudio(reason: String): String? {
+        val phoneInput = getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .firstOrNull { it.isSource && it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+        if (phoneInput == null) {
+            Timber.e("AudioRoute: phone fallback unavailable; no built-in microphone reason=$reason")
+            return null
+        }
+        val phoneOutput = getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.isSink && it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+
+        clearExternalCommunicationRoute()
+        detectedInput = phoneInput
+        detectedOutput = phoneOutput
+        val summary = currentRouteSummary()
+        Timber.w("AudioRoute: external route unavailable; falling back to phone reason=$reason $summary")
+        return "外部音频设备不可用，已回退到手机麦克风和扬声器；手机收音质量可能影响对话效果: $summary"
+    }
+
     private fun applyOutputRouting(routing: AudioRouting, owner: String) {
         val target = detectedOutput
         if (target == null) {
@@ -253,6 +295,20 @@ class AudioRouteManager(context: Context) {
                 Timber.w(it, "AudioRoute: startBluetoothSco failed")
             }
         }
+    }
+
+    private fun clearExternalCommunicationRoute() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { audioManager.clearCommunicationDevice() }
+                .onFailure { Timber.w(it, "AudioRoute: clearCommunicationDevice for fallback failed") }
+        }
+        if (scoStarted) {
+            @Suppress("DEPRECATION")
+            runCatching { audioManager.stopBluetoothSco() }
+                .onFailure { Timber.w(it, "AudioRoute: stopBluetoothSco for fallback failed") }
+        }
+        communicationDeviceSet = false
+        scoStarted = false
     }
 
     private fun communicationRouteReady(): Boolean {
@@ -349,6 +405,7 @@ class AudioRouteManager(context: Context) {
     private companion object {
         private const val ROUTE_READY_TIMEOUT_MS = 1_800L
         private const val INPUT_ROUTE_TIMEOUT_MS = 1_500L
+        private const val PHONE_INPUT_READY_TIMEOUT_MS = 800L
         private const val ROUTE_READY_POLL_MS = 100L
     }
 }

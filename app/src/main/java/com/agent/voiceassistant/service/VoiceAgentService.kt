@@ -392,7 +392,7 @@ class VoiceAgentService : Service() {
             try {
                 val readiness = routeManager?.awaitVoiceRoute()
                 if (readiness?.ready == false) {
-                    handleAudioRouteFailure(readiness.summary)
+                    handleMicrophoneFailure(readiness.summary)
                     break
                 }
                 readiness?.let {
@@ -412,7 +412,7 @@ class VoiceAgentService : Service() {
                         handleRecordedCapture(capture.recording)
                     }
                     is SimpleVadRecorder.CaptureResult.RouteUnavailable -> {
-                        handleAudioRouteFailure(capture.summary)
+                        handleMicrophoneFailure(capture.summary)
                     }
                     SimpleVadRecorder.CaptureResult.InactivityWarning -> {
                         emitLog("10 秒未检测到语音，即将进入休眠")
@@ -445,7 +445,7 @@ class VoiceAgentService : Service() {
                                 handleRecordedCapture(followUp.recording)
                             }
                             is SimpleVadRecorder.CaptureResult.RouteUnavailable -> {
-                                handleAudioRouteFailure(followUp.summary)
+                                handleMicrophoneFailure(followUp.summary)
                             }
                             SimpleVadRecorder.CaptureResult.InactivitySleep -> {
                                 emitLog("休眠提示后 5 秒仍未检测到语音，进入休眠")
@@ -2145,13 +2145,13 @@ class VoiceAgentService : Service() {
         updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
     }
 
-    private suspend fun handleAudioRouteFailure(details: String) {
-        val message = "蓝牙麦克风连接失败，助手已返回休眠。请确认设备连接后重新唤醒。"
-        DiagLog.w("audio.route.failed", details, showInUi = true)
+    private suspend fun handleMicrophoneFailure(details: String) {
+        val message = "麦克风不可用，助手已返回休眠。请检查录音权限或音频设备后重新唤醒。"
+        DiagLog.w("audio.microphone.failed", details, showInUi = true)
         store.addMessage("system", message)
         EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
         emitLog(message)
-        updateNotification("蓝牙麦克风不可用")
+        updateNotification("麦克风不可用")
         earcons.error()
         sleepAgent()
     }
