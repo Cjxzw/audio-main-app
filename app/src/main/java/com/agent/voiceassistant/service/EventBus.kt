@@ -43,6 +43,18 @@ object EventBus {
     )
     val chatResets: SharedFlow<List<ChatMessage>> = _chatResets.asSharedFlow()
 
+    private val _conversationUpdates = MutableSharedFlow<Long>(
+        replay = 0,
+        extraBufferCapacity = 16,
+    )
+    val conversationUpdates: SharedFlow<Long> = _conversationUpdates.asSharedFlow()
+
+    private val _userNotices = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 16,
+    )
+    val userNotices: SharedFlow<String> = _userNotices.asSharedFlow()
+
     fun emitLog(message: String) {
         _logs.tryEmit(ServiceLog(System.currentTimeMillis(), message))
     }
@@ -65,6 +77,14 @@ object EventBus {
 
     fun emitChatReset(messages: List<ChatMessage>) {
         _chatResets.tryEmit(messages)
+    }
+
+    fun emitConversationUpdate() {
+        _conversationUpdates.tryEmit(System.currentTimeMillis())
+    }
+
+    fun emitUserNotice(message: String) {
+        _userNotices.tryEmit(message)
     }
 }
 

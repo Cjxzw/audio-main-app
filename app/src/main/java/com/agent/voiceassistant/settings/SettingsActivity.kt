@@ -1,17 +1,26 @@
 package com.agent.voiceassistant.settings
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.text.InputType
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.Fragment
 import androidx.preference.ListPreference
+import androidx.preference.EditTextPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceCategory
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.SeekBarPreference
+import androidx.preference.SwitchPreferenceCompat
 import com.agent.voiceassistant.R
+import com.agent.voiceassistant.BuildConfig
 import com.agent.voiceassistant.databinding.ActivitySettingsBinding
 import com.agent.voiceassistant.workspace.WorkspaceActivity
+import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 
 class SettingsActivity : AppCompatActivity() {
     private lateinit var binding: ActivitySettingsBinding
@@ -51,7 +60,16 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
         preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
             addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_models)
+                title = getString(R.string.settings_mimo)
+                summary = AppCapabilityResolver(requireContext()).capabilities().summary
+                setIcon(R.drawable.ic_model_24)
+                setOnPreferenceClickListener {
+                    (activity as SettingsActivity).open(MimoSettingsFragment(), getString(R.string.settings_mimo))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_custom_llm)
                 summary = getString(R.string.settings_models_summary)
                 setIcon(R.drawable.ic_model_24)
                 setOnPreferenceClickListener {
@@ -71,6 +89,7 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
             addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_context_assets)
                 summary = getString(R.string.settings_context_assets_summary)
+                setIcon(R.drawable.ic_tools_crossed_24)
                 setOnPreferenceClickListener {
                     startActivity(Intent(requireContext(), ContextAssetsActivity::class.java))
                     true
@@ -79,11 +98,152 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
             addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_workspace)
                 summary = getString(R.string.settings_workspace_summary)
+                setIcon(R.drawable.ic_folder_24)
                 setOnPreferenceClickListener {
                     startActivity(Intent(requireContext(), WorkspaceActivity::class.java))
                     true
                 }
             })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_about)
+                summary = getString(R.string.settings_about_summary, BuildConfig.VERSION_NAME)
+                setIcon(R.drawable.ic_info_24)
+                setOnPreferenceClickListener {
+                    (activity as SettingsActivity).open(AboutSettingsFragment(), getString(R.string.settings_about))
+                    true
+                }
+            })
+        }
+    }
+}
+
+class AboutSettingsFragment : PreferenceFragmentCompat() {
+    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_about_app_name)
+                summary = getString(R.string.settings_about_app_value)
+                isSelectable = false
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_about_version)
+                summary = getString(
+                    R.string.settings_about_version_value,
+                    BuildConfig.VERSION_NAME,
+                    BuildConfig.VERSION_CODE,
+                )
+                isSelectable = false
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_about_github)
+                summary = getString(R.string.settings_about_github_url)
+                setIcon(R.drawable.ic_github_24)
+                setOnPreferenceClickListener {
+                    startActivity(
+                        Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse(getString(R.string.settings_about_github_url)),
+                        ),
+                    )
+                    true
+                }
+            })
+        }
+    }
+}
+
+class MimoSettingsFragment : PreferenceFragmentCompat() {
+    private lateinit var repository: MimoApiRepository
+    private lateinit var keyPreference: EditTextPreference
+    private lateinit var statusPreference: Preference
+
+    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        repository = MimoApiRepository(requireContext())
+        rebuild()
+    }
+
+    private fun rebuild() {
+        preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            keyPreference = EditTextPreference(requireContext()).apply {
+                key = "mimo_api_key_input"
+                isPersistent = false
+                title = getString(R.string.settings_mimo_key)
+                dialogTitle = getString(R.string.settings_mimo_key)
+                setOnBindEditTextListener { field ->
+                    field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    field.setSingleLine(true)
+                }
+                setOnPreferenceChangeListener { _, newValue ->
+                    val saved = runCatching { repository.saveKey(newValue.toString()) }
+                        .onFailure { Toast.makeText(requireContext(), it.message, Toast.LENGTH_SHORT).show() }
+                        .isSuccess
+                    if (saved) refreshStatus()
+                    false
+                }
+            }
+            addPreference(keyPreference)
+
+            statusPreference = Preference(requireContext()).apply {
+                title = getString(R.string.settings_service_status)
+                isSelectable = false
+            }
+            addPreference(statusPreference)
+
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_mimo_test)
+                summary = getString(R.string.settings_mimo_test_summary)
+                setOnPreferenceClickListener {
+                    testConnection()
+                    true
+                }
+            })
+
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_mimo_clear)
+                isEnabled = repository.hasValidKey()
+                setOnPreferenceClickListener {
+                    repository.clearKey()
+                    rebuild()
+                    true
+                }
+            })
+        }
+        refreshStatus()
+    }
+
+    private fun refreshStatus() {
+        if (::statusPreference.isInitialized) {
+            statusPreference.summary = AppCapabilityResolver(requireContext()).capabilities().summary
+        }
+        if (::keyPreference.isInitialized) {
+            val type = repository.keyType()
+            keyPreference.summary = if (type == null) {
+                getString(R.string.settings_mimo_key_missing)
+            } else {
+                getString(R.string.settings_mimo_key_configured, type.label)
+            }
+        }
+    }
+
+    private fun testConnection() {
+        if (!repository.hasValidKey()) {
+            Toast.makeText(requireContext(), R.string.settings_mimo_key_missing, Toast.LENGTH_SHORT).show()
+            return
+        }
+        statusPreference.summary = getString(R.string.settings_testing)
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = runCatching {
+                val client = OpenAiCompatibleLlmClient(repository.runtimeConfig())
+                try {
+                    client.testConnection()
+                } finally {
+                    client.close()
+                }
+            }
+            statusPreference.summary = result.fold(
+                onSuccess = { getString(R.string.settings_mimo_test_ok) },
+                onFailure = { getString(R.string.settings_mimo_test_failed, it.message ?: "未知错误") },
+            )
         }
     }
 }
@@ -157,6 +317,16 @@ class VoiceSettingsFragment : PreferenceFragmentCompat() {
     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
         val preferences = SpeechPreferences(requireContext())
         preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            addPreference(SwitchPreferenceCompat(requireContext()).apply {
+                key = "mute_text_replies"
+                title = getString(R.string.settings_mute_text_replies)
+                summary = getString(R.string.settings_mute_text_replies_summary)
+                isChecked = preferences.muteTextReplies
+                setOnPreferenceChangeListener { _, newValue ->
+                    preferences.muteTextReplies = newValue as Boolean
+                    true
+                }
+            })
             addPreference(SeekBarPreference(requireContext()).apply {
                 key = "tts_gain"
                 title = getString(R.string.settings_tts_gain)

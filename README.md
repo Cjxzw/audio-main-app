@@ -1,6 +1,6 @@
-# Audio Main App
+# Hanwo（喊我）
 
-Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成可通过手机、蓝牙耳机或智能音频眼镜随时唤醒的随身秘书。
+喊我 Hanwo 是一个以小米 MiMo 生态为核心的 Android 语音 Agent，可通过手机、蓝牙耳机或智能音频眼镜进行自然对话。
 
 当前版本已跑通语音闭环、持久会话、本地工具和原生函数调用。复杂执行任务和主动汇报将在接入 Hub 后继续完善。
 
@@ -9,12 +9,13 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 使用 Android `ForegroundService` 保持后台运行。
 - 使用 `AudioRouteManager` 优先选择可用的外部通信设备，并为 `AudioRecord`、`AudioTrack` 设置首选设备；无外设时回退手机音频。
 - 使用 MiMo 云端 ASR 将录音 WAV 转文字。
-- 聊天模型与 MiMo 语音链路已解耦：设置中心可切换 MiMo 或通用 OpenAI Chat Completions 供应商，ASR/TTS 保持使用内置 MiMo 配置。
+- 聊天模型与 MiMo 语音链路已解耦：只配置 MiMo Key 即可使用全部能力，也可让聊天请求改走专属 OpenAI 兼容供应商。
 - 自定义供应商支持多配置、连接测试和按回合热切换；API Key 使用 Android Keystore 加密，不写入普通配置或模型上下文。
 - 使用 MiMo 云端流式 TTS 按句播放回复。
-- 支持终止型 `voice_reply` 个性化播报：预设音色可流式整段播报和唱歌，VoiceDesign 可按自然语言临时设计音色；该回复以淡紫色气泡显示，不产生普通工具卡或二次总结。
+- 支持终止型 `voice_reply` 个性化播报：预设音色可流式整段播报和唱歌，VoiceDesign 可按自然语言临时设计音色。
 - 支持终止型 `agent_sleep` 语义休眠：用户明确表示结束交互时直接复用完整休眠流程，不再等待静默超时。
-- 设置中心采用“总设置 -> 模型与供应商/语音与播报 -> 具体编辑页”的多级结构，当前可配置聊天模型与 50%–150% TTS 增益。
+- MiMo Key 使用 Android Keystore 加密保存；`sk` Key 自动选择按量付费地址，`tp` Key 自动选择 Token Plan 地址。
+- 没有 MiMo Key但配置了专属 LLM 时，可使用纯文本交流；设置中可关闭文字输入回合的语音播报。
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
 - 工具阶段与最终回复使用独立预算；达到上限或连续失败后仍会保留一次无工具总结。
@@ -22,7 +23,8 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - 支持记忆、定位、天气、网络搜索、文件读写、Shell 和通用 HTTP 工具。
 - APK 自动携带不含密钥的源码快照，Agent 可读取源码与轮转日志进行交叉诊断。
 - 支持 Agent Skills 渐进加载：上下文只注入 Skill 名称、描述和路径，匹配任务后再读取全文。
-- 会话与本地记忆持久化，支持 `/new` 开启新话题。
+- 会话与本地记忆持久化；支持历史会话切换、重命名、删除和继续聊天。
+- 新建会话前自动提炼稳定偏好、反复话题和用户明确要求记录的信息，并在新会话中加载长期记忆。
 - 每个用户回合默认关闭深度思考；模型或用户可为当前回合升级一次，下一回合自动恢复关闭。
 - 使用标准 Media3 `MediaLibraryService` 注册为媒体应用，支持手机控制面板、手表、耳机和音频眼镜的播放/暂停控制。
 - 冷启动即发布持久 MediaStyle 卡片；卡片与前台服务共用同一个通知，提供唤醒/休眠按钮且不产生重复通知。
@@ -38,21 +40,18 @@ Audio Main App 是一个 Android 端语音 Agent 应用原型，目标是做成�
 - Android SDK 34
 - Android Studio 或 Gradle 命令行
 - Android 8.0 及以上设备
-- 可用的 MiMo/OpenAI 兼容 API Key
+- MiMo API Key，或可选的 OpenAI Chat Completions 兼容 LLM Key
 
 ## 配置
 
-在项目根目录创建 `.env`，或在 `local.properties` 中写入同名配置：
+首次打开 App 后进入“设置 -> 小米 MiMo 服务”，填写自己的 MiMo API Key：
 
-```properties
-LLM_API_KEY=你的 API Key
-LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
-LLM_MODEL=mimo-v2.5
-```
+- `sk...`：按量付费，自动使用 `https://api.xiaomimimo.com/v1`。
+- `tp...`：Token Plan 套餐，自动使用 `https://token-plan-cn.xiaomimimo.com/v1`。
 
-调试构建附带 Gitea Skill，但不会把 Gitea 凭据编译进 APK。Skill 只有在后续设置界面或 Hub 为 Android Keystore 配置 `gitea` profile 后才会执行认证请求；Release 构建默认不打包该 Skill。
+ASR 和 TTS 当前只支持 MiMo。需要让聊天模型走其他服务时，可在“设置 -> 专属 LLM”中填写 Base URL、API Key 和模型 ID。
 
-仓库中提供 `.env.example` 作为模板。不要提交 `.env` 或 `local.properties`。
+发行包不会编译任何 API Key。不要把真实密钥提交到仓库。
 
 ## 编译
 
@@ -63,7 +62,7 @@ LLM_MODEL=mimo-v2.5
 生成的调试 APK：
 
 ```text
-app/build/outputs/apk/debug/app-debug-ort1171.apk
+app/build/outputs/apk/debug/hanwo-debug-0.1.0.apk
 ```
 
 ## 安装
@@ -77,16 +76,16 @@ adb devices
 安装：
 
 ```powershell
-adb install -r app\build\outputs\apk\debug\app-debug-ort1171.apk
+adb install -r app\build\outputs\apk\debug\hanwo-debug-0.1.0.apk
 ```
 
 ## 使用
 
 1. 打开 App。
-2. 授权麦克风权限。
-3. 点击启动/唤醒 Agent，或使用媒体卡片及外部设备的播放/暂停按键唤醒。
-4. 说话后等待识别、回复和播报。
-5. 点击休眠或使用媒体播放/暂停控制让 Agent 进入休眠。
+2. 在设置中配置 MiMo Key或专属 LLM。
+3. 点击电话按钮并授权麦克风权限，或直接在输入框发送文字。
+4. 通过左上角按钮打开历史会话，切换或管理已有聊天。
+5. 再次点击电话按钮，或使用媒体播放/暂停控制让 Agent 进入休眠。
 
 休眠状态会停止收音，但服务仍保留在后台，后续用于接收后端任务结果和主动汇报。
 
@@ -111,7 +110,7 @@ app/src/main/java/com/agent/voiceassistant/
 ## 当前限制
 
 - Hub 工具尚未接入新工具注册表，当前 `CONNECTED` Profile 只预留结构。
-- 自定义聊天供应商只影响 LLM；当前 ASR、标准 TTS 和个性化 TTS 仍依赖 APK 内置的 MiMo Key。
+- 自定义聊天供应商只影响 LLM；当前 ASR、标准 TTS 和个性化 TTS 仍依赖用户配置的 MiMo Key。
 - 主动汇报相关早期模型尚未接入当前 AgentLoop。
 - 语音打断和完整用户状态机尚未实现。
 - App 已移除自管理 Telecom/PhoneAccount/ConnectionService，媒体键和通知由标准 Media3 会话统一管理；蓝牙麦克风由 `AudioManager` 通信路由直接建立。
@@ -146,6 +145,6 @@ app/src/main/java/com/agent/voiceassistant/
 
 ## 下一步
 
-- 按枢卫协议实现 Hub 工具 Profile 和任务派发。
+- 按 Hub 协议实现工具 Profile 和任务派发。
 - 接入后台任务结果同步与主动汇报。
 - 完善耳机/音频眼镜使用场景下的唤醒、休眠、打断和状态机。

@@ -4,6 +4,15 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M54,30 m-18,0 a18,18 0 1,0 36,0 a18,18 0 1,0 -36,0 M54,48 m-12,0 a12,12 0 1,0 24,0 a12,12 0 1,0 -24,0 M30,72 L78,72 L78,84 L30,84 Z" />
+        android:fillColor="@color/brand_accent"
+        android:pathData="M35,24H73Q80,24 80,31V66Q80,74 72,74H59L46,84L48,74H35Q28,74 28,67V31Q28,24 35,24Z" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@android:color/white"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M39,52V46M46.5,58V40M54,63V35M61.5,58V40M69,52V46" />
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M54,47m-3,0a3,3 0,1 0,6 0a3,3 0,1 0,-6 0" />
 </vector>

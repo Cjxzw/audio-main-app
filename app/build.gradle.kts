@@ -1,36 +1,8 @@
-import java.io.FileInputStream
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
-
-// 从 local.properties 读取（SDK 路径等）
-val localProps = Properties().apply {
-    val f = rootProject.file("local.properties")
-    if (f.exists()) load(FileInputStream(f))
-}
-
-// 从 .env 读取 LLM 配置（优先级高于 local.properties）
-val envProps = Properties().apply {
-    val f = rootProject.file(".env")
-    if (f.exists()) {
-        f.readLines().forEach { line ->
-            val trimmed = line.trim()
-            if (trimmed.isEmpty() || trimmed.startsWith("#")) return@forEach
-            val idx = trimmed.indexOf('=')
-            if (idx > 0) {
-                setProperty(trimmed.substring(0, idx).trim(), trimmed.substring(idx + 1).trim())
-            }
-        }
-    }
-}
-
-// LLM 配置：.env 优先，local.properties 回退，最后用默认值
-fun llmProp(key: String, default: String): String =
-    envProps.getProperty(key) ?: localProps.getProperty(key) ?: default
 
 val gitCommit = providers.exec {
     workingDir(rootProject.projectDir)
@@ -84,13 +56,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // LLM 配置注入 BuildConfig（从 .env 读取，回退到 local.properties，最后用默认值）
-        buildConfigField("String", "STEPFUN_API_KEY", "\"${llmProp("LLM_API_KEY", "")}\"")
-        buildConfigField("String", "STEPFUN_BASE_URL", "\"${llmProp("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")}\"")
-        buildConfigField("String", "STEPFUN_MODEL", "\"${llmProp("LLM_MODEL", "mimo-v2.5")}\"")
-        buildConfigField("String", "OPENAI_API_KEY", "\"${llmProp("LLM_API_KEY", "")}\"")
-        buildConfigField("String", "OPENAI_BASE_URL", "\"${llmProp("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")}\"")
-        buildConfigField("String", "OPENAI_MODEL", "\"${llmProp("LLM_MODEL", "mimo-v2.5")}\"")
         buildConfigField("String", "GIT_COMMIT", "\"$gitCommit\"")
 
         ndk {
@@ -159,17 +124,44 @@ android {
         }
     }
 
-    // 自定义 APK 输出文件名（绕过默认 app-debug.apk 的文件锁）
+    // 使用稳定、可区分构建类型的发行文件名。
     applicationVariants.all {
         outputs.forEach { output ->
             val out = output as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            out.outputFileName = "app-debug-ort1171.apk"
+            out.outputFileName = "hanwo-${name}-${versionName}.apk"
         }
     }
 }
 
 tasks.named("preBuild").configure {
     dependsOn(generateAgentAssets)
+}
+
+// Gradle's Windows test worker can fail to load class directories when the project path
+// contains non-ASCII characters. A small test-classes jar keeps the unit-test classpath portable.
+val debugUnitTestClassesJar by tasks.registering(Jar::class) {
+    dependsOn("compileDebugUnitTestKotlin")
+    dependsOn("bundleDebugClassesToRuntimeJar")
+    from(layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"))
+    from({
+        zipTree(
+            layout.buildDirectory
+                .file("intermediates/runtime_app_classes_jar/debug/bundleDebugClassesToRuntimeJar/classes.jar")
+                .get().asFile,
+        )
+    })
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    destinationDirectory.set(File(gradle.gradleUserHomeDir, "voiceassistant-test-classes"))
+    archiveFileName.set("debug-unit-test-classes.jar")
+}
+
+tasks.withType<Test>().configureEach {
+    if (name == "testDebugUnitTest") {
+        dependsOn(debugUnitTestClassesJar)
+        doFirst {
+            classpath = files(debugUnitTestClassesJar.get().archiveFile.get().asFile) + classpath
+        }
+    }
 }
 
 dependencies {
@@ -185,6 +177,7 @@ dependencies {
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("androidx.drawerlayout:drawerlayout:1.2.0")
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("io.noties.markwon:core:4.6.2")

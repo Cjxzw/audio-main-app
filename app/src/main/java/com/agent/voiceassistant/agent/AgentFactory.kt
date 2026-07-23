@@ -21,7 +21,7 @@ import java.time.Duration
  * - 避开 langchain4j-agentic 等实验性模块（反射密集，可能崩溃）
  */
 class AgentFactory(
-    private val config: LLMConfig = LLMConfig.auto(),
+    private val config: LLMConfig = LLMConfig.unconfigured(),
     private val taskDispatcher: TaskDispatcher
 ) {
 

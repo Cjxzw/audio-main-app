@@ -9,7 +9,9 @@ class LLMConfigTest {
     fun systemPromptContainsOnlyStableInstructions() {
         val prompt = buildMainSystemPrompt()
 
-        assertTrue(prompt.contains("你是一个中文语音助手"))
+        assertTrue(prompt.contains("喊我（Hanwo）"))
+        assertTrue(prompt.contains("独立运行在 Android 手机上"))
+        assertTrue(prompt.contains("绝不能要求用户必须连接外部设备"))
         assertFalse(prompt.contains("本回合思考策略"))
         assertFalse(prompt.contains("当前时间"))
         assertFalse(prompt.contains("当前是快速模式"))

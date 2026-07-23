@@ -25,6 +25,7 @@ class LlmProviderRepository(context: Context) {
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val secrets = EncryptedSecretStore(appContext)
+    private val mimo = MimoApiRepository(appContext)
     private val json = Json { ignoreUnknownKeys = true }
 
     fun profiles(): List<LlmProviderProfile> = listOf(builtInProfile()) + customProfiles()
@@ -79,12 +80,12 @@ class LlmProviderRepository(context: Context) {
     }
 
     fun hasApiKey(id: String): Boolean = when (id) {
-        BUILT_IN_ID -> LLMConfig.stepFun().apiKey.isNotBlank()
+        BUILT_IN_ID -> mimo.hasValidKey()
         else -> !secrets.get(secretName(id)).isNullOrBlank()
     }
 
     fun runtimeConfig(profile: LlmProviderProfile = activeProfile(), overrideApiKey: String? = null): LLMConfig {
-        if (profile.builtIn) return LLMConfig.stepFun()
+        if (profile.builtIn) return mimo.runtimeConfig(profile.modelId)
         val apiKey = overrideApiKey?.trim()?.takeIf { it.isNotBlank() }
             ?: secrets.get(secretName(profile.id)).orEmpty()
         require(apiKey.isNotBlank()) { "供应商未配置 API Key" }
@@ -111,12 +112,11 @@ class LlmProviderRepository(context: Context) {
     }
 
     private fun builtInProfile(): LlmProviderProfile {
-        val config = LLMConfig.stepFun()
         return LlmProviderProfile(
             id = BUILT_IN_ID,
-            displayName = "小米 MiMo（内置）",
-            baseUrl = config.baseUrl,
-            modelId = config.modelName,
+            displayName = "小米 MiMo",
+            baseUrl = mimo.keyType()?.baseUrl ?: MimoKeyType.PAY_AS_YOU_GO.baseUrl,
+            modelId = MimoApiRepository.DEFAULT_MODEL,
             mode = LlmProviderMode.MIMO,
             builtIn = true,
             supportsImages = true,

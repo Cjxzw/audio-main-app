@@ -18,6 +18,7 @@ import com.google.common.util.concurrent.ListenableFuture
 @OptIn(markerClass = [UnstableApi::class])
 class AssistantMediaPlayer(
     looper: Looper,
+    private val appName: String,
     private val callbacks: Callbacks,
 ) : SimpleBasePlayer(looper) {
 
@@ -27,9 +28,9 @@ class AssistantMediaPlayer(
         fun onStopRequested()
     }
 
-    private val mediaId = "shordway-main-session"
+    private val mediaId = "hanwo-session"
     private var active = false
-    private var title = "枢卫 Main"
+    private var title = appName
     private var status = "休眠中"
     private var volume = 1f
 
@@ -46,7 +47,7 @@ class AssistantMediaPlayer(
     }
 
     fun setNowPlaying(title: String, status: String) {
-        this.title = title.ifBlank { "枢卫 Main" }
+        this.title = title.ifBlank { appName }
         this.status = status
         invalidateState()
     }
@@ -107,9 +108,9 @@ class AssistantMediaPlayer(
     private fun metadata(): MediaMetadata = MediaMetadata.Builder()
         .setTitle(title)
         .setDisplayTitle(title)
-        .setArtist("枢卫语音助手")
-        .setAlbumTitle("Main 语音会话")
-        .setAlbumArtist("Shordway")
+        .setArtist(appName)
+        .setAlbumTitle(appName)
+        .setAlbumArtist(appName)
         .setSubtitle(status)
         .setDescription("个人语音助手：$status")
         .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)

@@ -4,6 +4,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.os.Build
+import com.agent.voiceassistant.R
 
 object AssistantNotificationContract {
     const val CHANNEL_ID = "assistant_media_session"
@@ -14,10 +15,13 @@ object AssistantNotificationContract {
 
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "枢卫 Main",
+            context.getString(R.string.app_name),
             NotificationManager.IMPORTANCE_DEFAULT,
         ).apply {
-            description = "枢卫 Main 运行状态与媒体控制"
+            description = context.getString(
+                R.string.media_notification_description,
+                context.getString(R.string.app_name),
+            )
             setSound(null, null)
             enableVibration(false)
         }

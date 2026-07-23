@@ -1,12 +1,16 @@
 package com.agent.voiceassistant.workspace
 
 import android.content.Context
+import android.content.ContentUris
 import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.util.Locale
 
 class WorkspaceRepository(context: Context) {
@@ -51,7 +55,7 @@ class WorkspaceRepository(context: Context) {
         val target = uniqueFile(sanitizeName(metadata.name ?: "imported-file"))
         var copied = 0L
         try {
-            appContext.contentResolver.openInputStream(uri)?.use { input ->
+            openImportStream(uri)?.use { input ->
                 target.outputStream().use { output ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                     while (true) {
@@ -158,6 +162,38 @@ class WorkspaceRepository(context: Context) {
         }
         if (name == null) name = uri.lastPathSegment?.substringAfterLast('/')
         return Metadata(name, size, appContext.contentResolver.getType(uri))
+    }
+
+    /**
+     * Some older sharing apps still expose a raw file:// URI. On modern Android,
+     * resolving its indexed MediaStore row gives us a permission-aware content URI.
+     */
+    private fun openImportStream(uri: Uri): InputStream? {
+        if (uri.scheme != "file") return appContext.contentResolver.openInputStream(uri)
+        val path = uri.path ?: return null
+        val direct = runCatching { File(path).inputStream() }.getOrNull()
+        if (direct != null) return direct
+        val contentUri = findMediaStoreUri(path) ?: return null
+        return appContext.contentResolver.openInputStream(contentUri)
+    }
+
+    private fun findMediaStoreUri(path: String): Uri? {
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Files.getContentUri("external")
+        }
+        val projection = arrayOf(MediaStore.Files.FileColumns._ID)
+        val selection = "${MediaStore.Files.FileColumns.DATA} = ?"
+        return runCatching {
+            appContext.contentResolver.query(collection, projection, selection, arrayOf(path), null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    ContentUris.withAppendedId(collection, cursor.getLong(0))
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
     }
 
     private fun mimeFor(file: File): String? = when (file.extension.lowercase(Locale.ROOT)) {

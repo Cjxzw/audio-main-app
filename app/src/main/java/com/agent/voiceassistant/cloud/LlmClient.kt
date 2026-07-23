@@ -10,9 +10,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -66,14 +69,42 @@ class OpenAiCompatibleLlmClient(
     }
 
     override suspend fun testConnection(): String {
-        val request = CloudSpeechClient.ChatRequest(
-            messages = listOf(CloudSpeechClient.LlmMessage("user", "只回复 OK")),
-            tools = emptyList(),
-            thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
-            maxCompletionTokens = 16,
-        )
-        return streamChat(request) {}.message.content.orEmpty().trim()
-            .ifBlank { throw IOException("模型返回为空") }
+        return withContext(Dispatchers.IO) {
+            val call = newModelsCall().also {
+                it.timeout().timeout(config.timeoutSeconds, TimeUnit.SECONDS)
+            }
+            val cancellation = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+            try {
+                call.execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        throw IOException("LLM models HTTP ${response.code}: ${body.take(500)}")
+                    }
+                    summarizeModelsResponse(body)
+                }
+            } finally {
+                cancellation?.dispose()
+            }
+        }
+    }
+
+    internal fun summarizeModelsResponse(body: String): String {
+        val root = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(body) }
+            .getOrElse { throw IOException("模型列表响应不是有效 JSON", it) }
+        val models = when (root) {
+            is JsonArray -> root
+            is JsonObject -> root["data"] as? JsonArray
+            else -> null
+        } ?: throw IOException("模型列表响应缺少 data 数组")
+        val modelIds = models.mapNotNull { model ->
+            ((model as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull
+        }
+        if (modelIds.isEmpty()) return "模型列表可用，当前没有可用模型"
+        return if (config.modelName in modelIds) {
+            "模型列表可用，已找到 ${config.modelName}"
+        } else {
+            "模型列表可用，共 ${modelIds.size} 个模型"
+        }
     }
 
     override fun close() {
@@ -200,6 +231,17 @@ class OpenAiCompatibleLlmClient(
             .addHeader("api-key", config.apiKey)
             .addHeader("Authorization", "Bearer ${config.apiKey}")
             .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        return client.newCall(request)
+    }
+
+    private fun newModelsCall(): okhttp3.Call {
+        val request = Request.Builder()
+            .url("${config.baseUrl.trimEnd('/')}/models")
+            .addHeader("Accept", "application/json")
+            .addHeader("api-key", config.apiKey)
+            .addHeader("Authorization", "Bearer ${config.apiKey}")
+            .get()
             .build()
         return client.newCall(request)
     }

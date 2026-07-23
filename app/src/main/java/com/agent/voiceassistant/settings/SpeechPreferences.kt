@@ -14,6 +14,12 @@ class SpeechPreferences(context: Context) {
     val ttsGain: Float
         get() = ttsGainPercent / 100f
 
+    var muteTextReplies: Boolean
+        get() = preferences.getBoolean(KEY_MUTE_TEXT_REPLIES, false)
+        set(value) {
+            preferences.edit().putBoolean(KEY_MUTE_TEXT_REPLIES, value).apply()
+        }
+
     private fun normalize(value: Int): Int {
         val bounded = value.coerceIn(MIN_TTS_GAIN, MAX_TTS_GAIN)
         return ((bounded - MIN_TTS_GAIN) / STEP * STEP) + MIN_TTS_GAIN
@@ -26,5 +32,6 @@ class SpeechPreferences(context: Context) {
         const val STEP = 5
         private const val PREFERENCES = "speech_settings"
         private const val KEY_TTS_GAIN = "tts_gain_percent"
+        private const val KEY_MUTE_TEXT_REPLIES = "mute_text_replies"
     }
 }

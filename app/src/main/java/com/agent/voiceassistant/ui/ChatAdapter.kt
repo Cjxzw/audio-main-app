@@ -17,7 +17,7 @@ import kotlin.math.roundToInt
 class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
 
     private val messages = mutableListOf<ChatMessage>()
-    private val maxMessages = 100
+    private val maxMessages = 500
 
     fun setMessages(items: List<ChatMessage>) {
         messages.clear()
@@ -82,8 +82,11 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             tvText.textSize = 15f
             tvText.maxLines = Int.MAX_VALUE
             tvText.ellipsize = null
-            tvText.setPadding(12, 12, 12, 12)
-            tvText.maxWidth = (280 * itemView.resources.displayMetrics.density).roundToInt()
+            val density = itemView.resources.displayMetrics.density
+            val horizontal = (12 * density).roundToInt()
+            val vertical = (10 * density).roundToInt()
+            tvText.setPadding(horizontal, vertical, horizontal, vertical)
+            tvText.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             when (msg.role) {
                 USER -> {
                     llBubble.gravity = android.view.Gravity.END

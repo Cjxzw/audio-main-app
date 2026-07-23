@@ -23,7 +23,6 @@ import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.R
-import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
@@ -50,11 +49,13 @@ import com.agent.voiceassistant.cloud.VoiceReplyDirectiveParser
 import com.agent.voiceassistant.cloud.VoiceReplyMode
 import com.agent.voiceassistant.cloud.VoiceReplyOptions
 import com.agent.voiceassistant.data.ConversationStore
+import com.agent.voiceassistant.data.ConversationMemoryCompactor
 import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.media.AssistantNotificationContract
 import com.agent.voiceassistant.settings.LlmProviderRepository
 import com.agent.voiceassistant.settings.SpeechPreferences
+import com.agent.voiceassistant.settings.AppCapabilityResolver
 import com.agent.voiceassistant.tools.LocalToolExecutor
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CodeGraphIndex
@@ -163,8 +164,15 @@ class VoiceAgentService : Service() {
         const val ACTION_WAKE = "com.agent.voiceassistant.WAKE"
         const val ACTION_SLEEP = "com.agent.voiceassistant.SLEEP"
         const val ACTION_TEXT_INPUT = "com.agent.voiceassistant.TEXT_INPUT"
+        const val ACTION_NEW_CONVERSATION = "com.agent.voiceassistant.NEW_CONVERSATION"
+        const val ACTION_SWITCH_CONVERSATION = "com.agent.voiceassistant.SWITCH_CONVERSATION"
+        const val ACTION_RENAME_CONVERSATION = "com.agent.voiceassistant.RENAME_CONVERSATION"
+        const val ACTION_DELETE_CONVERSATION = "com.agent.voiceassistant.DELETE_CONVERSATION"
+        const val ACTION_COMPACT_CONVERSATION = "com.agent.voiceassistant.COMPACT_CONVERSATION"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_ATTACHMENTS = "attachments"
+        private const val EXTRA_CONVERSATION_ID = "conversation_id"
+        private const val EXTRA_CONVERSATION_TITLE = "conversation_title"
 
         fun start(ctx: Context) {
             DiagLog.i("api.start", "ctx=${ctx.javaClass.simpleName}")
@@ -232,6 +240,28 @@ class VoiceAgentService : Service() {
                 ctx.startService(intent)
             }
         }
+
+        fun newConversation(ctx: Context) = sendServiceAction(ctx, ACTION_NEW_CONVERSATION)
+
+        fun switchConversation(ctx: Context, id: String) =
+            sendServiceAction(ctx, ACTION_SWITCH_CONVERSATION) { putExtra(EXTRA_CONVERSATION_ID, id) }
+
+        fun renameConversation(ctx: Context, id: String, title: String) =
+            sendServiceAction(ctx, ACTION_RENAME_CONVERSATION) {
+                putExtra(EXTRA_CONVERSATION_ID, id)
+                putExtra(EXTRA_CONVERSATION_TITLE, title)
+            }
+
+        fun deleteConversation(ctx: Context, id: String) =
+            sendServiceAction(ctx, ACTION_DELETE_CONVERSATION) { putExtra(EXTRA_CONVERSATION_ID, id) }
+
+        fun compactConversation(ctx: Context, id: String) =
+            sendServiceAction(ctx, ACTION_COMPACT_CONVERSATION) { putExtra(EXTRA_CONVERSATION_ID, id) }
+
+        private fun sendServiceAction(ctx: Context, action: String, configure: Intent.() -> Unit = {}) {
+            val intent = Intent(ctx, VoiceAgentService::class.java).setAction(action).apply(configure)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent) else ctx.startService(intent)
+        }
     }
 
     enum class State {
@@ -253,12 +283,14 @@ class VoiceAgentService : Service() {
     private lateinit var store: ConversationStore
     private lateinit var llmProviderRepository: LlmProviderRepository
     private lateinit var speechPreferences: SpeechPreferences
+    private lateinit var capabilityResolver: AppCapabilityResolver
     private lateinit var locationProvider: LocationProvider
     private lateinit var toolRegistry: MainToolRegistry
     private lateinit var executionEnv: AndroidExecutionEnv
     private lateinit var skillRegistry: SkillRegistry
     private lateinit var imageEncoder: MultimodalImageEncoder
     private val agentHarness = MainAgentHarness()
+    private val memoryCompactor = ConversationMemoryCompactor()
     private lateinit var earcons: EarconPlayer
     private var dormant = true
     private val turnMutex = Mutex()
@@ -274,6 +306,7 @@ class VoiceAgentService : Service() {
         store = ConversationStore(this)
         llmProviderRepository = LlmProviderRepository(this)
         speechPreferences = SpeechPreferences(this)
+        capabilityResolver = AppCapabilityResolver(this)
         locationProvider = LocationProvider(this, store)
         executionEnv = AndroidExecutionEnv(this)
         skillRegistry = SkillRegistry(
@@ -317,6 +350,55 @@ class VoiceAgentService : Service() {
                     serviceScope.launch { processUserText(text.trim(), source = "text", attachments = attachments) }
                 }
             }
+            ACTION_NEW_CONVERSATION -> {
+                ensureForegroundForCurrentState()
+                serviceScope.launch {
+                    turnMutex.withLock { createNewConversation("历史会话按钮", greet = false) }
+                }
+            }
+            ACTION_SWITCH_CONVERSATION -> {
+                ensureForegroundForCurrentState()
+                val id = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
+                serviceScope.launch { turnMutex.withLock { switchConversation(id) } }
+            }
+            ACTION_RENAME_CONVERSATION -> {
+                ensureForegroundForCurrentState()
+                val id = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
+                val title = intent.getStringExtra(EXTRA_CONVERSATION_TITLE).orEmpty()
+                serviceScope.launch {
+                    turnMutex.withLock {
+                        runCatching { store.renameConversation(id, title) }
+                            .onSuccess { EventBus.emitConversationUpdate() }
+                            .onFailure {
+                                val message = it.message ?: "会话重命名失败"
+                                emitLog(message)
+                                EventBus.emitUserNotice(message)
+                            }
+                    }
+                }
+            }
+            ACTION_DELETE_CONVERSATION -> {
+                ensureForegroundForCurrentState()
+                val id = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
+                serviceScope.launch {
+                    turnMutex.withLock {
+                        if (store.deleteConversation(id)) {
+                            EventBus.emitChatReset(store.recentChatMessages())
+                            EventBus.emitConversationUpdate()
+                        }
+                    }
+                }
+            }
+            ACTION_COMPACT_CONVERSATION -> {
+                ensureForegroundForCurrentState()
+                val id = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
+                serviceScope.launch {
+                    turnMutex.withLock {
+                        compactConversationIntoMemory(id, userVisible = true)
+                        EventBus.emitConversationUpdate()
+                    }
+                }
+            }
             ACTION_STOP -> {
                 hardStopAgent(keepForeground = false)
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -356,10 +438,15 @@ class VoiceAgentService : Service() {
             return
         }
 
-        val config = LLMConfig.auto()
-        if (config.apiKey.isBlank()) {
-            DiagLog.w("agent.wake.fail", "missing_api_key", showInUi = true)
-            fail("未配置 LLM_API_KEY")
+        val capabilities = capabilityResolver.capabilities()
+        if (!capabilities.speechAvailable) {
+            DiagLog.w("agent.wake.fail", "missing_mimo_key", showInUi = true)
+            fail("请先在设置中配置 MiMo API Key，语音输入输出才能使用")
+            return
+        }
+        if (!capabilities.llmAvailable) {
+            DiagLog.w("agent.wake.fail", "missing_llm", showInUi = true)
+            fail("请先配置 MiMo Key 或专属 LLM")
             return
         }
 
@@ -369,7 +456,7 @@ class VoiceAgentService : Service() {
         routeManager = routes
         val routeSummary = routes.configureForVoiceSession()
         if (speechClient == null) {
-            speechClient = CloudSpeechClient(config)
+            speechClient = CloudSpeechClient(capabilityResolver.speechConfig())
         }
         recorder = SimpleVadRecorder(routes)
         _state.value = State.LISTENING
@@ -512,11 +599,17 @@ class VoiceAgentService : Service() {
         attachments: List<String> = emptyList(),
     ) {
         turnMutex.withLock {
+            val speakReplies = source != "text" || !speechPreferences.muteTextReplies
             try {
                 if (handleLocalConversationCommand(userText)) return
-                val client = ensureSpeechClient() ?: return
-                val llmClient = createLlmClient()
-
+                val client = ensureSpeechClient()
+                val llmClient = runCatching { createLlmClient() }.getOrElse { error ->
+                    val message = error.message ?: "请先配置可用的 LLM"
+                    store.addMessage("system", message)
+                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+                    emitLog(message)
+                    return
+                }
                 val displayText = buildString {
                     append(userText)
                     if (attachments.isNotEmpty()) {
@@ -537,6 +630,7 @@ class VoiceAgentService : Service() {
                 val outcome = runAgentLoop(
                     llmClient = llmClient,
                     speechClient = client,
+                    speakReplies = speakReplies,
                     messages = buildMessages(
                         userText = userText,
                         currentUserMessageId = currentUserMessage.id,
@@ -569,14 +663,14 @@ class VoiceAgentService : Service() {
                 EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, fallback))
                 emitLog("助手兜底: $fallback")
                 val client = speechClient
-                if (client != null) {
+                if (client != null && speakReplies) {
                     try {
                         speakAssistantText(client, fallback)
                     } catch (speechError: Exception) {
                         Timber.w(speechError, "Failed to speak fallback")
                         earcons.error()
                     }
-                } else {
+                } else if (speakReplies) {
                     earcons.error()
                 }
                 updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
@@ -586,7 +680,8 @@ class VoiceAgentService : Service() {
 
     private suspend fun runAgentLoop(
         llmClient: LlmClient,
-        speechClient: CloudSpeechClient,
+        speechClient: CloudSpeechClient?,
+        speakReplies: Boolean = true,
         messages: List<CloudSpeechClient.LlmMessage>,
         initialThinkingMode: CloudSpeechClient.ThinkingMode,
         maxToolRounds: Int,
@@ -634,6 +729,7 @@ class VoiceAgentService : Service() {
                 ): AgentLoop.ModelTurn = streamModelTurn(
                     llmClient = llmClient,
                     speechClient = speechClient,
+                    speakReplies = speakReplies,
                     request = request,
                     beforeSpeech = {
                         awaitReasoningFeedback()
@@ -668,6 +764,47 @@ class VoiceAgentService : Service() {
                                 succeeded = true,
                             ),
                             finalText = finalText,
+                            playedSpeech = false,
+                        )
+                    }
+                    if (!speakReplies || speechClient == null) {
+                        val directive = runCatching { VoiceReplyDirectiveParser.parse(call.arguments) }
+                            .getOrElse { error ->
+                                return AgentLoop.TerminalExecution(
+                                    result = AgentLoop.ToolExecution(
+                                        message = CloudSpeechClient.LlmMessage(
+                                            role = "tool",
+                                            content = "个性化回复参数无效：${error.message}",
+                                            toolCallId = call.id,
+                                        ),
+                                        succeeded = false,
+                                    ),
+                                    finalText = "",
+                                    playedSpeech = false,
+                                )
+                            }
+                        store.addMessage(
+                            role = "assistant",
+                            content = directive.text,
+                            presentation = ChatPresentation.PERSONALIZED_VOICE,
+                        )
+                        EventBus.emitChatMessage(
+                            ChatMessage(
+                                role = ChatRole.BOT,
+                                text = directive.text,
+                                presentation = ChatPresentation.PERSONALIZED_VOICE,
+                            ),
+                        )
+                        return AgentLoop.TerminalExecution(
+                            result = AgentLoop.ToolExecution(
+                                message = CloudSpeechClient.LlmMessage(
+                                    role = "tool",
+                                    content = "已按当前设置仅显示文字",
+                                    toolCallId = call.id,
+                                ),
+                                succeeded = true,
+                            ),
+                            finalText = directive.text,
                             playedSpeech = false,
                         )
                     }
@@ -774,8 +911,10 @@ class VoiceAgentService : Service() {
                     if (!streamedSpeech) {
                         awaitReasoningFeedback()
                         beforeSpeech()
-                        speakAssistantText(speechClient, optimizeSpokenReply(finalText))
-                        return true
+                        if (speakReplies && speechClient != null) {
+                            speakAssistantText(speechClient, optimizeSpokenReply(finalText))
+                            return true
+                        }
                     }
                     return false
                 }
@@ -990,12 +1129,13 @@ class VoiceAgentService : Service() {
 
     private suspend fun streamModelTurn(
         llmClient: LlmClient,
-        speechClient: CloudSpeechClient,
+        speechClient: CloudSpeechClient?,
+        speakReplies: Boolean,
         request: CloudSpeechClient.ChatRequest,
         beforeSpeech: suspend () -> Unit,
         onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
     ): AgentLoop.ModelTurn = coroutineScope {
-        val allowDirectSpeech = shouldStreamDirectSpeech(request)
+        val allowDirectSpeech = speakReplies && speechClient != null && shouldStreamDirectSpeech(request)
         val extractor = StreamingSpeechExtractor()
         val segmenter = SpeechSegmenter()
         val ttsQueue = Channel<String>(Channel.UNLIMITED)
@@ -1028,6 +1168,7 @@ class VoiceAgentService : Service() {
                 "systemHash=$systemHash toolsHash=$toolsHash tools=${request.tools.size}",
         )
         val playbackJob = launch {
+            if (speechClient == null || !speakReplies) return@launch
             val playbackSession = StreamingTtsPlaybackSession(speechClient)
             try {
                 var speechGateOpened = false
@@ -1188,6 +1329,8 @@ class VoiceAgentService : Service() {
             append(executionEnv.credentialProfileSummary())
             append("\n\n会话上下文资产快照：\n")
             append(store.sessionContextSnapshot(skillRegistry.promptSummary()))
+            append("\n\n跨会话长期记忆：\n")
+            append(store.contextSummary())
         }.trim()
         add(CloudSpeechClient.LlmMessage("system", runtimeContext))
         addAll(hydratedHistory)
@@ -1334,29 +1477,32 @@ class VoiceAgentService : Service() {
 
     private suspend fun handleLocalConversationCommand(text: String): Boolean {
         return when (LocalConversationCommandPolicy.classify(text)) {
-            LocalConversationCommandPolicy.Command.NEW_TOPIC -> startNewConversation(text)
+            LocalConversationCommandPolicy.Command.NEW_TOPIC -> createNewConversation(text, greet = true)
             LocalConversationCommandPolicy.Command.SLEEP -> handleLocalSleepCommand(text)
             null -> false
         }
     }
 
-    private suspend fun startNewConversation(text: String): Boolean {
+    private suspend fun createNewConversation(text: String, greet: Boolean): Boolean {
+        compactConversationIntoMemory(store.currentConversationId, userVisible = false)
         store.startNewConversation(reason = text)
         locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
+        EventBus.emitConversationUpdate()
+        if (!greet) {
+            emitLog("已开启新会话")
+            return true
+        }
         emitLog("已开启新话题，准备主动问候")
 
         val client = ensureSpeechClient()
-        if (client == null) {
-            emitSessionGreetingFallback(null)
-            return true
-        }
 
         updateNotification("正在问候...")
         return try {
             runAgentLoop(
                 llmClient = createLlmClient(),
                 speechClient = client,
+                speakReplies = client != null,
                 messages = buildMessages(
                     userText = SESSION_GREETING_TRIGGER,
                     currentUserMessageId = SESSION_GREETING_MESSAGE_ID,
@@ -1407,16 +1553,51 @@ class VoiceAgentService : Service() {
 
     private fun ensureSpeechClient(): CloudSpeechClient? {
         speechClient?.let { return it }
-        val config = LLMConfig.stepFun()
-        if (config.apiKey.isBlank()) {
-            fail("未配置 LLM_API_KEY")
-            return null
+        if (!capabilityResolver.capabilities().speechAvailable) return null
+        return CloudSpeechClient(capabilityResolver.speechConfig()).also { speechClient = it }
+    }
+
+    private fun switchConversation(id: String) {
+        if (id.isBlank() || !store.switchConversation(id)) return
+        EventBus.emitChatReset(store.recentChatMessages())
+        EventBus.emitConversationUpdate()
+        emitLog("已切换会话")
+    }
+
+    private suspend fun compactConversationIntoMemory(id: String, userVisible: Boolean): Boolean {
+        val source = store.conversationForCompression(id) ?: return false
+        val client = runCatching { createLlmClient() }.getOrElse { error ->
+            Timber.w(error, "Conversation memory compression unavailable")
+            if (userVisible) {
+                val message = "无法提炼记忆：${error.message ?: "未配置 LLM"}"
+                emitLog(message)
+                EventBus.emitUserNotice(message)
+            }
+            return false
         }
-        return CloudSpeechClient(config).also { speechClient = it }
+        return try {
+            if (userVisible) emitLog("正在从会话中提炼长期记忆")
+            val drafts = memoryCompactor.compact(client, source, store.memories())
+            store.mergeConversationMemories(source.id, drafts)
+            val message = if (drafts.isEmpty()) "本会话没有需要长期保存的信息" else "已提炼 ${drafts.size} 条长期记忆"
+            emitLog(message)
+            if (userVisible) EventBus.emitUserNotice(message)
+            true
+        } catch (error: Exception) {
+            Timber.w(error, "Conversation memory compression failed id=$id")
+            if (userVisible) {
+                val message = "提炼记忆失败：${error.message ?: error.javaClass.simpleName}"
+                emitLog(message)
+                EventBus.emitUserNotice(message)
+            }
+            false
+        } finally {
+            client.close()
+        }
     }
 
     private fun createLlmClient(): LlmClient =
-        OpenAiCompatibleLlmClient(llmProviderRepository.runtimeConfig())
+        OpenAiCompatibleLlmClient(capabilityResolver.llmConfig())
 
     private suspend fun playFullTtsSentence(client: CloudSpeechClient, sentence: String) {
         if (sentence.isBlank()) return
@@ -2126,8 +2307,10 @@ class VoiceAgentService : Service() {
     private fun fail(message: String) {
         _state.value = State.FAILED
         emitState(ServiceState.FAILED)
+        store.addMessage("system", message)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
         emitLog(message)
-        updateNotification("启动失败")
+        updateNotification(message)
     }
 
     private suspend fun handleConnectionLost(operation: String, error: NetworkTimeoutException) {
@@ -2222,7 +2405,7 @@ class VoiceAgentService : Service() {
         val actionIcon = if (dormant) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
         val actionText = if (dormant) "唤醒" else "休眠"
         val builder = NotificationCompat.Builder(this, AssistantNotificationContract.CHANNEL_ID)
-            .setContentTitle("枢卫 Main")
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)

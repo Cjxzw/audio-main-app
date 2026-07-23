@@ -6,6 +6,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -50,6 +51,26 @@ class LlmClientTest {
         assertTrue(content.any { it.jsonObject["type"]?.jsonPrimitive?.content == "text" })
         val image = content.first { it.jsonObject["type"]?.jsonPrimitive?.content == "image_url" }.jsonObject
         assertTrue(image.getValue("image_url").jsonObject.getValue("url").jsonPrimitive.content.startsWith("data:image/jpeg;base64,"))
+    }
+
+    @Test
+    fun `models response reports configured model when present`() {
+        val response = """{"object":"list","data":[{"id":"test-model"},{"id":"another-model"}]}"""
+
+        assertEquals(
+            "模型列表可用，已找到 test-model",
+            client(LlmProviderMode.OPENAI_COMPATIBLE).summarizeModelsResponse(response),
+        )
+    }
+
+    @Test
+    fun `models response accepts a root array`() {
+        val response = """[{"id":"one"},{"id":"two"}]"""
+
+        assertEquals(
+            "模型列表可用，共 2 个模型",
+            client(LlmProviderMode.OPENAI_COMPATIBLE).summarizeModelsResponse(response),
+        )
     }
 
     private fun request() = CloudSpeechClient.ChatRequest(

@@ -22,13 +22,12 @@ class VoiceBarView @JvmOverloads constructor(
     private val barCount = 24
     private var level = 0.0f
 
-    private val barWidth = resources.getDimension(R.dimen.voice_bar_bar_width)
     private val barGap = resources.getDimension(R.dimen.voice_bar_bar_gap)
 
     private var lastNonZeroLevel = 0L
 
     init {
-        Timber.d("VoiceBarView init: barWidth=$barWidth, barGap=$barGap, barCount=$barCount")
+        Timber.d("VoiceBarView init: barGap=$barGap, barCount=$barCount")
     }
 
     fun setLevel(newLevel: Float) {
@@ -45,6 +44,9 @@ class VoiceBarView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val activeCount = (level * barCount).roundToInt()
+        val availableWidth = width - barGap * (barCount - 1)
+        val barWidth = (availableWidth / barCount).coerceAtLeast(1f)
+        val cornerRadius = (barWidth / 2f).coerceAtMost(2f * resources.displayMetrics.density)
         for (i in 0 until barCount) {
             val left = i * (barWidth + barGap)
             val right = left + barWidth
@@ -54,9 +56,9 @@ class VoiceBarView @JvmOverloads constructor(
                     i < barCount * 0.8 -> 0xFFFFC107.toInt()
                     else -> 0xFFF44336.toInt()
                 }
-                canvas.drawRoundRect(left, 0f, right, height.toFloat(), 2f, 2f, barPaint)
+                canvas.drawRoundRect(left, 0f, right, height.toFloat(), cornerRadius, cornerRadius, barPaint)
             } else {
-                canvas.drawRoundRect(left, 0f, right, height.toFloat(), 2f, 2f, bgPaint)
+                canvas.drawRoundRect(left, 0f, right, height.toFloat(), cornerRadius, cornerRadius, bgPaint)
             }
         }
     }

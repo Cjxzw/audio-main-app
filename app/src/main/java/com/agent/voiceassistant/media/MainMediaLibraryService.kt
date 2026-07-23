@@ -19,6 +19,7 @@ import androidx.media3.session.SessionResult
 import androidx.media3.session.SessionError
 import androidx.media3.common.util.UnstableApi
 import com.agent.voiceassistant.MainActivity
+import com.agent.voiceassistant.R
 import com.agent.voiceassistant.service.DiagLog
 import com.agent.voiceassistant.service.VoiceAgentService
 import com.google.common.util.concurrent.Futures
@@ -41,7 +42,10 @@ class MainMediaLibraryService : MediaLibraryService() {
         super.onCreate()
         AssistantNotificationContract.ensureChannel(this)
 
-        assistantPlayer = AssistantMediaPlayer(Looper.getMainLooper(), object : AssistantMediaPlayer.Callbacks {
+        assistantPlayer = AssistantMediaPlayer(
+            Looper.getMainLooper(),
+            getString(R.string.app_name),
+            object : AssistantMediaPlayer.Callbacks {
             override fun onPlayRequested() {
                 DiagLog.i("media3.control.play", "source=external_controller", showInUi = true)
                 VoiceAgentService.wake(this@MainMediaLibraryService)
@@ -56,7 +60,8 @@ class MainMediaLibraryService : MediaLibraryService() {
                 DiagLog.i("media3.control.stop", "source=external_controller", showInUi = true)
                 VoiceAgentService.sleep(this@MainMediaLibraryService)
             }
-        })
+            },
+        )
         val sessionActivity = PendingIntent.getActivity(
             this,
             12,
@@ -185,7 +190,7 @@ class MainMediaLibraryService : MediaLibraryService() {
         val actionText = if (active) "休眠" else "唤醒"
 
         return NotificationCompat.Builder(this, AssistantNotificationContract.CHANNEL_ID)
-            .setContentTitle("枢卫 Main")
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(status)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(sessionActivity)
@@ -202,7 +207,7 @@ class MainMediaLibraryService : MediaLibraryService() {
         .setMediaId(ROOT_ID)
         .setMediaMetadata(
             androidx.media3.common.MediaMetadata.Builder()
-                .setTitle("枢卫 Main")
+                .setTitle(getString(R.string.app_name))
                 .setIsBrowsable(true)
                 .setIsPlayable(false)
                 .build(),
@@ -213,9 +218,9 @@ class MainMediaLibraryService : MediaLibraryService() {
         .setMediaId(MEDIA_ID)
         .setMediaMetadata(
             androidx.media3.common.MediaMetadata.Builder()
-                .setTitle("枢卫 Main")
-                .setArtist("枢卫语音助手")
-                .setAlbumTitle("Main 语音会话")
+                .setTitle(getString(R.string.app_name))
+                .setArtist(getString(R.string.app_name))
+                .setAlbumTitle(getString(R.string.app_name))
                 .setIsBrowsable(false)
                 .setIsPlayable(true)
                 .build(),
@@ -226,9 +231,9 @@ class MainMediaLibraryService : MediaLibraryService() {
         @Volatile
         private var activeInstance: MainMediaLibraryService? = null
 
-        private const val SESSION_ID = "shordway-main"
-        private const val ROOT_ID = "shordway-root"
-        private const val MEDIA_ID = "shordway-main-session"
+        private const val SESSION_ID = "hanwo-media"
+        private const val ROOT_ID = "hanwo-root"
+        private const val MEDIA_ID = "hanwo-session"
         private const val ACTION_UPDATE_STATE = "com.agent.voiceassistant.media.UPDATE_STATE"
         private const val EXTRA_ACTIVE = "active"
         private const val EXTRA_STATUS = "status"

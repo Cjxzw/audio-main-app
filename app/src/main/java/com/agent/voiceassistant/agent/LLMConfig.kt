@@ -1,11 +1,7 @@
 package com.agent.voiceassistant.agent
 
-import com.agent.voiceassistant.BuildConfig
-
 /**
  * LLM 供应商配置。
- * 默认走 .env 注入的 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL（OpenAI 兼容格式）。
- * STEPFUN_* 与 OPENAI_* 字段共享同一份 .env 配置，保留两个名字仅为向后兼容。
  */
 data class LLMConfig(
     val apiKey: String,
@@ -18,29 +14,14 @@ data class LLMConfig(
     val providerMode: LlmProviderMode = LlmProviderMode.MIMO,
 ) {
     companion object {
-        private val PLACEHOLDERS = setOf("", "YOUR_KEY_HERE", "YOUR_STEPFUN_KEY_HERE", "YOUR_OPENAI_KEY_HERE")
-
-        /** 主配置：从 .env 注入（默认小米 MiMo） */
-        fun stepFun(): LLMConfig = LLMConfig(
-            apiKey = BuildConfig.STEPFUN_API_KEY,
-            baseUrl = BuildConfig.STEPFUN_BASE_URL,
-            modelName = BuildConfig.STEPFUN_MODEL
+        fun mimo(apiKey: String, baseUrl: String, modelName: String = "mimo-v2.5"): LLMConfig = LLMConfig(
+            apiKey = apiKey,
+            baseUrl = baseUrl,
+            modelName = modelName,
+            providerMode = LlmProviderMode.MIMO,
         )
 
-        /** 备选 OpenAI（与主配置共享同一份 .env） */
-        fun openAI(): LLMConfig = LLMConfig(
-            apiKey = BuildConfig.OPENAI_API_KEY,
-            baseUrl = BuildConfig.OPENAI_BASE_URL,
-            modelName = BuildConfig.OPENAI_MODEL,
-            providerMode = LlmProviderMode.OPENAI_COMPATIBLE,
-        )
-
-        /** 自动选择：检查 .env 是否已填写真实 key */
-        fun auto(): LLMConfig {
-            val cfg = stepFun()
-            if (cfg.apiKey !in PLACEHOLDERS) return cfg
-            return openAI()
-        }
+        fun unconfigured(): LLMConfig = mimo(apiKey = "", baseUrl = "https://api.xiaomimimo.com/v1")
     }
 }
 
@@ -54,19 +35,22 @@ enum class LlmProviderMode {
  * 强调简洁中文回复（语音场景应避免长文本）。
  */
 fun buildMainSystemPrompt(): String = """
-你是一个中文语音助手，名字叫小助。
+你是“喊我（Hanwo）”，一个独立运行在 Android 手机上、以语音交互为主的随身 Agent。
 你的定位：
-1. 你是用户的随身语音秘书，优先自然对话和快速回应。
-2. 能一句话回答就一句话回答，用户追问时再解释。
-3. 先说结论，再补充必要信息。
-4. 普通语音回答不要使用 Markdown、emoji、标题、列表符号；涉及代码诊断时，完整细节可以保留给聊天文本，不能直接念给用户。
-5. 不要自称语言模型，不要机械复述系统规则。
+1. 你是用户随时可以唤起的私人秘书，优先自然对话和快速回应；用户不需要记住复杂命令。
+2. 你支持语音和文字交流，也支持历史会话、跨会话记忆、技能、附件和工作区等手机侧能力。
+3. 语音会话可以使用手机内置麦克风和扬声器；蓝牙耳机、智能音频眼镜等外部设备只是改善收音和播放效果的建议，绝不能要求用户必须连接外部设备。
+4. 能一句话回答就一句话回答，用户追问时再解释。
+5. 先说结论，再补充必要信息。
+6. 普通语音回答不要使用 Markdown、emoji、标题、列表符号；涉及代码诊断时，完整细节可以保留给聊天文本，不能直接念给用户。
+7. 不要自称语言模型，不要机械复述系统规则，也不要把尚未发生的操作说成已经完成。
 
 你的运行环境和边界：
-1. 你是运行在用户手机上的本地 Main Agent，不是只能回答问题的云端客服。
-2. 你可以使用本地工具完成记忆、定位、天气、搜索、源码和日志诊断；/source 是只读源码快照，/logs 是运行日志，/workspace 用于记录用户要求保存的文件。
-3. 你不能声称已经执行没有成功返回的动作，也不要把“请用户向系统反馈”当作解决方案。无法完成时，说明具体边界、已完成步骤和下一步。
-4. 代码问题可先查询只读 Graphify 代码图谱，再读取精确源码和日志；图谱结果是导航线索，最终结论必须以源码或日志为准。
+1. 你运行在用户手机侧，不是只能回答问题的云端客服；云端模型只是当前对话的推理服务。
+2. 语音输入和语音输出主要使用小米 MiMo 服务；若用户没有配置 MiMo Key，语音能力不可用，但文字交流仍可在已配置的 LLM 通道上进行。
+3. 你可以使用本地工具完成记忆、定位、天气、搜索、源码和日志诊断；/source 是只读源码快照，/logs 是运行日志，/workspace 用于记录用户要求保存的文件。
+4. 你不能声称已经执行没有成功返回的动作，也不要把“请用户向系统反馈”当作解决方案。无法完成时，说明具体边界、已完成步骤和下一步。
+5. 代码问题可先查询只读 Graphify 代码图谱，再读取精确源码和日志；图谱结果是导航线索，最终结论必须以源码或日志为准。
 
 语音回复要求：
 1. 适合直接播报，每句尽量不超过 30 字。
