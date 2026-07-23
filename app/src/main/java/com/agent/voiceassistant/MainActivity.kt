@@ -28,6 +28,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.data.ConversationSummary
 import com.agent.voiceassistant.databinding.ActivityMainBinding
+import com.agent.voiceassistant.databinding.PageHomeBinding
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.ServiceState
@@ -35,8 +36,11 @@ import com.agent.voiceassistant.service.VoiceAgentService
 import com.agent.voiceassistant.settings.SettingsActivity
 import com.agent.voiceassistant.ui.ChatAdapter
 import com.agent.voiceassistant.ui.ConversationAdapter
+import com.agent.voiceassistant.ui.MainPage
+import com.agent.voiceassistant.ui.MainPageAdapter
 import com.agent.voiceassistant.workspace.WorkspaceRepository
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.tabs.TabLayoutMediator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -47,6 +51,8 @@ import java.io.File
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+    private lateinit var homeBinding: PageHomeBinding
+    private lateinit var pageTabsMediator: TabLayoutMediator
     private lateinit var store: ConversationStore
     private val chatAdapter = ChatAdapter()
     private lateinit var conversationAdapter: ConversationAdapter
@@ -116,11 +122,20 @@ class MainActivity : AppCompatActivity() {
         store = ConversationStore(this)
         workspace = WorkspaceRepository(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
+        homeBinding = PageHomeBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        val mainPages = listOf(
+            MainPage(R.string.page_home, homeBinding.root),
+        )
+        val pageAdapter = MainPageAdapter(mainPages)
+        binding.pagePager.adapter = pageAdapter
+        pageTabsMediator = TabLayoutMediator(binding.pageTabs, binding.pagePager) { tab, position ->
+            tab.setText(pageAdapter.pages[position].titleRes)
+        }.also(TabLayoutMediator::attach)
         MainMediaLibraryService.ensureStarted(this)
         ensureNotificationPermissionAndBootstrap()
 
-        binding.rvChat.apply {
+        homeBinding.rvChat.apply {
             layoutManager = LinearLayoutManager(this@MainActivity).apply {
                 stackFromEnd = true
             }
@@ -149,22 +164,22 @@ class MainActivity : AppCompatActivity() {
                     toggleVoiceSession()
                     true
                 }
-                R.id.action_settings -> {
-                    startActivity(Intent(this, SettingsActivity::class.java))
-                    true
-                }
                 else -> false
             }
         }
 
-        binding.btnAttach.setOnClickListener { showAttachmentMenu() }
+        homeBinding.btnAttach.setOnClickListener { showAttachmentMenu() }
         binding.btnNewConversation.setOnClickListener {
             showMessage(getString(R.string.conversation_new_preparing))
             VoiceAgentService.newConversation(this)
             binding.drawerLayout.closeDrawer(GravityCompat.START)
         }
-        TooltipCompat.setTooltipText(binding.btnAttach, getString(R.string.attachment_add))
-        TooltipCompat.setTooltipText(binding.btnSendText, getString(R.string.btn_send_text))
+        binding.btnSettings.setOnClickListener {
+            binding.drawerLayout.closeDrawer(GravityCompat.START)
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        TooltipCompat.setTooltipText(homeBinding.btnAttach, getString(R.string.attachment_add))
+        TooltipCompat.setTooltipText(homeBinding.btnSendText, getString(R.string.btn_send_text))
         TooltipCompat.setTooltipText(binding.btnNewConversation, getString(R.string.conversation_new))
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -177,10 +192,10 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        binding.btnSendText.setOnClickListener {
+        homeBinding.btnSendText.setOnClickListener {
             sendTextInput()
         }
-        binding.etTextInput.setOnEditorActionListener { _, actionId, _ ->
+        homeBinding.etTextInput.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEND) {
                 sendTextInput()
                 true
@@ -203,7 +218,7 @@ class MainActivity : AppCompatActivity() {
         val messages = store.recentChatMessages()
         chatAdapter.setMessages(messages)
         if (messages.isNotEmpty()) {
-            binding.rvChat.post { binding.rvChat.scrollToPosition(chatAdapter.itemCount - 1) }
+            homeBinding.rvChat.post { homeBinding.rvChat.scrollToPosition(chatAdapter.itemCount - 1) }
         }
     }
 
@@ -225,11 +240,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendTextInput() {
-        val text = binding.etTextInput.text?.toString()?.trim().orEmpty()
+        val text = homeBinding.etTextInput.text?.toString()?.trim().orEmpty()
         if (text.isBlank() && pendingAttachments.isEmpty()) return
         val attachments = pendingAttachments.map(WorkspaceRepository.Entry::virtualPath)
         val effectiveText = text.ifBlank { "请查看这些附件。" }
-        binding.etTextInput.setText("")
+        homeBinding.etTextInput.setText("")
         pendingAttachments.clear()
         updatePendingAttachments()
         VoiceAgentService.sendText(this, effectiveText, attachments)
@@ -280,8 +295,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePendingAttachments() {
-        binding.tvPendingAttachments.visibility = if (pendingAttachments.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
-        binding.tvPendingAttachments.text = getString(
+        homeBinding.tvPendingAttachments.visibility = if (pendingAttachments.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
+        homeBinding.tvPendingAttachments.text = getString(
             R.string.attachment_pending,
             pendingAttachments.joinToString { it.name },
         )
@@ -363,7 +378,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             EventBus.chatMessages.collectLatest { msg ->
                 chatAdapter.addMessage(msg)
-                binding.rvChat.scrollToPosition(chatAdapter.itemCount - 1)
+                homeBinding.rvChat.scrollToPosition(chatAdapter.itemCount - 1)
                 refreshConversations()
                 Timber.d("UI chat: [${msg.role}] ${msg.text}")
             }
@@ -372,7 +387,7 @@ class MainActivity : AppCompatActivity() {
             EventBus.chatResets.collectLatest { messages ->
                 chatAdapter.setMessages(messages)
                 if (messages.isNotEmpty()) {
-                    binding.rvChat.scrollToPosition(chatAdapter.itemCount - 1)
+                    homeBinding.rvChat.scrollToPosition(chatAdapter.itemCount - 1)
                 }
                 refreshConversations()
             }
@@ -387,7 +402,7 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             EventBus.volumeEvents.collectLatest { level ->
-                binding.inputVoiceBar.setLevel(level)
+                homeBinding.inputVoiceBar.setLevel(level)
             }
         }
     }
@@ -415,19 +430,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun setVoiceControlActive(active: Boolean) {
         agentListening = active
-        binding.etTextInput.isEnabled = !active
-        binding.etTextInput.visibility = if (active) View.GONE else View.VISIBLE
-        binding.inputVoiceBar.visibility = if (active) View.VISIBLE else View.GONE
-        binding.btnAttach.isEnabled = !active
-        binding.btnSendText.isEnabled = !active
-        binding.btnAttach.alpha = if (active) 0.35f else 1f
-        binding.btnSendText.alpha = if (active) 0.35f else 1f
+        homeBinding.etTextInput.isEnabled = !active
+        homeBinding.etTextInput.visibility = if (active) View.GONE else View.VISIBLE
+        homeBinding.inputVoiceBar.visibility = if (active) View.VISIBLE else View.GONE
+        homeBinding.btnAttach.isEnabled = !active
+        homeBinding.btnSendText.isEnabled = !active
+        homeBinding.btnAttach.alpha = if (active) 0.35f else 1f
+        homeBinding.btnSendText.alpha = if (active) 0.35f else 1f
         if (active) {
-            binding.etTextInput.clearFocus()
+            homeBinding.etTextInput.clearFocus()
             (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
-                .hideSoftInputFromWindow(binding.etTextInput.windowToken, 0)
+                .hideSoftInputFromWindow(homeBinding.etTextInput.windowToken, 0)
         } else {
-            binding.inputVoiceBar.setLevel(0f)
+            homeBinding.inputVoiceBar.setLevel(0f)
         }
 
         val title = getString(if (active) R.string.voice_stop else R.string.voice_start)
@@ -450,8 +465,6 @@ class MainActivity : AppCompatActivity() {
         if (!::conversationAdapter.isInitialized) return
         val conversations = store.conversationSummaries()
         conversationAdapter.submitList(conversations)
-        binding.topAppBar.title = conversations.firstOrNull { it.current }?.title.orEmpty()
-        binding.topAppBar.subtitle = null
     }
 
     private fun selectConversation(conversation: ConversationSummary) {
@@ -519,6 +532,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        pageTabsMediator.detach()
         super.onDestroy()
     }
 

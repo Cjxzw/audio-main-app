@@ -6,9 +6,4 @@
         android:icon="@drawable/ic_phone_24"
         android:title="@string/voice_start"
         app:showAsAction="always" />
-    <item
-        android:id="@+id/action_settings"
-        android:icon="@drawable/ic_settings_24"
-        android:title="@string/settings_title"
-        app:showAsAction="always" />
 </menu>

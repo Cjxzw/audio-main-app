@@ -10,6 +10,9 @@
     <string name="voice_start">开始语音会话</string>
     <string name="voice_stop">结束语音会话</string>
     <string name="voice_level">语音输入音量</string>
+    <string name="page_home">首页</string>
+    <string name="page_hub">枢卫 Hub</string>
+    <string name="main_menu">主菜单</string>
     <string name="conversation_history">历史会话</string>
     <string name="conversation_new">新建会话</string>
     <string name="conversation_new_preparing">正在整理当前会话并创建新会话</string>

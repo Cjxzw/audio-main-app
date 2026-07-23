@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">Hanwo</string>
     <string name="chat_role_bot">Hanwo</string>
+    <string name="page_home">Home</string>
+    <string name="page_hub">Shuwei Hub</string>
+    <string name="main_menu">Main menu</string>
     <string name="settings_about">About</string>
     <string name="settings_about_summary">Hanwo · Version %1$s</string>
     <string name="settings_about_app_name">Software name</string>
