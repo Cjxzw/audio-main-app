@@ -29,6 +29,7 @@ import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.data.ConversationSummary
 import com.agent.voiceassistant.databinding.ActivityMainBinding
 import com.agent.voiceassistant.databinding.PageHomeBinding
+import com.agent.voiceassistant.databinding.PageTasksBinding
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.ServiceState
@@ -38,6 +39,9 @@ import com.agent.voiceassistant.ui.ChatAdapter
 import com.agent.voiceassistant.ui.ConversationAdapter
 import com.agent.voiceassistant.ui.MainPage
 import com.agent.voiceassistant.ui.MainPageAdapter
+import com.agent.voiceassistant.ui.TaskAdapter
+import com.agent.voiceassistant.tasks.TaskEntity
+import com.agent.voiceassistant.tasks.TaskRepository
 import com.agent.voiceassistant.workspace.WorkspaceRepository
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayoutMediator
@@ -52,11 +56,14 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var homeBinding: PageHomeBinding
+    private lateinit var tasksBinding: PageTasksBinding
     private lateinit var pageTabsMediator: TabLayoutMediator
     private lateinit var store: ConversationStore
     private val chatAdapter = ChatAdapter()
     private lateinit var conversationAdapter: ConversationAdapter
     private lateinit var workspace: WorkspaceRepository
+    private lateinit var taskRepository: TaskRepository
+    private lateinit var taskAdapter: TaskAdapter
     private val pendingAttachments = mutableListOf<WorkspaceRepository.Entry>()
     private var pendingCameraFile: File? = null
     private var agentListening = false
@@ -121,11 +128,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         store = ConversationStore(this)
         workspace = WorkspaceRepository(this)
+        taskRepository = TaskRepository(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
         homeBinding = PageHomeBinding.inflate(layoutInflater)
+        tasksBinding = PageTasksBinding.inflate(layoutInflater)
         setContentView(binding.root)
         val mainPages = listOf(
             MainPage(R.string.page_home, homeBinding.root),
+            MainPage(R.string.page_tasks, tasksBinding.root),
         )
         val pageAdapter = MainPageAdapter(mainPages)
         binding.pagePager.adapter = pageAdapter
@@ -141,6 +151,20 @@ class MainActivity : AppCompatActivity() {
             }
             adapter = chatAdapter
             itemAnimator = DefaultItemAnimator().apply { addDuration = 150 }
+        }
+        taskAdapter = TaskAdapter(
+            onOpen = ::showTaskDetails,
+            onCancel = { VoiceAgentService.cancelTask(this, it.taskId) },
+        )
+        tasksBinding.rvTasks.apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            adapter = taskAdapter
+        }
+        lifecycleScope.launch {
+            taskRepository.observeAll().collectLatest { tasks ->
+                taskAdapter.submitList(tasks)
+                tasksBinding.tvTaskEmpty.visibility = if (tasks.isEmpty()) View.VISIBLE else View.GONE
+            }
         }
         conversationAdapter = ConversationAdapter(
             onSelect = { conversation -> selectConversation(conversation) },
@@ -303,6 +327,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleIncomingIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(VoiceAgentService.EXTRA_OPEN_TASKS, false) == true) {
+            binding.pagePager.setCurrentItem(1, false)
+            intent.removeExtra(VoiceAgentService.EXTRA_OPEN_TASKS)
+        }
         if (intent == null || intent.action !in setOf(Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE, Intent.ACTION_VIEW)) return
         val uris = buildList {
             intent.data?.let(::add)
@@ -529,6 +557,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMessage(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showTaskDetails(task: TaskEntity) {
+        val text = buildString {
+            appendLine("任务 ID：${task.taskId}")
+            appendLine("执行者：${task.executorName}（${task.executorId}）")
+            appendLine("状态：${task.status} · 进度 ${task.progress}%")
+            appendLine("优先级：${task.priority}")
+            appendLine("汇报：${task.reportState}")
+            if (task.summary.isNotBlank()) appendLine("结果：${task.summary}")
+            if (task.error.isNotBlank()) appendLine("错误：${task.error}")
+            if (task.outputPath.isNotBlank()) append("产物：${task.outputPath}")
+        }.trim()
+        MaterialAlertDialogBuilder(this)
+            .setTitle(task.title)
+            .setMessage(text)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     override fun onDestroy() {

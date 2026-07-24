@@ -2,6 +2,10 @@ package com.agent.voiceassistant.tools
 
 import com.agent.voiceassistant.agent.AgentAction
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.tasks.AsyncTaskCoordinator
+import com.agent.voiceassistant.tasks.SongGenerationExecutor
+import com.agent.voiceassistant.tasks.TaskPriority
+import com.agent.voiceassistant.tasks.TaskSubmission
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -14,7 +18,11 @@ import kotlinx.serialization.json.putJsonObject
 
 class MainToolRegistry(
     private val executor: LocalToolExecutor,
+    private val taskCoordinator: AsyncTaskCoordinator? = null,
+    private val taskContext: () -> TaskToolContext = { TaskToolContext("default", "") },
 ) {
+    data class TaskToolContext(val conversationId: String, val sourceTurnId: String)
+
     enum class Profile {
         STANDALONE,
         CONNECTED,
@@ -43,6 +51,9 @@ class MainToolRegistry(
         add(webSearch())
         add(agentSleep())
         add(voiceReply())
+        add(singSong())
+        add(taskStatus())
+        add(cancelTask())
         add(readFile())
         add(writeFile())
         add(execCommand())
@@ -88,6 +99,9 @@ class MainToolRegistry(
 
     suspend fun execute(call: CloudSpeechClient.ToolCall): Execution {
         val payload = parseArguments(call.arguments)
+        if (call.name in ASYNC_TASK_TOOL_NAMES) {
+            return Execution(call, executeAsyncTaskTool(call, payload))
+        }
         val legacyAction = when (call.name) {
             TOOL_MEMORY_CREATE -> "memory.create"
             TOOL_MEMORY_SEARCH -> "memory.search"
@@ -112,6 +126,73 @@ class MainToolRegistry(
         return Execution(call, executor.execute(action))
     }
 
+    private suspend fun executeAsyncTaskTool(
+        call: CloudSpeechClient.ToolCall,
+        payload: JsonObject,
+    ): LocalToolExecutor.ToolResult {
+        val coordinator = taskCoordinator ?: return LocalToolExecutor.ToolResult(
+            actionType = call.name,
+            displayText = "异步任务系统不可用",
+            contextText = "异步任务系统尚未初始化。",
+            shouldAskLlm = true,
+            success = false,
+        )
+        val context = taskContext()
+        return when (call.name) {
+            TOOL_SING_SONG -> {
+                val lyrics = payload.text("lyrics")
+                    ?: return LocalToolExecutor.ToolResult(call.name, "唱歌任务创建失败", "sing_song 缺少 lyrics。", true, false)
+                require(lyrics.length <= 2_000) { "歌词不能超过 2000 字" }
+                val title = payload.text("title") ?: "未命名歌曲"
+                val task = coordinator.submit(
+                    TaskSubmission(
+                        taskType = SongGenerationExecutor.TYPE,
+                        title = "演唱《$title》",
+                        executorId = "local:song-generator",
+                        executorName = "手机本地唱歌执行器",
+                        conversationId = context.conversationId,
+                        sourceTurnId = context.sourceTurnId,
+                        priority = if (payload.text("urgent")?.toBooleanStrictOrNull() == true) TaskPriority.URGENT else TaskPriority.NORMAL,
+                        inputJson = payload.toString(),
+                        idempotencyKey = "tool:${call.id}",
+                    ),
+                )
+                LocalToolExecutor.ToolResult(
+                    actionType = call.name,
+                    displayText = "歌曲正在准备 · ${task.taskId.takeLast(8)}",
+                    contextText = "唱歌任务已创建。task_id=${task.taskId}，status=${task.status.lowercase()}。请立即告诉用户：歌手正在开嗓，请稍后。不要等待歌曲生成，也不要再次调用 sing_song。",
+                    shouldAskLlm = true,
+                )
+            }
+            TOOL_TASK_STATUS -> {
+                val task = payload.text("task_id")?.let { coordinator.get(it) }
+                    ?: coordinator.latestActive(context.conversationId)
+                    ?: return LocalToolExecutor.ToolResult(call.name, "没有找到任务", "当前会话没有匹配的异步任务。", true, false)
+                LocalToolExecutor.ToolResult(
+                    actionType = call.name,
+                    displayText = "任务 ${task.taskId.takeLast(8)} · ${task.status.lowercase()}",
+                    contextText = "task_id=${task.taskId}\ntitle=${task.title}\nexecutor=${task.executorName}\nstatus=${task.status.lowercase()}\nprogress=${task.progress}\nsummary=${task.summary}\nerror=${task.error}\noutput=${task.outputPath}",
+                    shouldAskLlm = true,
+                    success = task.status != "FAILED",
+                )
+            }
+            TOOL_CANCEL_TASK -> {
+                val task = payload.text("task_id")?.let { coordinator.get(it) }
+                    ?: coordinator.latestActive(context.conversationId)
+                    ?: return LocalToolExecutor.ToolResult(call.name, "没有可取消的任务", "当前会话没有进行中的异步任务。", true, false)
+                val cancelled = coordinator.cancel(task.taskId)
+                LocalToolExecutor.ToolResult(
+                    actionType = call.name,
+                    displayText = if (cancelled) "已取消 ${task.title}" else "任务无法取消",
+                    contextText = if (cancelled) "任务 ${task.taskId} 已取消。" else "任务 ${task.taskId} 已结束或无法取消。",
+                    shouldAskLlm = true,
+                    success = cancelled,
+                )
+            }
+            else -> error("unknown async task tool")
+        }
+    }
+
     fun displayName(toolName: String): String = when (toolName) {
         TOOL_MEMORY_CREATE -> "写入记忆"
         TOOL_MEMORY_SEARCH -> "查询记忆"
@@ -129,6 +210,9 @@ class MainToolRegistry(
         TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
         TOOL_AGENT_SLEEP -> "进入休眠"
         TOOL_VOICE_REPLY -> "个性化播报"
+        TOOL_SING_SONG -> "准备歌曲"
+        TOOL_TASK_STATUS -> "查询任务"
+        TOOL_CANCEL_TASK -> "取消任务"
         TOOL_PROTOCOL_REPAIR -> "修正工具调用格式"
         else -> toolName
     }
@@ -153,6 +237,8 @@ class MainToolRegistry(
             TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
             TOOL_SKILL_REGISTER -> payload.text("name")
             TOOL_REQUEST_DEEP_REASONING -> "当前回合"
+            TOOL_SING_SONG -> payload.text("title") ?: "未命名歌曲"
+            TOOL_TASK_STATUS, TOOL_CANCEL_TASK -> payload.text("task_id")
             else -> null
         }
         return value
@@ -300,7 +386,7 @@ class MainToolRegistry(
 
     private fun voiceReply() = tool(
         name = TOOL_VOICE_REPLY,
-        description = "终止型个性化语音回复。仅在用户明确要求唱歌、临时更换音色、模仿特殊说话风格或设计新音色时使用。调用即作为本回合最终答复：正文必须为空，完整可见且可播报的回复全部写入 text，App 不会再请求模型总结。preset 支持四种内置音色及唱歌；design 根据 voice_prompt 临时设计音色，但不支持唱歌。普通问答不要调用。",
+        description = "终止型个性化语音回复。仅在用户明确要求临时更换音色、模仿特殊说话风格或设计新音色时使用。只支持讲话，不支持唱歌；唱歌必须调用 sing_song。调用即作为本回合最终答复，普通正文必须为空。",
         required = listOf("text", "mode"),
     ) {
         putJsonObject("text") {
@@ -318,11 +404,6 @@ class MainToolRegistry(
             })
             put("description", "preset 模式的内置音色，省略时使用冰糖")
         }
-        putJsonObject("performance") {
-            put("type", "string")
-            put("enum", buildJsonArray { add(JsonPrimitive("speech")); add(JsonPrimitive("singing")) })
-            put("description", "preset 可选；design 只能 speech")
-        }
         putJsonObject("style_prompt") {
             put("type", "string")
             put("description", "preset 模式的语气、节奏、情绪要求")
@@ -331,6 +412,47 @@ class MainToolRegistry(
             put("type", "string")
             put("description", "design 模式必填，描述目标音色、年龄感、音调和说话风格")
         }
+    }
+
+    private fun singSong() = tool(
+        name = TOOL_SING_SONG,
+        description = "创建异步唱歌任务。仅当用户当前消息明确要求唱歌或演唱时调用。工具会立即返回 task_id，不等待音频生成；收到成功结果后告诉用户‘歌手正在开嗓，请稍后’，然后正常结束当前回合。朗诵歌词、普通配音或背景音乐请求不得调用。",
+        required = listOf("lyrics"),
+    ) {
+        putJsonObject("lyrics") {
+            put("type", "string")
+            put("description", "需要演唱的完整歌词，最多 2000 字")
+        }
+        putJsonObject("voice") {
+            put("type", "string")
+            put("enum", buildJsonArray { listOf("冰糖", "茉莉", "苏打", "白桦").forEach { add(JsonPrimitive(it)) } })
+        }
+        putJsonObject("style_prompt") {
+            put("type", "string")
+            put("description", "曲风、节奏和情绪要求")
+        }
+        putJsonObject("title") {
+            put("type", "string")
+            put("description", "歌曲标题")
+        }
+        putJsonObject("urgent") {
+            put("type", "boolean")
+            put("description", "仅当用户明确要求立即处理时为 true；不能用于绕过用户说话保护")
+        }
+    }
+
+    private fun taskStatus() = tool(
+        name = TOOL_TASK_STATUS,
+        description = "查询异步任务状态。用户询问刚才的歌曲或后台任务进度时使用；省略 task_id 时查询当前会话最新的进行中任务。",
+    ) {
+        putJsonObject("task_id") { put("type", "string") }
+    }
+
+    private fun cancelTask() = tool(
+        name = TOOL_CANCEL_TASK,
+        description = "取消进行中的异步任务。仅在用户明确表示不再需要该任务或要求取消时使用；省略 task_id 时取消当前会话最新的进行中任务。",
+    ) {
+        putJsonObject("task_id") { put("type", "string") }
     }
 
     private fun agentSleep() = tool(
@@ -503,6 +625,9 @@ class MainToolRegistry(
         const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
         const val TOOL_AGENT_SLEEP = "agent_sleep"
         const val TOOL_VOICE_REPLY = "voice_reply"
+        const val TOOL_SING_SONG = "sing_song"
+        const val TOOL_TASK_STATUS = "task_status"
+        const val TOOL_CANCEL_TASK = "cancel_task"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
 
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48
@@ -514,6 +639,8 @@ class MainToolRegistry(
             TOOL_CODE_GRAPH_SEARCH,
             TOOL_CODE_GRAPH_EXPLAIN,
         )
+
+        private val ASYNC_TASK_TOOL_NAMES = setOf(TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK)
 
     }
 }

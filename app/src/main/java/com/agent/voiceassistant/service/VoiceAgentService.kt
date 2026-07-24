@@ -3,6 +3,7 @@ package com.agent.voiceassistant.service
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationManager
+import android.app.NotificationChannel
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
@@ -61,6 +62,13 @@ import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CodeGraphIndex
 import com.agent.voiceassistant.tools.LocationProvider
 import com.agent.voiceassistant.tools.MainToolRegistry
+import com.agent.voiceassistant.tasks.AsyncTaskCoordinator
+import com.agent.voiceassistant.tasks.DelayedTestExecutor
+import com.agent.voiceassistant.tasks.SongGenerationExecutor
+import com.agent.voiceassistant.tasks.TaskRepository
+import com.agent.voiceassistant.tasks.TaskEntity
+import com.agent.voiceassistant.tasks.TaskPriority
+import com.agent.voiceassistant.tasks.TaskReportPolicy
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
@@ -71,6 +79,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -128,6 +137,9 @@ class VoiceAgentService : Service() {
         private const val LEGACY_STREAM_BLUETOOTH_SCO = 6
         private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif")
         private const val SESSION_GREETING_MESSAGE_ID = "__session_greeting__"
+        private const val TASK_REPORT_NOTIFICATION_ID = 9207
+        private const val TASK_REPORT_CHANNEL_ID = "task_reports"
+        private const val TASK_REPORT_BATCH_SIZE = 3
         private const val SESSION_GREETING_TRIGGER =
             "这是 Main Agent 的内部会话事件：用户刚刚开启了一个新话题。请只向用户发送一句简短、自然的中文问候，并邀请用户提出新的话题。不要调用工具，不要提及这个内部事件。"
         private val THINKING_FEEDBACK_AUDIO = intArrayOf(
@@ -169,10 +181,13 @@ class VoiceAgentService : Service() {
         const val ACTION_RENAME_CONVERSATION = "com.agent.voiceassistant.RENAME_CONVERSATION"
         const val ACTION_DELETE_CONVERSATION = "com.agent.voiceassistant.DELETE_CONVERSATION"
         const val ACTION_COMPACT_CONVERSATION = "com.agent.voiceassistant.COMPACT_CONVERSATION"
+        const val ACTION_CANCEL_TASK = "com.agent.voiceassistant.CANCEL_TASK"
+        const val EXTRA_OPEN_TASKS = "open_tasks"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_ATTACHMENTS = "attachments"
         private const val EXTRA_CONVERSATION_ID = "conversation_id"
         private const val EXTRA_CONVERSATION_TITLE = "conversation_title"
+        private const val EXTRA_TASK_ID = "task_id"
 
         fun start(ctx: Context) {
             DiagLog.i("api.start", "ctx=${ctx.javaClass.simpleName}")
@@ -258,6 +273,9 @@ class VoiceAgentService : Service() {
         fun compactConversation(ctx: Context, id: String) =
             sendServiceAction(ctx, ACTION_COMPACT_CONVERSATION) { putExtra(EXTRA_CONVERSATION_ID, id) }
 
+        fun cancelTask(ctx: Context, id: String) =
+            sendServiceAction(ctx, ACTION_CANCEL_TASK) { putExtra(EXTRA_TASK_ID, id) }
+
         private fun sendServiceAction(ctx: Context, action: String, configure: Intent.() -> Unit = {}) {
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(action).apply(configure)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent) else ctx.startService(intent)
@@ -286,6 +304,8 @@ class VoiceAgentService : Service() {
     private lateinit var capabilityResolver: AppCapabilityResolver
     private lateinit var locationProvider: LocationProvider
     private lateinit var toolRegistry: MainToolRegistry
+    private lateinit var taskRepository: TaskRepository
+    private lateinit var taskCoordinator: AsyncTaskCoordinator
     private lateinit var executionEnv: AndroidExecutionEnv
     private lateinit var skillRegistry: SkillRegistry
     private lateinit var imageEncoder: MultimodalImageEncoder
@@ -296,7 +316,9 @@ class VoiceAgentService : Service() {
     private val turnMutex = Mutex()
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
     private val thinkingFeedbackLock = Any()
+    private val speechInterruptedForUrgentReport = AtomicBoolean(false)
     private var lastThinkingFeedbackAudio: Int? = null
+    @Volatile private var activeSourceTurnId: String = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -309,6 +331,15 @@ class VoiceAgentService : Service() {
         capabilityResolver = AppCapabilityResolver(this)
         locationProvider = LocationProvider(this, store)
         executionEnv = AndroidExecutionEnv(this)
+        taskRepository = TaskRepository(this)
+        taskCoordinator = AsyncTaskCoordinator(taskRepository, serviceScope).apply {
+            register(DelayedTestExecutor())
+            register(
+                SongGenerationExecutor(executionEnv.workspaceRoot) {
+                    ensureSpeechClient() ?: error("MiMo 语音服务不可用")
+                },
+            )
+        }
         skillRegistry = SkillRegistry(
             executionEnv.skillsRoot,
             executionEnv.disabledSkillsRoot,
@@ -324,10 +355,20 @@ class VoiceAgentService : Service() {
                 codeGraph = CodeGraphIndex(this),
                 skillRegistry = skillRegistry,
             ),
+            taskCoordinator = taskCoordinator,
+            taskContext = {
+                MainToolRegistry.TaskToolContext(
+                    conversationId = store.currentConversationId,
+                    sourceTurnId = activeSourceTurnId,
+                )
+            },
         )
+        serviceScope.launch { taskCoordinator.recover() }
+        serviceScope.launch { taskReportReviewLoop() }
         locationProvider.refreshInBackground("service_start")
         earcons = EarconPlayer { routeManager }
         createNotificationChannel()
+        createTaskReportChannel()
         MainMediaLibraryService.ensureStarted(this)
     }
 
@@ -399,6 +440,11 @@ class VoiceAgentService : Service() {
                     }
                 }
             }
+            ACTION_CANCEL_TASK -> {
+                ensureForegroundForCurrentState()
+                val id = intent.getStringExtra(EXTRA_TASK_ID).orEmpty()
+                serviceScope.launch { taskCoordinator.cancel(id) }
+            }
             ACTION_STOP -> {
                 hardStopAgent(keepForeground = false)
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -406,6 +452,156 @@ class VoiceAgentService : Service() {
             }
         }
         return START_STICKY
+    }
+
+    private suspend fun taskReportReviewLoop() {
+        while (serviceScope.isActive) {
+            delay(1_000)
+            runCatching { reviewPendingTaskReports() }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    Timber.w(error, "Task report review failed")
+                }
+        }
+    }
+
+    private suspend fun reviewPendingTaskReports() {
+        val pending = taskRepository.pendingReports()
+        if (pending.isEmpty()) return
+        val first = pending.first()
+        val batch = pending
+            .filter { it.conversationId == first.conversationId }
+            .take(TASK_REPORT_BATCH_SIZE)
+        val sameConversation = first.conversationId == store.currentConversationId
+        val external = if (dormant) AudioRouteManager(this).externalOutput().connected else false
+        if (!dormant &&
+            pending.any { it.priority == TaskPriority.URGENT.name } &&
+            recorder?.isUserSpeaking() != true
+        ) {
+            speechInterruptedForUrgentReport.set(true)
+        }
+        when (
+            TaskReportPolicy.route(
+                dormant = dormant,
+                sameConversation = sameConversation,
+                externalOutputConnected = external,
+                userSpeaking = recorder?.isUserSpeaking() == true,
+            )
+        ) {
+            TaskReportPolicy.Route.DEFER -> Unit
+            TaskReportPolicy.Route.NOTIFICATION -> reportTasksByNotification(batch)
+            TaskReportPolicy.Route.ACTIVE_AUDIO -> reportTasksByAudio(batch, fromDormant = false)
+            TaskReportPolicy.Route.DORMANT_EXTERNAL_AUDIO -> reportTasksByAudio(batch, fromDormant = true)
+        }
+    }
+
+    private suspend fun reportTasksByNotification(tasks: List<TaskEntity>) {
+        val action = taskRepository.beginReport(tasks, "notification")
+        val title = if (tasks.any { it.priority == TaskPriority.URGENT.name }) "紧急任务已完成" else "任务进展"
+        val content = tasks.joinToString("；") { task ->
+            task.summary.ifBlank { "${task.title}：${task.status}" }
+        }.take(240)
+        val openTasks = Intent(this, MainActivity::class.java)
+            .putExtra(EXTRA_OPEN_TASKS, true)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            TASK_REPORT_NOTIFICATION_ID,
+            openTasks,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(this, TASK_REPORT_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(TASK_REPORT_NOTIFICATION_ID, notification)
+        taskRepository.finishReport(action.reportActionId, "NOTIFIED", content)
+    }
+
+    private suspend fun reportTasksByAudio(tasks: List<TaskEntity>, fromDormant: Boolean) {
+        if (!fromDormant && recorder?.stopIfIdle() != true) return
+        turnMutex.withLock {
+            val wasActive = !dormant
+            if (wasActive) {
+                loopJob?.cancelAndJoin()
+                loopJob = null
+                delay(220)
+            } else {
+                val routes = AudioRouteManager(this)
+                routeManager = routes
+                check(routes.configureForExternalPlayback().connected) { "外部音频设备已断开" }
+                speechClient = ensureSpeechClient()
+            }
+
+            val action = taskRepository.beginReport(
+                tasks,
+                if (fromDormant) "dormant_external_audio" else "active_audio",
+            )
+            var finalText = ""
+            try {
+                speechInterruptedForUrgentReport.set(false)
+                updateNotification("正在汇报任务...")
+                earcons.reporting()
+                val client = ensureSpeechClient() ?: error("MiMo 语音服务不可用")
+                val prompt = buildTaskReportPrompt(tasks)
+                val outcome = runAgentLoop(
+                    llmClient = createLlmClient(),
+                    speechClient = client,
+                    speakReplies = true,
+                    messages = listOf(
+                        CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()),
+                        CloudSpeechClient.LlmMessage("user", prompt),
+                    ),
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                    maxToolRounds = 1,
+                    allowReasoningEscalation = false,
+                    toolsEnabled = false,
+                )
+                finalText = outcome.finalText
+                tasks.mapNotNull(::taskOutputFile).forEach { playAudioFile(it) }
+                taskRepository.finishReport(action.reportActionId, "COMPLETED", finalText)
+            } catch (error: Throwable) {
+                taskRepository.finishReport(
+                    action.reportActionId,
+                    "FAILED",
+                    finalText,
+                    error.message ?: error.javaClass.simpleName,
+                )
+                throw error
+            } finally {
+                if (fromDormant) {
+                    routeManager?.release()
+                    routeManager = null
+                } else if (wasActive && !dormant) {
+                    recorder = SimpleVadRecorder(routeManager)
+                    loopJob = serviceScope.launch { runConversationLoop() }
+                    updateNotification("聆听中...")
+                }
+            }
+        }
+    }
+
+    private fun buildTaskReportPrompt(tasks: List<TaskEntity>): String = buildString {
+        appendLine("这是内部异步任务完成事件。请用一到三句自然、适合语音播报的中文汇报结果。")
+        appendLine("不要调用工具，不要解释内部机制，不要使用 Markdown。")
+        tasks.forEach { task ->
+            appendLine("- 任务：${task.title}")
+            appendLine("  状态：${task.status}")
+            appendLine("  结果：${task.summary.ifBlank { task.error.ifBlank { "无补充信息" } }}")
+            if (task.details.isNotBlank()) appendLine("  详情：${task.details.take(600)}")
+            if (task.outputPath.isNotBlank()) appendLine("  产物：${task.outputPath}")
+        }
+    }
+
+    private fun taskOutputFile(task: TaskEntity): File? {
+        if (task.outputPath.isBlank() || task.taskType != SongGenerationExecutor.TYPE) return null
+        val relative = task.outputPath.removePrefix("/workspace/")
+        return File(executionEnv.workspaceRoot, relative).takeIf(File::isFile)
     }
 
     override fun onDestroy() {
@@ -619,6 +815,7 @@ class VoiceAgentService : Service() {
                 }
                 val storedAttachments = attachments.map { StoredAttachment(it, attachmentMimeType(it)) }
                 val currentUserMessage = store.addMessage("user", displayText, attachments = storedAttachments)
+                activeSourceTurnId = currentUserMessage.id
                 EventBus.emitChatMessage(ChatMessage(ChatRole.USER, displayText))
                 turnNote?.let {
                     store.addMessage("system", it)
@@ -627,6 +824,7 @@ class VoiceAgentService : Service() {
                 emitLog("你($source): $userText attachments=${attachments.size}")
                 updateNotification("正在回应...")
 
+                speechInterruptedForUrgentReport.set(false)
                 val outcome = runAgentLoop(
                     llmClient = llmClient,
                     speechClient = client,
@@ -1742,6 +1940,13 @@ class VoiceAgentService : Service() {
         }
 
         suspend fun finish() = withContext(Dispatchers.IO) {
+            if (speechInterruptedForUrgentReport.get()) {
+                audioTrack?.let { releaseAudioTrack(it) }
+                audioTrack = null
+                pendingTail = ByteArray(0)
+                abandonPlaybackFocus(focus)
+                return@withContext
+            }
             val track = audioTrack
             if (track != null) {
                 flushPendingTail(track)
@@ -1766,6 +1971,12 @@ class VoiceAgentService : Service() {
             mimeType: String?,
             alreadyBoosted: Boolean = false,
         ) {
+            if (speechInterruptedForUrgentReport.get()) {
+                audioTrack?.let { releaseAudioTrack(it) }
+                audioTrack = null
+                pendingTail = ByteArray(0)
+                return
+            }
             if (rawPcm.isEmpty()) return
             val pcm = if (alreadyBoosted) rawPcm else amplifyPcm16Le(rawPcm)
             val track = ensureTrack(chunkSampleRate, mimeType, rawPcm, pcm)
@@ -1941,7 +2152,8 @@ class VoiceAgentService : Service() {
         val timeoutMs = (totalFrames * 1000L / sampleRate) + 2_000L
         val startedAt = System.currentTimeMillis()
         while (track.playbackHeadPosition < totalFrames &&
-            System.currentTimeMillis() - startedAt < timeoutMs
+            System.currentTimeMillis() - startedAt < timeoutMs &&
+            !speechInterruptedForUrgentReport.get()
         ) {
             delay(20)
         }
@@ -2079,6 +2291,7 @@ class VoiceAgentService : Service() {
             var offset = 0
             while (offset < chunk.pcm.size) {
                 coroutineContext.ensureActive()
+                if (speechInterruptedForUrgentReport.get()) break
                 val written = track.write(chunk.pcm, offset, chunk.pcm.size - offset)
                 if (written <= 0) error("AudioTrack write failed: $written")
                 offset += written
@@ -2118,7 +2331,7 @@ class VoiceAgentService : Service() {
     }
 
     private fun playbackAudioAttributes(): AudioAttributes {
-        val communicationSession = routeManager != null
+        val communicationSession = routeManager?.communicationSession == true
         return AudioAttributes.Builder()
             .setUsage(
                 if (communicationSession) {
@@ -2313,6 +2526,46 @@ class VoiceAgentService : Service() {
         updateNotification(message)
     }
 
+    private suspend fun playAudioFile(file: File) {
+        if (!file.isFile) return
+        withContext(Dispatchers.Main.immediate) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                val mediaPlayer = MediaPlayer()
+                player = mediaPlayer
+                val focus = requestPlaybackFocus()
+                mediaPlayer.setAudioAttributes(playbackAudioAttributes())
+                mediaPlayer.setVolume(1f, 1f)
+                routeManager?.applyOutputRouting(mediaPlayer)
+                mediaPlayer.setOnPreparedListener(MediaPlayer::start)
+                mediaPlayer.setOnCompletionListener {
+                    releasePlayer(it)
+                    abandonPlaybackFocus(focus)
+                    if (cont.isActive) cont.resume(Unit)
+                }
+                mediaPlayer.setOnErrorListener { mp, what, extra ->
+                    releasePlayer(mp)
+                    abandonPlaybackFocus(focus)
+                    if (cont.isActive) cont.resumeWithException(
+                        IllegalStateException("MediaPlayer file error $what/$extra"),
+                    )
+                    true
+                }
+                cont.invokeOnCancellation {
+                    releasePlayer(mediaPlayer)
+                    abandonPlaybackFocus(focus)
+                }
+                runCatching {
+                    mediaPlayer.setDataSource(file.absolutePath)
+                    mediaPlayer.prepareAsync()
+                }.onFailure {
+                    releasePlayer(mediaPlayer)
+                    abandonPlaybackFocus(focus)
+                    if (cont.isActive) cont.resumeWithException(it)
+                }
+            }
+        }
+    }
+
     private suspend fun handleConnectionLost(operation: String, error: NetworkTimeoutException) {
         val message = "本轮网络响应超时，请稍后重试。助手仍保持在线。"
         Timber.w(error, "Network connection lost during $operation")
@@ -2378,6 +2631,20 @@ class VoiceAgentService : Service() {
 
     private fun createNotificationChannel() {
         AssistantNotificationContract.ensureChannel(this)
+    }
+
+    private fun createTaskReportChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(
+                TASK_REPORT_CHANNEL_ID,
+                "任务汇报",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "异步任务完成与失败通知"
+                enableVibration(true)
+            },
+        )
     }
 
     private fun buildNotification(text: String): Notification {

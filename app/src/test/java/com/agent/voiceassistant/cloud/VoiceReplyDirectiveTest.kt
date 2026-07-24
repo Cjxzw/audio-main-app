@@ -6,15 +6,15 @@ import org.junit.Test
 
 class VoiceReplyDirectiveTest {
     @Test
-    fun `parses preset singing reply`() {
-        val directive = VoiceReplyDirectiveParser.parse(
-            """{"text":"祝你生日快乐","mode":"preset","voice":"茉莉","performance":"singing"}""",
-        )
+    fun `voice reply rejects singing so it cannot block the conversation`() {
+        val result = runCatching {
+            VoiceReplyDirectiveParser.parse(
+                """{"text":"祝你生日快乐","mode":"preset","voice":"茉莉","performance":"singing"}""",
+            )
+        }
 
-        assertEquals("祝你生日快乐", directive.text)
-        assertEquals(VoiceReplyMode.PRESET, directive.options.mode)
-        assertEquals("茉莉", directive.options.voice)
-        assertEquals(VoicePerformance.SINGING, directive.options.performance)
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("sing_song"))
     }
 
     @Test

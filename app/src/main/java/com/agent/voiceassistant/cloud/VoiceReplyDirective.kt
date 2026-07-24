@@ -48,10 +48,8 @@ object VoiceReplyDirectiveParser {
             "design" -> VoiceReplyMode.DESIGN
             else -> throw IllegalArgumentException("mode 只支持 preset 或 design")
         }
-        val performance = when (payload.text("performance")?.lowercase()) {
-            null, "speech" -> VoicePerformance.SPEECH
-            "singing" -> VoicePerformance.SINGING
-            else -> throw IllegalArgumentException("performance 只支持 speech 或 singing")
+        require(payload.text("performance") == null) {
+            "voice_reply 不支持 performance；唱歌请使用 sing_song"
         }
         val stylePrompt = payload.text("style_prompt")
         val voicePrompt = payload.text("voice_prompt")
@@ -64,7 +62,6 @@ object VoiceReplyDirectiveParser {
             require(voicePrompt == null) { "preset 模式不能传 voice_prompt" }
         } else {
             require(!voicePrompt.isNullOrBlank()) { "design 模式必须传 voice_prompt" }
-            require(performance == VoicePerformance.SPEECH) { "design 模式暂不支持唱歌" }
         }
 
         return VoiceReplyDirective(
@@ -72,7 +69,7 @@ object VoiceReplyDirectiveParser {
             options = VoiceReplyOptions(
                 mode = mode,
                 voice = voice,
-                performance = performance,
+                performance = VoicePerformance.SPEECH,
                 stylePrompt = stylePrompt,
                 voicePrompt = voicePrompt,
             ),

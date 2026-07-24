@@ -42,10 +42,19 @@ class SimpleVadRecorder(
     )
 
     private val stopped = AtomicBoolean(false)
+    private val userSpeaking = AtomicBoolean(false)
     @Volatile private var pendingCleanup: Future<*>? = null
 
     fun stop() {
         stopped.set(true)
+    }
+
+    fun isUserSpeaking(): Boolean = userSpeaking.get()
+
+    fun stopIfIdle(): Boolean {
+        if (userSpeaking.get()) return false
+        stopped.set(true)
+        return true
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
@@ -149,6 +158,7 @@ class SimpleVadRecorder(
                         startFrames++
                         if (startFrames >= START_FRAMES_REQUIRED) {
                             speechStarted = true
+                            userSpeaking.set(true)
                             speechPeakRms = smoothedRms
                             while (preRoll.isNotEmpty()) {
                                 val pre = preRoll.removeFirst()
@@ -184,6 +194,7 @@ class SimpleVadRecorder(
                     frames.clear()
                     preRoll.clear()
                     speechStarted = false
+                    userSpeaking.set(false)
                     startFrames = 0
                     silenceFrames = 0
                     capturedSamples = 0
@@ -195,6 +206,7 @@ class SimpleVadRecorder(
                     frames.clear()
                     preRoll.clear()
                     speechStarted = false
+                    userSpeaking.set(false)
                     startFrames = 0
                     silenceFrames = 0
                     capturedSamples = 0
@@ -203,6 +215,7 @@ class SimpleVadRecorder(
             }
             CaptureResult.Stopped
         } finally {
+            userSpeaking.set(false)
             EventBus.emitVolume(0f)
             scheduleCleanup(record)
         }

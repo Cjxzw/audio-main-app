@@ -170,15 +170,17 @@ class CloudSpeechClient(
     suspend fun streamSynthesizeSpeech(
         text: String,
         options: VoiceReplyOptions = VoiceReplyOptions(),
+        firstAudioTimeoutMs: Long = FIRST_AUDIO_TIMEOUT_MS,
+        maxAttempts: Int = MAX_NETWORK_ATTEMPTS,
         onAudioChunk: suspend (AudioPayload) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
         var lastTimeout: FirstAudioTimeoutException? = null
-        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
+        repeat(maxAttempts.coerceIn(1, MAX_NETWORK_ATTEMPTS)) { attempt ->
             try {
-                return@withContext streamSynthesizeSpeechOnce(text, options, onAudioChunk)
+                return@withContext streamSynthesizeSpeechOnce(text, options, firstAudioTimeoutMs, onAudioChunk)
             } catch (error: FirstAudioTimeoutException) {
                 lastTimeout = error
-                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
+                if (attempt + 1 < maxAttempts.coerceIn(1, MAX_NETWORK_ATTEMPTS)) {
                     Timber.w("TTS first audio timeout; retrying request")
                 }
             }
@@ -189,18 +191,19 @@ class CloudSpeechClient(
     private suspend fun streamSynthesizeSpeechOnce(
         text: String,
         options: VoiceReplyOptions,
+        firstAudioTimeoutMs: Long,
         onAudioChunk: suspend (AudioPayload) -> Unit,
     ): Boolean = coroutineScope {
         require(options.mode == VoiceReplyMode.PRESET) { "音色设计模式不支持流式返回" }
         val payload = buildTtsPayload(text, stream = true, options = options)
-        val call = newJsonRequest(payload)
+        val call = newJsonRequest(payload, readTimeoutSeconds = (firstAudioTimeoutMs / 1_000L + 30L).coerceAtLeast(30L))
         val receivedAudio = AtomicBoolean(false)
         val firstAudioTimedOut = AtomicBoolean(false)
         val cancellation = coroutineContext[Job]?.invokeOnCompletion {
             call.cancel()
         }
         val firstAudioWatchdog = launch(Dispatchers.IO) {
-            delay(FIRST_AUDIO_TIMEOUT_MS)
+            delay(firstAudioTimeoutMs)
             if (!receivedAudio.get()) {
                 firstAudioTimedOut.set(true)
                 call.cancel()
@@ -353,7 +356,11 @@ class CloudSpeechClient(
         throw NetworkTimeoutException(operation, lastTimeout)
     }
 
-    private fun newJsonRequest(payload: JsonObject, callTimeoutSeconds: Long? = null): okhttp3.Call {
+    private fun newJsonRequest(
+        payload: JsonObject,
+        callTimeoutSeconds: Long? = null,
+        readTimeoutSeconds: Long? = null,
+    ): okhttp3.Call {
         val request = Request.Builder()
             .url("${config.baseUrl.trimEnd('/')}/chat/completions")
             .addHeader("Content-Type", JSON_MEDIA_TYPE.toString())
@@ -361,7 +368,10 @@ class CloudSpeechClient(
             .addHeader("Authorization", "Bearer ${config.apiKey}")
             .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        return client.newCall(request).also { call ->
+        val requestClient = readTimeoutSeconds?.let {
+            client.newBuilder().readTimeout(it, TimeUnit.SECONDS).build()
+        } ?: client
+        return requestClient.newCall(request).also { call ->
             callTimeoutSeconds?.let { call.timeout().timeout(it, TimeUnit.SECONDS) }
         }
     }

@@ -11,6 +11,10 @@
     <string name="voice_stop">结束语音会话</string>
     <string name="voice_level">语音输入音量</string>
     <string name="page_home">首页</string>
+    <string name="page_tasks">任务</string>
+    <string name="task_empty">暂无任务</string>
+    <string name="task_cancel">取消任务</string>
+    <string name="task_details">任务详情</string>
     <string name="page_hub">枢卫 Hub</string>
     <string name="main_menu">主菜单</string>
     <string name="conversation_history">历史会话</string>

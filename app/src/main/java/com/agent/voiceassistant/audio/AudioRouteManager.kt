@@ -15,6 +15,10 @@ import kotlinx.coroutines.delay
 import timber.log.Timber
 
 class AudioRouteManager(context: Context) {
+    data class ExternalOutput(
+        val connected: Boolean,
+        val label: String,
+    )
     data class RouteReadiness(
         val ready: Boolean,
         val elapsedMs: Long,
@@ -29,8 +33,12 @@ class AudioRouteManager(context: Context) {
     @Volatile private var previousMode: Int? = null
     @Volatile private var communicationDeviceSet = false
     @Volatile private var scoStarted = false
+    @Volatile private var playbackOnly = false
+
+    val communicationSession: Boolean get() = configured && !playbackOnly
 
     fun configureForVoiceSession(): String {
+        playbackOnly = false
         prepareCommunicationRoute()
 
         val inputs = getDevices(AudioManager.GET_DEVICES_INPUTS)
@@ -198,6 +206,7 @@ class AudioRouteManager(context: Context) {
                 .onFailure { Timber.w(it, "AudioRoute: restore audio mode failed") }
         }
         configured = false
+        playbackOnly = false
         detectedInput = null
         detectedOutput = null
         previousMode = null
@@ -207,7 +216,7 @@ class AudioRouteManager(context: Context) {
     }
 
     fun ensureCommunicationMode(reason: String): Boolean {
-        if (!configured) return false
+        if (!configured || playbackOnly) return false
         val current = audioManager.mode
         val protectedCallMode = current == AudioManager.MODE_IN_CALL ||
             (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && current == AudioManager.MODE_CALL_SCREENING)
@@ -224,6 +233,24 @@ class AudioRouteManager(context: Context) {
         }.onFailure {
             Timber.w(it, "AudioRoute: communication mode reassert failed from=$current reason=$reason")
         }.getOrDefault(false)
+    }
+
+    fun externalOutput(): ExternalOutput {
+        val device = getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .filter { it.isSink && it.isPreferredExternalOutput() }
+            .minByOrNull { outputPriority(it) }
+        return ExternalOutput(device != null, deviceLabel(device))
+    }
+
+    fun configureForExternalPlayback(): ExternalOutput {
+        val device = getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .filter { it.isSink && it.isPreferredExternalOutput() }
+            .minByOrNull { outputPriority(it) }
+        detectedInput = null
+        detectedOutput = device
+        configured = true
+        playbackOnly = true
+        return ExternalOutput(device != null, deviceLabel(device))
     }
 
     @Synchronized
@@ -359,7 +386,9 @@ class AudioRouteManager(context: Context) {
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> 4
         AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> 5
         AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 6
-        bleSpeakerType() -> 7
+        AudioDeviceInfo.TYPE_USB_DEVICE -> 7
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> 8
+        bleSpeakerType() -> 9
         AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> 50
         else -> 40
     }

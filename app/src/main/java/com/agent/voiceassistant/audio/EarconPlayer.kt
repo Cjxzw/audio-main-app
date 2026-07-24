@@ -20,6 +20,7 @@ class EarconPlayer(
     suspend fun listening() = playTone("listening", listOf(660.0, 880.0), 130, gain = 0.58)
     suspend fun captureDone() = playTone("capture_done", listOf(880.0, 660.0), 130, gain = 0.58)
     suspend fun waiting() = playTone("waiting", listOf(760.0, 760.0), 150, gain = 0.50)
+    suspend fun reporting() = playTone("reporting", listOf(740.0, 932.0, 1108.0), 105, gain = 0.54)
     suspend fun preSleep() = playTone("pre_sleep", listOf(620.0, 520.0), 180, gain = 0.56)
     suspend fun sleep() = playTone("sleep", listOf(660.0, 440.0), 150, gain = 0.58)
     suspend fun playbackDone() = playTone(listOf(784.0, 988.0), 120, gain = 0.45)
@@ -41,7 +42,7 @@ class EarconPlayer(
         val pcm = buildPcm(frequencies, segmentMs, gain)
         val routes = routeManagerProvider()
         val createStartedAt = SystemClock.elapsedRealtime()
-        val track = createTrack(pcm.size, communicationSession = routes != null)
+        val track = createTrack(pcm.size, communicationSession = routes?.communicationSession == true)
         val createElapsedMs = SystemClock.elapsedRealtime() - createStartedAt
         try {
             if (SystemClock.elapsedRealtime() - startedAt > MAX_START_LATENCY_MS) {
@@ -53,7 +54,7 @@ class EarconPlayer(
             track.play()
             Timber.i(
                 "Earcon: $label started bytes=$written session=${track.audioSessionId} " +
-                    "domain=${if (routes != null) "communication" else "media"} createMs=$createElapsedMs",
+                    "domain=${if (routes?.communicationSession == true) "communication" else "media"} createMs=$createElapsedMs",
             )
             delay(frequencies.size * segmentMs + 80L)
             Timber.i("Earcon: $label finished totalMs=${SystemClock.elapsedRealtime() - startedAt}")
