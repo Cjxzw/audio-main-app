@@ -59,13 +59,12 @@ class ContextAssetsActivity : AppCompatActivity() {
     private fun reload() {
         val items = when (tab) {
             Tab.SKILLS -> skills.listAll().map { skill ->
-                ContextAssetItem(skill.id, skill.name, skill.description, skill.enabled, ContextAssetItem.Kind.SKILL)
+                ContextAssetItem(skill.id, skill.name, skill.enabled, ContextAssetItem.Kind.SKILL)
             }
             Tab.MEMORIES -> store.memories().map { memory ->
                 ContextAssetItem(
                     memory.id,
                     memory.content.take(60),
-                    memory.tags.joinToString(" · ").ifBlank { getString(R.string.context_asset_no_tags) },
                     memory.enabled,
                     ContextAssetItem.Kind.MEMORY,
                 )
@@ -87,30 +86,9 @@ class ContextAssetsActivity : AppCompatActivity() {
 
     private fun edit(item: ContextAssetItem) {
         when (item.kind) {
-            ContextAssetItem.Kind.SKILL -> editSkill(item.id)
+            ContextAssetItem.Kind.SKILL -> startActivity(SkillEditorActivity.intent(this, item.id))
             ContextAssetItem.Kind.MEMORY -> editMemory(item.id)
         }
-    }
-
-    private fun editSkill(id: String) {
-        val skill = skills.listAll().firstOrNull { it.id == id } ?: return
-        val name = editField(skill.name)
-        val description = editField(skill.description)
-        val body = editField(skills.coreBody(id), multiline = true)
-        val form = form(name, description, body)
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.context_asset_edit_skill)
-            .setView(form)
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                runCatching {
-                    require(name.text.toString().isNotBlank()) { "名称不能为空" }
-                    require(description.text.toString().isNotBlank()) { "简介不能为空" }
-                    skills.update(id, name.text.toString(), description.text.toString(), body.text.toString())
-                }.onFailure { showError(it.message ?: "Skill 保存失败") }
-                reload()
-            }
-            .show()
     }
 
     private fun editMemory(id: String) {
@@ -178,7 +156,6 @@ class ContextAssetsActivity : AppCompatActivity() {
 private data class ContextAssetItem(
     val id: String,
     val title: String,
-    val summary: String,
     val enabled: Boolean,
     val kind: Kind,
 ) {
@@ -207,15 +184,14 @@ private class ContextAssetAdapter(
 
     inner class Holder(view: View) : RecyclerView.ViewHolder(view) {
         private val toggle = view.findViewById<MaterialSwitch>(R.id.switchContextAsset)
-        private val summary = view.findViewById<TextView>(R.id.tvContextAssetSummary)
+        private val title = view.findViewById<TextView>(R.id.tvContextAssetTitle)
         private val edit = view.findViewById<ImageButton>(R.id.btnEditContextAsset)
         private val delete = view.findViewById<ImageButton>(R.id.btnDeleteContextAsset)
 
         fun bind(item: ContextAssetItem) {
             toggle.setOnCheckedChangeListener(null)
-            toggle.text = item.title
             toggle.isChecked = item.enabled
-            summary.text = item.summary
+            title.text = item.title
             toggle.setOnCheckedChangeListener { _, checked -> onToggle(item, checked) }
             edit.setOnClickListener { onEdit(item) }
             delete.setOnClickListener { onDelete(item) }

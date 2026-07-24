@@ -15,6 +15,7 @@ val generateAgentAssets by tasks.registering(Sync::class) {
     from(rootProject.projectDir) {
         include(
             "README.md",
+            "LICENSE",
             "开发日志.md",
             "settings.gradle.kts",
             "build.gradle.kts",

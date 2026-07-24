@@ -99,4 +99,38 @@ class SkillRegistryTest {
             )
         }
     }
+
+    @Test
+    fun `lists and edits skill text files while preserving metadata`() {
+        val runtime = Files.createTempDirectory("skill-editor").toFile()
+        val root = runtime.resolve("skills").apply { mkdirs() }
+        val skill = root.resolve("notes").apply { mkdirs() }
+        skill.resolve("SKILL.md").writeText("---\nname: Notes\ndescription: Note flow\n---\nOriginal body")
+        skill.resolve("references").mkdirs()
+        skill.resolve("references/guide.md").writeText("Old guide")
+        val modified = runtime.resolve("skills-user-modified")
+        val registry = SkillRegistry(root, runtime.resolve("disabled"), runtime.resolve("deleted"), modified)
+
+        assertEquals(listOf("SKILL.md", "references/guide.md"), registry.files("notes").map { it.relativePath })
+        registry.updateFile("notes", "references/guide.md", "New guide")
+        registry.updateMetadata("notes", "Updated Notes", "Updated description")
+
+        assertEquals("New guide", skill.resolve("references/guide.md").readText())
+        assertEquals("Updated Notes", registry.listAll().single().name)
+        assertTrue(skill.resolve("SKILL.md").readText().contains("Original body"))
+        assertTrue(modified.readText().contains("notes"))
+    }
+
+    @Test
+    fun `skill editor rejects paths outside skill root`() {
+        val runtime = Files.createTempDirectory("skill-editor-path").toFile()
+        val root = runtime.resolve("skills").apply { mkdirs() }
+        root.resolve("notes").apply { mkdirs() }.resolve("SKILL.md").writeText("# Notes")
+        runtime.resolve("secret.txt").writeText("secret")
+        val registry = SkillRegistry(root)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            registry.readFile("notes", "../secret.txt")
+        }
+    }
 }

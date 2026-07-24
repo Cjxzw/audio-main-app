@@ -11,6 +11,9 @@ import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Locale
 
 class WorkspaceRepository(context: Context) {
@@ -100,6 +103,18 @@ class WorkspaceRepository(context: Context) {
         return file.extension.lowercase(Locale.ROOT) in PREVIEW_EXTENSIONS && file.length() <= MAX_PREVIEW_BYTES
     }
 
+    fun canEdit(relativePath: String): Boolean {
+        val file = file(relativePath)
+        if (file.extension.lowercase(Locale.ROOT) !in EDITABLE_EXTENSIONS || file.length() > MAX_EDIT_BYTES) return false
+        return runCatching {
+            file.inputStream().use { input ->
+                val sample = ByteArray(4_096)
+                val count = input.read(sample)
+                count <= 0 || sample.take(count).none { it == 0.toByte() }
+            }
+        }.getOrDefault(false)
+    }
+
     fun readPreview(relativePath: String): String {
         val file = file(relativePath)
         require(file.length() <= MAX_PREVIEW_BYTES) { "文件超过 2 MB 预览限制" }
@@ -164,6 +179,35 @@ class WorkspaceRepository(context: Context) {
         return Metadata(name, size, appContext.contentResolver.getType(uri))
     }
 
+    fun readEditable(relativePath: String): String {
+        val file = file(relativePath)
+        require(canEdit(relativePath)) { "该文件不支持文本编辑" }
+        return file.readText(Charsets.UTF_8)
+    }
+
+    fun saveText(relativePath: String, content: String): Long {
+        val target = file(relativePath)
+        require(canEdit(relativePath)) { "该文件不支持文本编辑" }
+        require(content.toByteArray(Charsets.UTF_8).size <= MAX_EDIT_BYTES) { "文件超过编辑大小限制" }
+        val temporary = File(target.parentFile, ".${target.name}.editing")
+        try {
+            temporary.writeText(content, Charsets.UTF_8)
+            try {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } finally {
+            temporary.delete()
+        }
+        return target.lastModified()
+    }
+
     /**
      * Some older sharing apps still expose a raw file:// URI. On modern Android,
      * resolving its indexed MediaStore row gives us a permission-aware content URI.
@@ -213,7 +257,11 @@ class WorkspaceRepository(context: Context) {
     companion object {
         private const val MAX_IMPORT_BYTES = 50L * 1_024 * 1_024
         private const val MAX_PREVIEW_BYTES = 2L * 1_024 * 1_024
+        private const val MAX_EDIT_BYTES = 2L * 1_024 * 1_024
         private const val CAMERA_PENDING_PREFIX = ".camera-"
         private val PREVIEW_EXTENSIONS = setOf("txt", "log", "md", "markdown", "json", "xml", "csv", "html", "htm", "kt", "java", "py", "js", "ts", "sh")
+        private val EDITABLE_EXTENSIONS = PREVIEW_EXTENSIONS + setOf(
+            "yaml", "yml", "css", "properties", "toml", "ini",
+        )
     }
 }

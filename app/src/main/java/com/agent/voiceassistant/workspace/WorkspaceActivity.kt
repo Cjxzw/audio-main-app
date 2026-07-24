@@ -16,6 +16,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.databinding.ActivityWorkspaceBinding
+import com.agent.voiceassistant.editor.TextEditorActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.text.DateFormat
 import java.util.Date
@@ -63,6 +64,7 @@ class WorkspaceActivity : AppCompatActivity() {
         }
         val labels = buildList {
             if (repository.canPreview(entry.relativePath)) add(getString(R.string.workspace_preview))
+            if (repository.canEdit(entry.relativePath)) add(getString(R.string.workspace_edit))
             add(getString(R.string.workspace_open_external))
             add(getString(R.string.workspace_share))
         }
@@ -74,6 +76,9 @@ class WorkspaceActivity : AppCompatActivity() {
                     getString(R.string.workspace_preview) -> startActivity(
                         Intent(this, WorkspacePreviewActivity::class.java)
                             .putExtra(WorkspacePreviewActivity.EXTRA_PATH, entry.relativePath),
+                    )
+                    getString(R.string.workspace_edit) -> startActivity(
+                        TextEditorActivity.workspaceIntent(this, entry.relativePath),
                     )
                     getString(R.string.workspace_open_external) -> openExternal(entry)
                     getString(R.string.workspace_share) -> share(entry)

@@ -78,11 +78,19 @@
             android:exported="false" />
 
         <activity
+            android:name=".settings.SkillEditorActivity"
+            android:exported="false" />
+
+        <activity
             android:name=".workspace.WorkspaceActivity"
             android:exported="false" />
 
         <activity
             android:name=".workspace.WorkspacePreviewActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".editor.TextEditorActivity"
             android:exported="false" />
 
         <provider

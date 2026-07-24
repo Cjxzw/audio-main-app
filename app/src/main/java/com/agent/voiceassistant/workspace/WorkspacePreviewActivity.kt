@@ -12,6 +12,8 @@ import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.agent.voiceassistant.databinding.ActivityWorkspacePreviewBinding
+import com.agent.voiceassistant.editor.TextEditorActivity
+import com.agent.voiceassistant.R
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.tables.TablePlugin
 import java.io.FileInputStream
@@ -20,15 +22,30 @@ import java.util.Locale
 class WorkspacePreviewActivity : AppCompatActivity() {
     private lateinit var binding: ActivityWorkspacePreviewBinding
     private lateinit var repository: WorkspaceRepository
+    private lateinit var path: String
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityWorkspacePreviewBinding.inflate(layoutInflater)
         setContentView(binding.root)
         repository = WorkspaceRepository(this)
-        val path = intent.getStringExtra(EXTRA_PATH).orEmpty()
+        path = intent.getStringExtra(EXTRA_PATH).orEmpty()
         binding.workspacePreviewToolbar.setNavigationOnClickListener { finish() }
         binding.workspacePreviewToolbar.title = path.substringAfterLast('/')
+        binding.workspacePreviewToolbar.inflateMenu(R.menu.menu_workspace_preview)
+        binding.workspacePreviewToolbar.menu.findItem(R.id.action_edit_workspace_file).isVisible = repository.canEdit(path)
+        binding.workspacePreviewToolbar.setOnMenuItemClickListener { item ->
+            if (item.itemId == R.id.action_edit_workspace_file) {
+                startActivity(TextEditorActivity.workspaceIntent(this, path))
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
         runCatching { showPreview(path) }
             .onFailure {
                 Toast.makeText(this, it.message ?: "预览失败", Toast.LENGTH_LONG).show()
@@ -46,6 +63,10 @@ class WorkspacePreviewActivity : AppCompatActivity() {
             binding.workspaceWebPreview.loadUrl(url)
             return
         }
+
+        binding.workspaceWebPreview.stopLoading()
+        binding.workspaceWebPreview.visibility = View.GONE
+        binding.workspaceTextScroll.visibility = View.VISIBLE
 
         val text = repository.readPreview(path)
         if (extension == "md" || extension == "markdown") {

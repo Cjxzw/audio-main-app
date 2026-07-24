@@ -1,7 +1,9 @@
 package com.agent.voiceassistant.agent.runtime
 
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Locale
 
 class SkillRegistry(
@@ -22,6 +24,13 @@ class SkillRegistry(
     data class Registration(
         val skill: Skill,
         val compatibilityNotes: String,
+    )
+
+    data class SkillFile(
+        val relativePath: String,
+        val size: Long,
+        val modifiedAt: Long,
+        val editable: Boolean,
     )
 
     init {
@@ -84,10 +93,113 @@ class SkillRegistry(
         return loadSkill(root, current.enabled) ?: error("Skill 更新后无法解析")
     }
 
+    fun updateMetadata(id: String, name: String, description: String): Skill {
+        require(name.isNotBlank()) { "名称不能为空" }
+        require(description.isNotBlank()) { "简介不能为空" }
+        val current = requireSkill(id)
+        val root = skillRoot(current)
+        val core = File(root, "SKILL.md")
+        atomicWrite(core, renderSkill(name, description, stripFrontMatter(core.readText(Charsets.UTF_8))))
+        markModified(current.id)
+        return loadSkill(root, current.enabled) ?: error("Skill 更新后无法解析")
+    }
+
+    fun files(id: String): List<SkillFile> {
+        val root = skillRoot(requireSkill(id)).canonicalFile
+        return root.walkTopDown()
+            .filter(File::isFile)
+            .filterNot { Files.isSymbolicLink(it.toPath()) }
+            .map { file ->
+                SkillFile(
+                    relativePath = file.relativeTo(root).path.replace('\\', '/'),
+                    size = file.length(),
+                    modifiedAt = file.lastModified(),
+                    editable = isEditableText(file),
+                )
+            }
+            .sortedWith(compareBy<SkillFile>({ it.relativePath != "SKILL.md" }, { it.relativePath.lowercase(Locale.ROOT) }))
+            .toList()
+    }
+
+    fun readFile(id: String, relativePath: String): String {
+        val file = resolveSkillFile(id, relativePath)
+        require(isEditableText(file)) { "该文件不支持文本编辑" }
+        return file.readText(Charsets.UTF_8)
+    }
+
+    fun updateFile(id: String, relativePath: String, content: String): Long {
+        require(content.toByteArray(Charsets.UTF_8).size <= MAX_FILE_BYTES) { "文件超过编辑大小限制" }
+        val current = requireSkill(id)
+        val file = resolveSkillFile(current, relativePath)
+        require(isEditableText(file)) { "该文件不支持文本编辑" }
+        atomicWrite(file, content)
+        if (file.name == "SKILL.md") {
+            require(loadSkill(skillRoot(current), current.enabled) != null) { "SKILL.md 保存后无法解析" }
+        }
+        markModified(current.id)
+        return file.lastModified()
+    }
+
     fun coreBody(id: String): String {
         val current = listAll().firstOrNull { it.id == id } ?: error("Skill 不存在：$id")
         val root = File(if (current.enabled) skillsRoot else disabledSkillsRoot, current.id)
         return stripFrontMatter(File(root, "SKILL.md").readText(Charsets.UTF_8))
+    }
+
+    private fun requireSkill(id: String): Skill {
+        val safeId = requireSafeId(id)
+        return listAll().firstOrNull { it.id == safeId } ?: error("Skill 不存在：$safeId")
+    }
+
+    private fun skillRoot(skill: Skill): File =
+        File(if (skill.enabled) skillsRoot else disabledSkillsRoot, skill.id)
+
+    private fun resolveSkillFile(id: String, relativePath: String): File =
+        resolveSkillFile(requireSkill(id), relativePath)
+
+    private fun resolveSkillFile(skill: Skill, relativePath: String): File {
+        val normalized = relativePath.trim().replace('\\', '/').trimStart('/')
+        require(normalized.isNotBlank() && ".." !in normalized.split('/')) { "无效文件路径" }
+        val root = skillRoot(skill).canonicalFile
+        val target = File(root, normalized).canonicalFile
+        require(target.toPath().startsWith(root.toPath()) && target.isFile) { "Skill 文件不存在" }
+        require(!Files.isSymbolicLink(target.toPath())) { "不支持编辑符号链接" }
+        return target
+    }
+
+    private fun isEditableText(file: File): Boolean {
+        if (!file.isFile || file.length() > MAX_FILE_BYTES) return false
+        if (file.extension.lowercase(Locale.ROOT) !in EDITABLE_EXTENSIONS) return false
+        return runCatching {
+            file.inputStream().use { input ->
+                val sample = ByteArray(4_096)
+                val count = input.read(sample)
+                count <= 0 || sample.take(count).none { it == 0.toByte() }
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun atomicWrite(target: File, content: String) {
+        val temporary = File(target.parentFile, ".${target.name}.editing")
+        try {
+            temporary.writeText(content, Charsets.UTF_8)
+            try {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } finally {
+            temporary.delete()
+        }
+    }
+
+    private fun markModified(id: String) {
+        writeIds(modifiedManifest, readIds(modifiedManifest) + id)
     }
 
     fun unavailableReason(virtualPath: String): String? {
@@ -246,5 +358,9 @@ class SkillRegistry(
         const val MAX_CORE_BYTES = 256 * 1_024
         const val MAX_TOTAL_BYTES = 2 * 1_024 * 1_024L
         val SCRIPT_EXTENSIONS = setOf("py", "sh", "js", "ts", "jar", "class", "dex", "so", "exe", "bat", "cmd", "ps1")
+        val EDITABLE_EXTENSIONS = setOf(
+            "md", "markdown", "txt", "json", "xml", "yaml", "yml", "csv", "html", "htm",
+            "kt", "java", "js", "ts", "css", "properties", "toml", "ini",
+        )
     }
 }

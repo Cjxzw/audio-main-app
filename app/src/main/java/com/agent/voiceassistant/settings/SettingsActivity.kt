@@ -89,7 +89,7 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
             addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_context_assets)
                 summary = getString(R.string.settings_context_assets_summary)
-                setIcon(R.drawable.ic_tools_crossed_24)
+                setIcon(R.drawable.ic_brain_24)
                 setOnPreferenceClickListener {
                     startActivity(Intent(requireContext(), ContextAssetsActivity::class.java))
                     true
