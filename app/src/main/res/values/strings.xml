@@ -100,8 +100,8 @@
     <string name="settings_add_provider">添加供应商</string>
     <string name="settings_tts_gain">TTS 数字增益</string>
     <string name="settings_tts_gain_summary">当前 %1$d%%；蓝牙通话音量由系统控制</string>
-    <string name="settings_mute_text_replies">文本输入时不进行语音播报</string>
-    <string name="settings_mute_text_replies_summary">从输入框发送时只显示文字；语音对话仍正常播报</string>
+    <string name="settings_mute_text_replies">文本输入及主动汇报不进行语音播报</string>
+    <string name="settings_mute_text_replies_summary">文本消息只显示文字，后台任务完成时只发送通知；语音对话仍正常播报</string>
     <string name="provider_editor_title">供应商配置</string>
     <string name="provider_display_name">显示名称</string>
     <string name="provider_base_url">Base URL（填写到 /v1）</string>

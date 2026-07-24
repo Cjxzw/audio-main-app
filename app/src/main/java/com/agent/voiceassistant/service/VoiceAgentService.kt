@@ -473,8 +473,12 @@ class VoiceAgentService : Service() {
             .filter { it.conversationId == first.conversationId }
             .take(TASK_REPORT_BATCH_SIZE)
         val sameConversation = first.conversationId == store.currentConversationId
-        val external = if (dormant) AudioRouteManager(this).externalOutput().connected else false
+        val external = AudioRouteManager(this).externalOutput().connected
+        val capabilities = capabilityResolver.capabilities()
+        val audioReportsEnabled = !speechPreferences.muteTextReplies &&
+            capabilities.speechAvailable && capabilities.llmAvailable
         if (!dormant &&
+            audioReportsEnabled && external &&
             pending.any { it.priority == TaskPriority.URGENT.name } &&
             recorder?.isUserSpeaking() != true
         ) {
@@ -486,6 +490,7 @@ class VoiceAgentService : Service() {
                 sameConversation = sameConversation,
                 externalOutputConnected = external,
                 userSpeaking = recorder?.isUserSpeaking() == true,
+                audioReportsEnabled = audioReportsEnabled,
             )
         ) {
             TaskReportPolicy.Route.DEFER -> Unit
@@ -525,6 +530,7 @@ class VoiceAgentService : Service() {
 
     private suspend fun reportTasksByAudio(tasks: List<TaskEntity>, fromDormant: Boolean) {
         if (!fromDormant && recorder?.stopIfIdle() != true) return
+        var wakeAfterReport = false
         turnMutex.withLock {
             val wasActive = !dormant
             if (wasActive) {
@@ -543,16 +549,16 @@ class VoiceAgentService : Service() {
                 if (fromDormant) "dormant_external_audio" else "active_audio",
             )
             var finalText = ""
+            var reportCompleted = false
             try {
                 speechInterruptedForUrgentReport.set(false)
-                updateNotification("正在汇报任务...")
-                earcons.reporting()
+                updateNotification("正在准备任务汇报...")
                 val client = ensureSpeechClient() ?: error("MiMo 语音服务不可用")
                 val prompt = buildTaskReportPrompt(tasks)
                 val outcome = runAgentLoop(
                     llmClient = createLlmClient(),
-                    speechClient = client,
-                    speakReplies = true,
+                    speechClient = null,
+                    speakReplies = false,
                     messages = listOf(
                         CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()),
                         CloudSpeechClient.LlmMessage("user", prompt),
@@ -563,8 +569,12 @@ class VoiceAgentService : Service() {
                     toolsEnabled = false,
                 )
                 finalText = outcome.finalText
+                updateNotification("正在汇报任务...")
+                earcons.reporting()
+                speakAssistantText(client, optimizeSpokenReply(finalText))
                 tasks.mapNotNull(::taskOutputFile).forEach { playAudioFile(it) }
                 taskRepository.finishReport(action.reportActionId, "COMPLETED", finalText)
+                reportCompleted = true
             } catch (error: Throwable) {
                 taskRepository.finishReport(
                     action.reportActionId,
@@ -577,6 +587,8 @@ class VoiceAgentService : Service() {
                 if (fromDormant) {
                     routeManager?.release()
                     routeManager = null
+                    updateNotification("休眠中，等待唤醒")
+                    wakeAfterReport = reportCompleted
                 } else if (wasActive && !dormant) {
                     recorder = SimpleVadRecorder(routeManager)
                     loopJob = serviceScope.launch { runConversationLoop() }
@@ -584,6 +596,7 @@ class VoiceAgentService : Service() {
                 }
             }
         }
+        if (wakeAfterReport) wakeAgent()
     }
 
     private fun buildTaskReportPrompt(tasks: List<TaskEntity>): String = buildString {

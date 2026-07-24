@@ -8,7 +8,7 @@ class TaskReportPolicyTest {
     fun `active idle conversation reports through audio`() {
         assertEquals(
             TaskReportPolicy.Route.ACTIVE_AUDIO,
-            TaskReportPolicy.route(false, true, false, false),
+            TaskReportPolicy.route(false, true, true, false),
         )
     }
 
@@ -33,10 +33,32 @@ class TaskReportPolicyTest {
     }
 
     @Test
+    fun `active session without external output uses notification`() {
+        assertEquals(
+            TaskReportPolicy.Route.NOTIFICATION,
+            TaskReportPolicy.route(false, true, false, false),
+        )
+    }
+
+    @Test
     fun `different conversation is notification only`() {
         assertEquals(
             TaskReportPolicy.Route.NOTIFICATION,
             TaskReportPolicy.route(false, false, true, false),
+        )
+    }
+
+    @Test
+    fun `global speech opt out forces notification while active`() {
+        assertEquals(
+            TaskReportPolicy.Route.NOTIFICATION,
+            TaskReportPolicy.route(
+                dormant = false,
+                sameConversation = true,
+                externalOutputConnected = true,
+                userSpeaking = false,
+                audioReportsEnabled = false,
+            ),
         )
     }
 }

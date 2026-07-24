@@ -8,10 +8,12 @@ object TaskReportPolicy {
         sameConversation: Boolean,
         externalOutputConnected: Boolean,
         userSpeaking: Boolean,
+        audioReportsEnabled: Boolean = true,
     ): Route = when {
+        !audioReportsEnabled -> Route.NOTIFICATION
         !sameConversation -> Route.NOTIFICATION
+        !externalOutputConnected -> Route.NOTIFICATION
         dormant && externalOutputConnected -> Route.DORMANT_EXTERNAL_AUDIO
-        dormant -> Route.NOTIFICATION
         userSpeaking -> Route.DEFER
         else -> Route.ACTIVE_AUDIO
     }
