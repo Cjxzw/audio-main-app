@@ -3,7 +3,7 @@ package com.agent.voiceassistant.cloud
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
 
 class StreamingSpeechExtractor {
-    private enum class State { TEXT, REPLY, TAG, TOOL, CODE_FENCE, JSON_ONLY }
+    private enum class State { TEXT, REPLY, TAG, TOOL, CODE_FENCE, DISPLAY_DETAIL, MARKDOWN_TABLE }
 
     private var state = State.TEXT
     private var previousState = State.TEXT
@@ -14,15 +14,18 @@ class StreamingSpeechExtractor {
     private var codeReturnState = State.TEXT
     private var closingBackticks = 0
     private var sawFirstVisible = false
-    private var sawFencedDetails = false
+    private var shouldAnnounceDetails = false
     private var emittedVisibleText = false
+    private var atLineStart = true
+    private var tablePreviousWasNewline = false
 
     fun feed(delta: String): String {
         if (delta.isEmpty()) return ""
         val out = StringBuilder()
         for (ch in delta) {
             when (state) {
-                State.JSON_ONLY -> Unit
+                State.DISPLAY_DETAIL -> Unit
+                State.MARKDOWN_TABLE -> feedMarkdownTable(ch)
                 State.TOOL -> feedTool(ch)
                 State.CODE_FENCE -> feedCodeFence(ch)
                 State.TAG -> feedTag(ch, out)
@@ -43,13 +46,25 @@ class StreamingSpeechExtractor {
             tagBuffer.clear()
             state = previousState
         }
-        if (sawFencedDetails && emittedVisibleText) {
-            output.append(' ').append(SpokenReplyPolicy.DETAILS_NOTICE)
+        if (shouldAnnounceDetails) {
+            if (emittedVisibleText) output.append(' ')
+            output.append(SpokenReplyPolicy.DETAILS_NOTICE)
         }
         return output.toString()
     }
 
     private fun feedText(ch: Char, out: StringBuilder) {
+        if (atLineStart && ch == '|') {
+            state = State.MARKDOWN_TABLE
+            tablePreviousWasNewline = false
+            return
+        }
+        if (ch == '\n') {
+            atLineStart = true
+            appendVisible(out, ch.toString())
+            return
+        }
+        if (!ch.isWhitespace()) atLineStart = false
         if (ch == '*' || ch == '_') return
         if (ch == '`') {
             backtickBuffer.append(ch)
@@ -58,7 +73,7 @@ class StreamingSpeechExtractor {
                 state = State.CODE_FENCE
                 backtickBuffer.clear()
                 closingBackticks = 0
-                sawFencedDetails = true
+                shouldAnnounceDetails = true
             }
             return
         }
@@ -68,8 +83,8 @@ class StreamingSpeechExtractor {
         }
         if (!sawFirstVisible && !ch.isWhitespace()) {
             sawFirstVisible = true
-            if (ch == '{') {
-                state = State.JSON_ONLY
+            if (ch == '{' || ch == '[') {
+                state = State.DISPLAY_DETAIL
                 return
             }
         }
@@ -101,9 +116,12 @@ class StreamingSpeechExtractor {
             "<local_action>" -> enterTool("</local_action>")
             "<hub_action>" -> enterTool("</hub_action>")
             "<tool_call>" -> enterTool("</tool_call>")
+            "<detail>" -> enterDetail("</detail>")
+            "<details>" -> enterDetail("</details>")
             else -> when {
                 tag == "<function>" || tag.startsWith("<function=") -> enterTool("</function>")
                 tag == "<parameter>" || tag.startsWith("<parameter=") -> enterTool("</parameter>")
+                !emittedVisibleText && previousState == State.TEXT -> state = State.DISPLAY_DETAIL
                 else -> {
                     appendVisible(out, "<${tag.removePrefix("<").removeSuffix(">")}>")
                     state = previousState
@@ -118,6 +136,11 @@ class StreamingSpeechExtractor {
         state = State.TOOL
     }
 
+    private fun enterDetail(closingTag: String) {
+        shouldAnnounceDetails = true
+        enterTool(closingTag)
+    }
+
     private fun feedCodeFence(ch: Char) {
         if (ch == '`') {
             closingBackticks++
@@ -127,6 +150,20 @@ class StreamingSpeechExtractor {
             }
         } else {
             closingBackticks = 0
+        }
+    }
+
+    private fun feedMarkdownTable(ch: Char) {
+        if (ch == '\n') {
+            if (tablePreviousWasNewline) {
+                state = State.TEXT
+                atLineStart = true
+                tablePreviousWasNewline = false
+            } else {
+                tablePreviousWasNewline = true
+            }
+        } else if (!ch.isWhitespace()) {
+            tablePreviousWasNewline = false
         }
     }
 
@@ -145,6 +182,7 @@ class StreamingSpeechExtractor {
             toolTail.clear()
             toolClosingTag = ""
             state = State.TEXT
+            atLineStart = true
         }
     }
 

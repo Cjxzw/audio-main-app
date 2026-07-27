@@ -9,6 +9,9 @@ build/
 .idea/
 *.iml
 .vscode/
+.DS_Store
+__pycache__/
+*.pyc
 
 # Native libs（AAR 需手动下载放入）
 app/libs/
@@ -25,3 +28,5 @@ aar_tmp_classes/
 logs/
 *.log
 *.apk
+.ucg/
+graphify-out/

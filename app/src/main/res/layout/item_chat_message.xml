@@ -24,6 +24,7 @@
         android:background="@drawable/bubble_user"
         android:padding="12dp"
         android:maxWidth="280dp"
+        android:textIsSelectable="true"
         android:textSize="15sp"
         android:textColor="@color/white" />
 

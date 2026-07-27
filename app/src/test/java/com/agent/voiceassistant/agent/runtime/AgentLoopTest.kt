@@ -42,12 +42,65 @@ class AgentLoopTest {
             ),
         )
 
-        val outcome = AgentLoop(runtime).run(config())
+        val events = mutableListOf<AgentEvent>()
+        val outcome = AgentLoop(runtime, events::add).run(config())
 
         assertEquals(AgentLoop.Outcome.Completed("文件已经读完", true), outcome)
         assertEquals(listOf("call-1"), runtime.executedCalls)
         assertEquals("tool", runtime.requests[1].messages.last().role)
         assertEquals("call-1", runtime.requests[1].messages.last().toolCallId)
+        assertTrue(events.any { it is AgentEvent.ToolCallDetected && it.toolName == "read" })
+    }
+
+    @Test
+    fun `rejects malformed tool arguments without execution or persistence`() = runBlocking {
+        val malformed = CloudSpeechClient.ToolCall(
+            "call-bad",
+            "read",
+            "{\"path\":\"/source/a.kt\"",
+        )
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(malformed)),
+                    message(content = "工具参数有误，已改为直接说明"),
+                ),
+            ),
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("工具参数有误，已改为直接说明", true), outcome)
+        assertTrue(runtime.executedCalls.isEmpty())
+        assertTrue(events.any { it is AgentEvent.ToolCallRejected && it.toolCallId == "call-bad" })
+        assertTrue(
+            events.none {
+                it is AgentEvent.MessageFinished && it.message.toolCalls.any { call -> call.id == "call-bad" }
+            },
+        )
+        assertTrue(runtime.requests[1].messages.last().content!!.contains("工具参数不是合法的 JSON 对象"))
+    }
+
+    @Test
+    fun `returns unregistered tool as an error result without execution`() = runBlocking {
+        val unknown = CloudSpeechClient.ToolCall("call-unknown", "made_up_tool", "{}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(unknown)),
+                    message(content = "当前没有对应工具"),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("当前没有对应工具", true), outcome)
+        assertTrue(runtime.executedCalls.isEmpty())
+        assertEquals(listOf("call-unknown"), runtime.blockedCalls)
+        assertEquals("tool", runtime.requests[1].messages.last().role)
+        assertTrue(runtime.requests[1].messages.last().content!!.contains("工具未在本轮注册"))
     }
 
     @Test
@@ -68,6 +121,35 @@ class AgentLoopTest {
 
         assertEquals(listOf("call-1"), runtime.executedCalls)
         assertEquals(listOf("call-2"), runtime.blockedCalls)
+    }
+
+    @Test
+    fun `allows consecutive searches when the query changes`() = runBlocking {
+        val first = CloudSpeechClient.ToolCall(
+            "search-1",
+            "web_search",
+            "{\"query\":\"Hanwo Android voice assistant\"}",
+        )
+        val refined = CloudSpeechClient.ToolCall(
+            "search-2",
+            "web_search",
+            "{\"query\":\"Hanwo Android voice assistant official documentation\"}",
+        )
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(first)),
+                    message(toolCalls = listOf(refined)),
+                    message(content = "已根据更准确的结果完成核实"),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config(maxToolRounds = 3))
+
+        assertEquals(AgentLoop.Outcome.Completed("已根据更准确的结果完成核实", true), outcome)
+        assertEquals(listOf("search-1", "search-2"), runtime.executedCalls)
+        assertTrue(runtime.blockedCalls.isEmpty())
     }
 
     @Test
@@ -303,21 +385,37 @@ class AgentLoopTest {
     }
 
     @Test
-    fun `details only final response is repaired with speakable summary`() = runBlocking {
+    fun `details only markdown is accepted as display content`() = runBlocking {
         val runtime = FakeRuntime(
             responses = ArrayDeque(
                 listOf(
                     message(content = "```json\n{\"status\":\"ok\"}\n```"),
-                    message(content = "处理已经完成，详细数据请看手机。"),
                 ),
             ),
         )
 
         val outcome = AgentLoop(runtime).run(config())
 
-        assertEquals(AgentLoop.Outcome.Completed("处理已经完成，详细数据请看手机。", true), outcome)
-        assertEquals(2, runtime.requests.size)
-        assertTrue(runtime.requests.last().tools.isEmpty())
+        assertEquals(AgentLoop.Outcome.Completed("```json\n{\"status\":\"ok\"}\n```", true), outcome)
+        assertEquals(1, runtime.requests.size)
+    }
+
+    @Test
+    fun `ordinary json and arrays are accepted as text`() = runBlocking {
+        val jsonRuntime = FakeRuntime(
+            responses = ArrayDeque(listOf(message(content = "{\"status\":\"ok\"}"))),
+        )
+        val arrayRuntime = FakeRuntime(
+            responses = ArrayDeque(listOf(message(content = "[\"方案一\",\"方案二\"]"))),
+        )
+
+        val jsonOutcome = AgentLoop(jsonRuntime).run(config())
+        val arrayOutcome = AgentLoop(arrayRuntime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("{\"status\":\"ok\"}", true), jsonOutcome)
+        assertEquals(AgentLoop.Outcome.Completed("[\"方案一\",\"方案二\"]", true), arrayOutcome)
+        assertEquals(1, jsonRuntime.requests.size)
+        assertEquals(1, arrayRuntime.requests.size)
     }
 
     @Test
@@ -392,9 +490,18 @@ class AgentLoopTest {
         private val activeTools = AtomicInteger(0)
         val maxActiveTools = AtomicInteger(0)
 
-        override fun toolDefinitions(allowReasoningEscalation: Boolean) = listOf(
-            CloudSpeechClient.ToolDefinition("read", "read", buildJsonObject {}),
-        )
+        override fun toolDefinitions(allowReasoningEscalation: Boolean): List<CloudSpeechClient.ToolDefinition> {
+            val names = buildSet {
+                add("read")
+                add("web_search")
+                add("code_graph_search")
+                addAll(terminalToolNames)
+                if (allowReasoningEscalation) add("request_deep_reasoning")
+            }
+            return names.map { name ->
+                CloudSpeechClient.ToolDefinition(name, name, buildJsonObject {})
+            }
+        }
 
         override suspend fun modelTurn(
             request: CloudSpeechClient.ChatRequest,
@@ -404,6 +511,16 @@ class AgentLoopTest {
             requests += request
             val message = responses.removeFirst()
             message.content?.let { onStreamEvent(CloudSpeechClient.ChatStreamEvent.ContentDelta(it)) }
+            message.toolCalls.forEachIndexed { index, call ->
+                onStreamEvent(
+                    CloudSpeechClient.ChatStreamEvent.ToolCallDelta(
+                        index = index,
+                        id = call.id,
+                        name = call.name,
+                        argumentsDelta = call.arguments,
+                    ),
+                )
+            }
             return AgentLoop.ModelTurn(
                 CloudSpeechClient.ChatCompletion(message, "stop"),
                 streamedSpeech = message.content != null,
@@ -482,6 +599,7 @@ class AgentLoopTest {
         }
 
         override suspend fun finishAssistant(
+            turnId: String,
             message: CloudSpeechClient.LlmMessage,
             streamedSpeech: Boolean,
         ) = true

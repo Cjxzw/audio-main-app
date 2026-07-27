@@ -367,16 +367,10 @@ class AudioRouteManager(context: Context) {
             .getOrDefault(emptyList())
     }
 
-    private fun inputPriority(device: AudioDeviceInfo): Int = when (device.type) {
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 0
-        bleHeadsetType() -> 1
-        AudioDeviceInfo.TYPE_USB_HEADSET -> 2
-        AudioDeviceInfo.TYPE_WIRED_HEADSET -> 3
-        AudioDeviceInfo.TYPE_USB_DEVICE -> 4
-        AudioDeviceInfo.TYPE_USB_ACCESSORY -> 5
-        AudioDeviceInfo.TYPE_BUILTIN_MIC -> 50
-        else -> 40
-    }
+    private fun inputPriority(device: AudioDeviceInfo): Int = AudioInputRoutePolicy.priority(
+        device.type,
+        bleHeadsetType(),
+    )
 
     private fun outputPriority(device: AudioDeviceInfo): Int = when (device.type) {
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 0
@@ -436,5 +430,19 @@ class AudioRouteManager(context: Context) {
         private const val INPUT_ROUTE_TIMEOUT_MS = 1_500L
         private const val PHONE_INPUT_READY_TIMEOUT_MS = 800L
         private const val ROUTE_READY_POLL_MS = 100L
+    }
+}
+
+internal object AudioInputRoutePolicy {
+    fun priority(type: Int, bleHeadsetType: Int): Int = when (type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 0
+        bleHeadsetType -> 1
+        AudioDeviceInfo.TYPE_USB_HEADSET -> 2
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> 3
+        AudioDeviceInfo.TYPE_USB_DEVICE -> 4
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> 5
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> 50
+        AudioDeviceInfo.TYPE_TELEPHONY -> 60
+        else -> 40
     }
 }

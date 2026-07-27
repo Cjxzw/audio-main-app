@@ -82,6 +82,10 @@ class MainAgentHarnessTest {
         override fun toolDisplayName(toolName: String) = toolName
         override suspend fun executeTool(call: CloudSpeechClient.ToolCall): AgentLoop.ToolExecution = error("unused")
         override fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String) = error("unused")
-        override suspend fun finishAssistant(message: CloudSpeechClient.LlmMessage, streamedSpeech: Boolean) = true
+        override suspend fun finishAssistant(
+            turnId: String,
+            message: CloudSpeechClient.LlmMessage,
+            streamedSpeech: Boolean,
+        ) = true
     }
 }

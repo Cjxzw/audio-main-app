@@ -50,8 +50,14 @@ object SpokenReplyPolicy {
     }
 
     fun fallback(text: String): String {
-        val hasDetails = hasFencedDetails(text)
-        val cleaned = withoutFencedDetails(text)
+        val detailExtraction = ReplyDetailPolicy.stripDetails(text)
+        val hasCodeFence = hasFencedDetails(detailExtraction.speakableText)
+        val visible = withoutFencedDetails(detailExtraction.speakableText)
+        val withoutTables = removeMarkdownTables(visible)
+        if (isDisplayOnlyStructure(withoutTables)) {
+            return if (detailExtraction.hasMarkedDetails || hasCodeFence) DETAILS_NOTICE else ""
+        }
+        val cleaned = withoutTables
             .replace(url, "相关链接已放在聊天窗口里")
             .replace(technicalPath, "相关文件")
             .replace(markdownLink, "$1")
@@ -61,7 +67,36 @@ object SpokenReplyPolicy {
             .replace("`", "")
             .replace(Regex("\\s+"), " ")
             .trim()
-        if (cleaned.isBlank()) return ""
-        return if (hasDetails) "$cleaned $DETAILS_NOTICE" else cleaned
+        val shouldAnnounceDetails = detailExtraction.hasMarkedDetails || hasCodeFence
+        if (cleaned.isBlank()) return if (shouldAnnounceDetails) DETAILS_NOTICE else ""
+        return if (shouldAnnounceDetails) "$cleaned $DETAILS_NOTICE" else cleaned
     }
+
+    private fun isDisplayOnlyStructure(text: String): Boolean {
+        val trimmed = text.trimStart()
+        return trimmed.startsWith('{') ||
+            trimmed.startsWith('[') ||
+            Regex("^<[A-Za-z][^>]*>.*</[A-Za-z][^>]*>", RegexOption.DOT_MATCHES_ALL)
+                .containsMatchIn(trimmed)
+    }
+
+    private fun removeMarkdownTables(text: String): String {
+        val lines = text.lines()
+        val tableLines = mutableSetOf<Int>()
+        lines.forEachIndexed { index, line ->
+            if (!TABLE_SEPARATOR.matches(line)) return@forEachIndexed
+            if (index > 0 && lines[index - 1].contains('|')) tableLines += index - 1
+            tableLines += index
+            var cursor = index + 1
+            while (cursor < lines.size && lines[cursor].contains('|') && lines[cursor].isNotBlank()) {
+                tableLines += cursor
+                cursor += 1
+            }
+        }
+        return lines.filterIndexed { index, _ -> index !in tableLines }.joinToString("\n")
+    }
+
+    private val TABLE_SEPARATOR = Regex(
+        "^\\s*\\|?\\s*:?-{3,}:?\\s*(?:\\|\\s*:?-{3,}:?\\s*)+\\|?\\s*$",
+    )
 }

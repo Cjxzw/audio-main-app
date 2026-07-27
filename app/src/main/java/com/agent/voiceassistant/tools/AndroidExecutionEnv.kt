@@ -42,6 +42,7 @@ class AndroidExecutionEnv(
         val endLine: Int,
         val totalLines: Int,
         val truncated: Boolean,
+        val filterSummary: String? = null,
     )
 
     data class WriteResult(val path: String, val bytesWritten: Int, val mode: String)
@@ -84,6 +85,10 @@ class AndroidExecutionEnv(
         offset: Int? = null,
         limit: Int = DEFAULT_READ_LINES,
         tailLines: Int? = null,
+        logLevels: List<String> = emptyList(),
+        logTags: List<String> = emptyList(),
+        eventPrefixes: List<String> = emptyList(),
+        query: String? = null,
     ): ReadResult {
         offset?.let { require(it >= 1) { "offset 必须从 1 开始" } }
         require(limit in 1..MAX_READ_LINES) { "limit 必须在 1..$MAX_READ_LINES 之间" }
@@ -91,6 +96,11 @@ class AndroidExecutionEnv(
         require(offset == null || tailLines == null) { "offset 和 tail_lines 不能同时使用" }
         val normalizedPath = pathResolver.normalize(path)
         val file = pathResolver.resolve(path, write = false)
+        val hasLogFilters = logLevels.isNotEmpty() || logTags.isNotEmpty() ||
+            eventPrefixes.isNotEmpty() || !query.isNullOrBlank()
+        require(!hasLogFilters || normalizedPath.startsWith("/logs/")) {
+            "日志筛选参数只能用于 /logs 下的文件"
+        }
         require(file.exists()) { "路径不存在：$path" }
         if (file.isDirectory) {
             return readDirectory(normalizedPath, file, offset ?: 1, limit)
@@ -98,7 +108,12 @@ class AndroidExecutionEnv(
         require(file.length() <= MAX_READ_FILE_BYTES) { "文件过大，不能直接读取：$path" }
         val text = file.readText(Charsets.UTF_8)
         require(!text.contains('\u0000')) { "暂不支持读取二进制文件：$path" }
-        val lines = text.lines()
+        val sourceLines = text.lines()
+        val lines = if (hasLogFilters) {
+            LogFilterPolicy.filter(sourceLines, logLevels, logTags, eventPrefixes, query)
+        } else {
+            sourceLines
+        }
         val effectiveTail = tailLines ?: if (offset == null && normalizedPath.startsWith("/logs/")) limit else null
         val startLine = if (effectiveTail != null) {
             (lines.size - effectiveTail).coerceAtLeast(0) + 1
@@ -118,6 +133,17 @@ class AndroidExecutionEnv(
             endLine = endLine,
             totalLines = lines.size,
             truncated = startLine > 1 || endLine < lines.size || fullContent.length > content.length,
+            filterSummary = if (hasLogFilters) {
+                buildString {
+                    append("扫描 ${sourceLines.size} 行，筛选后 ${lines.size} 行")
+                    if (logLevels.isNotEmpty()) append("；级别=${logLevels.joinToString(",")}")
+                    if (logTags.isNotEmpty()) append("；标签=${logTags.joinToString(",")}")
+                    if (eventPrefixes.isNotEmpty()) append("；事件=${eventPrefixes.joinToString(",")}")
+                    query?.takeIf(String::isNotBlank)?.let { append("；关键词=$it") }
+                }
+            } else {
+                null
+            },
         )
     }
 
@@ -396,6 +422,59 @@ class AndroidExecutionEnv(
         private const val MAX_HTTP_ATTEMPTS = 2
         private val HTTP_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
     }
+}
+
+internal object LogFilterPolicy {
+    private val header = Regex("^\\d{2}:\\d{2}:\\d{2}\\.\\d{3}\\s+([VDIWE?])/([^:]+):\\s?(.*)$")
+
+    fun filter(
+        lines: List<String>,
+        levels: List<String>,
+        tags: List<String>,
+        eventPrefixes: List<String>,
+        query: String?,
+    ): List<String> {
+        val acceptedLevels = levels.map { it.trim().uppercase() }.filter(String::isNotBlank).toSet()
+        val acceptedTags = tags.map(::normalizeTag).filter(String::isNotBlank).toSet()
+        val prefixes = eventPrefixes.map { it.trim().lowercase() }.filter(String::isNotBlank)
+        val needle = query?.trim()?.lowercase()?.takeIf(String::isNotBlank)
+        return entries(lines).filter { entry ->
+            (acceptedLevels.isEmpty() || entry.level in acceptedLevels) &&
+                (acceptedTags.isEmpty() || normalizeTag(entry.tag) in acceptedTags) &&
+                (prefixes.isEmpty() || prefixes.any { entry.message.lowercase().startsWith(it) }) &&
+                (needle == null || entry.lines.any { it.lowercase().contains(needle) })
+        }.flatMap(LogEntry::lines)
+    }
+
+    private fun entries(lines: List<String>): List<LogEntry> {
+        val entries = mutableListOf<LogEntry>()
+        var current: LogEntry? = null
+        lines.forEach { line ->
+            val match = header.matchEntire(line)
+            if (match != null) {
+                current?.let(entries::add)
+                current = LogEntry(
+                    level = match.groupValues[1],
+                    tag = match.groupValues[2],
+                    message = match.groupValues[3],
+                    lines = mutableListOf(line),
+                )
+            } else if (current != null) {
+                current?.lines?.add(line)
+            }
+        }
+        current?.let(entries::add)
+        return entries
+    }
+
+    private fun normalizeTag(value: String): String = value.trim().uppercase().removePrefix("VA_")
+
+    private data class LogEntry(
+        val level: String,
+        val tag: String,
+        val message: String,
+        val lines: MutableList<String>,
+    )
 }
 
 class CredentialProfileStore(context: Context) {

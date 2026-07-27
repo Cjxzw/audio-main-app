@@ -50,4 +50,11 @@ class StructuredOutputParserTest {
 
         assertFalse(StructuredOutputParser.containsToolProtocol(raw))
     }
+
+    @Test
+    fun `details boundary is display metadata not a tool request`() {
+        val raw = "<DETAILS>\n## 详情\n```json\n{\"status\":\"ok\"}\n```\n</DETAILS>"
+
+        assertFalse(StructuredOutputParser.containsToolProtocol(raw))
+    }
 }

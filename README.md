@@ -83,6 +83,18 @@ adb devices
 adb install -r app\build\outputs\apk\debug\hanwo-debug-0.1.0.apk
 ```
 
+## Agent 调试 CLI
+
+Debug APK 提供仅限 ADB shell 调用的 Agent 调试入口。配置、会话和真实 Agent 回合可以通过结构化 CLI 操作，不需要依赖坐标点击：
+
+```bash
+./tools/hanwo-dev status
+./tools/hanwo-dev config show
+./tools/hanwo-dev turn run "查询今天的重要新闻"
+```
+
+Key 必须通过 stdin 写入，不能放在命令参数中。完整命令和安全边界见 [Agent 调试 CLI](docs/agent-debug-cli.md)。Release APK 不包含该调试入口。
+
 ## 使用
 
 1. 打开 App。

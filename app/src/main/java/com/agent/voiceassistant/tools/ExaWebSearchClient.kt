@@ -136,8 +136,8 @@ class ExaWebSearchClient {
         private const val EXA_URL = "https://mcp.exa.ai/mcp"
         private const val CONNECT_TIMEOUT_SECONDS = 3L
         private const val SEARCH_TIMEOUT_SECONDS = 8L
-        private const val DEFAULT_LIMIT = 5
-        private const val MAX_RESULTS = 5
+        private const val DEFAULT_LIMIT = 8
+        private const val MAX_RESULTS = 10
         private const val MAX_SUMMARY_CHARS = 600
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val JSON = Json { ignoreUnknownKeys = true; isLenient = true }

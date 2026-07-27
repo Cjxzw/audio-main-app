@@ -42,6 +42,20 @@ sealed interface AgentEvent {
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
+    data class ToolCallDetected(
+        override val turnId: String,
+        val toolName: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ToolCallRejected(
+        override val turnId: String,
+        val toolCallId: String,
+        val toolName: String,
+        val reason: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
     data class ReasoningDelta(
         override val turnId: String,
         val text: String,

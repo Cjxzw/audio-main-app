@@ -359,17 +359,17 @@ class MainToolRegistry(
 
     private fun webSearch() = tool(
         name = TOOL_WEB_SEARCH,
-        description = "搜索实时公开网络信息。用于近期变化、新闻、产品资料和需要核实的公开事实；禁止在查询词中加入私人信息。",
+        description = "搜索并核实公开网络信息。用于近期变化、新闻、产品资料，以及模型不知道、记忆模糊、把握不足、资料冷门或来源可能冲突的客观事实。得到结果后必须评估相关性、覆盖度、来源可靠性、时效和冲突；优先一手来源，关键事实尽量由两个独立可靠来源交叉验证。结果不足或噪声大时，使用实质不同且限定更准确的查询再次搜索，不要直接回答不知道，也不要机械重复。禁止在查询中加入私人信息。",
         required = listOf("query"),
     ) {
         putJsonObject("query") {
             put("type", "string")
-            put("description", "包含必要时间范围的准确搜索词")
+            put("description", "语义完整的自然语言查询：描述要找的事实或理想页面，并包含必要的实体、领域、地区和时间范围；不要只堆砌宽泛关键词")
         }
         putJsonObject("limit") {
             put("type", "integer")
             put("minimum", 1)
-            put("maximum", 5)
+            put("maximum", 10)
         }
     }
 
@@ -493,6 +493,28 @@ class MainToolRegistry(
             put("minimum", 1)
             put("maximum", 1000)
             put("description", "从文件末尾读取的行数，不能与 offset 同时使用；查看日志时优先使用")
+        }
+        putJsonObject("log_levels") {
+            put("type", "array")
+            put("description", "仅用于 /logs，按级别筛选；可选 V、D、I、W、E")
+            put("items", buildJsonObject {
+                put("type", "string")
+                put("enum", buildJsonArray { listOf("V", "D", "I", "W", "E").forEach { add(JsonPrimitive(it)) } })
+            })
+        }
+        putJsonObject("log_tags") {
+            put("type", "array")
+            put("description", "仅用于 /logs，按分类标签筛选，例如 AGENT、TOOL、LLM、ASR、TTS、AUDIO、TASK、NETWORK、UI；VA_ 前缀可省略")
+            put("items", buildJsonObject { put("type", "string") })
+        }
+        putJsonObject("event_prefixes") {
+            put("type", "array")
+            put("description", "仅用于 /logs，按事件名前缀筛选，例如 audio.route、agent.tool")
+            put("items", buildJsonObject { put("type", "string") })
+        }
+        putJsonObject("query") {
+            put("type", "string")
+            put("description", "仅用于 /logs，在完整日志条目中进行不区分大小写的关键词筛选")
         }
     }
 

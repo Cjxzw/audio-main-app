@@ -10,27 +10,26 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
-import android.os.CancellationSignal
 import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.data.StoredLocation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 import java.util.Locale
-import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class LocationProvider(
     private val context: Context,
@@ -41,6 +40,9 @@ class LocationProvider(
         IDLE,
         REQUESTING,
         COOLDOWN,
+        PERMISSION_REQUIRED,
+        PROVIDER_UNAVAILABLE,
+        EMPTY_RESULT,
         TIMEOUT,
         FAILED,
     }
@@ -75,6 +77,24 @@ class LocationProvider(
             val cached = store.lastLocation()
             val now = System.currentTimeMillis()
             refreshJob?.let { if (it.isActive) return snapshotLocked(cached) }
+
+            val preflight = preflightFailure()
+            if (preflight != null) {
+                refreshStartedAt = now
+                refreshCompletedAt = now
+                refreshError = preflight.second
+                refreshState = preflight.first
+                retryAfterAt = now + FAILURE_RETRY_COOLDOWN_MS
+                Timber.i(
+                    "Location refresh skipped reason=$reason state=$refreshState error=$refreshError",
+                )
+                return snapshotLocked(cached)
+            }
+            if (refreshState == RefreshState.PERMISSION_REQUIRED ||
+                refreshState == RefreshState.PROVIDER_UNAVAILABLE
+            ) {
+                retryAfterAt = null
+            }
 
             val nextRefreshAt = cached?.timestamp?.plus(SUCCESS_COOLDOWN_MS)
             val failureRetryAt = retryAfterAt
@@ -112,7 +132,11 @@ class LocationProvider(
                             retryAfterAt = System.currentTimeMillis() + FAILURE_RETRY_COOLDOWN_MS
                             RefreshState.FAILED
                         }
-                        else -> RefreshState.FAILED
+                        else -> {
+                            refreshError = "定位服务未返回位置"
+                            retryAfterAt = System.currentTimeMillis() + FAILURE_RETRY_COOLDOWN_MS
+                            RefreshState.EMPTY_RESULT
+                        }
                     }
                     refreshJob = null
                     Timber.i(
@@ -248,52 +272,31 @@ class LocationProvider(
         return if (hasEnabledProvider) null else "系统定位开关未开启，或没有可用定位提供器。"
     }
 
+    private fun preflightFailure(): Pair<RefreshState, String>? {
+        if (!hasLocationPermission()) {
+            return RefreshState.PERMISSION_REQUIRED to "应用尚未获得定位权限"
+        }
+        val manager = context.getSystemService(LocationManager::class.java)
+        val hasEnabledProvider = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+            .any { provider -> runCatching { manager.isProviderEnabled(provider) }.getOrDefault(false) }
+        return if (hasEnabledProvider) null else {
+            RefreshState.PROVIDER_UNAVAILABLE to "系统定位开关未开启或 Provider 尚未就绪"
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private suspend fun requestBestFreshLocation(
         manager: LocationManager,
         providers: List<String>,
         timeoutMs: Long,
-    ): Location? = coroutineScope {
-        val pending = providers.map { provider ->
-            async {
-                runCatching { requestFreshLocation(manager, provider) }.getOrNull()
-            }
-        }.toMutableList()
-        try {
-            withTimeoutOrNull(timeoutMs) {
-                while (pending.isNotEmpty()) {
-                    val (completed, location) = select {
-                        pending.forEach { request ->
-                            request.onAwait { request to it }
-                        }
-                    }
-                    pending.remove(completed)
-                    if (location != null) return@withTimeoutOrNull location
-                }
-                null
-            }
-        } finally {
-            pending.forEach { it.cancel() }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private suspend fun requestFreshLocation(
-        manager: LocationManager,
-        provider: String,
     ): Location? = suspendCancellableCoroutine { cont ->
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val signal = CancellationSignal()
-            val executor = Executor { command -> command.run() }
-            manager.getCurrentLocation(provider, signal, executor) { location ->
-                if (cont.isActive) cont.resume(location)
-            }
-            cont.invokeOnCancellation { signal.cancel() }
-            return@suspendCancellableCoroutine
-        }
-
+        val timeout = LOCATION_TIMEOUT_EXECUTOR.schedule({
+            if (cont.isActive) cont.resumeWithException(LocationTimeoutException())
+        }, timeoutMs, TimeUnit.MILLISECONDS)
+        val remainingProviders = AtomicInteger(providers.size)
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
+                timeout.cancel(false)
                 manager.removeUpdates(this)
                 if (cont.isActive) cont.resume(location)
             }
@@ -303,12 +306,25 @@ class LocationProvider(
 
             override fun onProviderEnabled(provider: String) = Unit
             override fun onProviderDisabled(provider: String) {
-                manager.removeUpdates(this)
-                if (cont.isActive) cont.resume(null)
+                if (remainingProviders.decrementAndGet() == 0 && cont.isActive) {
+                    timeout.cancel(false)
+                    manager.removeUpdates(this)
+                    cont.resume(null)
+                }
             }
         }
-        manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
-        cont.invokeOnCancellation { manager.removeUpdates(listener) }
+        providers.forEach { provider ->
+            runCatching {
+                manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            }.onFailure {
+                if (remainingProviders.decrementAndGet() == 0 && cont.isActive) {
+                    timeout.cancel(false)
+                    manager.removeUpdates(listener)
+                    cont.resume(null)
+                }
+            }
+        }
+        cont.invokeOnCancellation { timeout.cancel(false) }
     }
 
     private fun Location.toStoredLocation(): StoredLocation {
@@ -339,5 +355,8 @@ class LocationProvider(
         private const val FAILURE_RETRY_COOLDOWN_MS = 30 * 1000L
         private const val REVERSE_GEOCODE_TIMEOUT_MS = 3_000L
         private const val MAX_FORCE_FRESH_FALLBACK_AGE_MS = 2 * 60 * 1000L
+        private val LOCATION_TIMEOUT_EXECUTOR = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "location-timeout").apply { isDaemon = true }
+        }
     }
 }

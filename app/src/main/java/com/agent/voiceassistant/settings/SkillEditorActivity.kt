@@ -28,6 +28,7 @@ class SkillEditorActivity : AppCompatActivity() {
     private lateinit var skills: SkillRegistry
     private lateinit var skillId: String
     private lateinit var adapter: SkillFileAdapter
+    private var creating = false
     private var savedName = ""
     private var savedDescription = ""
     private var loaded = false
@@ -36,13 +37,19 @@ class SkillEditorActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivitySkillEditorBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        skillId = intent.getStringExtra(EXTRA_SKILL_ID)?.takeIf(String::isNotBlank)
-            ?: return fail("缺少 Skill ID")
+        creating = intent.getBooleanExtra(EXTRA_CREATE, false)
+        skillId = intent.getStringExtra(EXTRA_SKILL_ID).orEmpty()
+        if (!creating && skillId.isBlank()) return fail("缺少 Skill ID")
         val env = AndroidExecutionEnv(this)
         skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest)
         adapter = SkillFileAdapter(::openFile)
         binding.skillFilesList.layoutManager = LinearLayoutManager(this)
         binding.skillFilesList.adapter = adapter
+        binding.skillEditorToolbar.title = if (creating) {
+            getString(R.string.context_assets_add_skill)
+        } else {
+            getString(R.string.context_asset_edit_skill)
+        }
 
         binding.skillEditorToolbar.inflateMenu(R.menu.menu_text_editor)
         binding.skillEditorToolbar.setNavigationOnClickListener { leaveEditor() }
@@ -63,6 +70,11 @@ class SkillEditorActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (creating) {
+            adapter.submit(emptyList())
+            updateSaveState()
+            return
+        }
         reload(reloadMetadata = !loaded || !isDirty())
         loaded = true
     }
@@ -85,12 +97,18 @@ class SkillEditorActivity : AppCompatActivity() {
     private fun saveMetadata() {
         val name = binding.skillNameInput.text?.toString().orEmpty().trim()
         val description = binding.skillDescriptionInput.text?.toString().orEmpty().trim()
-        runCatching { skills.updateMetadata(skillId, name, description) }
+        runCatching {
+            if (creating) skills.create(name, description) else skills.updateMetadata(skillId, name, description)
+        }
             .onSuccess {
+                skillId = it.id
+                creating = false
                 savedName = it.name
                 savedDescription = it.description
                 binding.skillNameInput.setText(savedName)
                 binding.skillDescriptionInput.setText(savedDescription)
+                binding.skillEditorToolbar.title = getString(R.string.context_asset_edit_skill)
+                reload(reloadMetadata = true)
                 updateSaveState()
                 Toast.makeText(this, R.string.text_editor_saved, Toast.LENGTH_SHORT).show()
             }
@@ -133,9 +151,13 @@ class SkillEditorActivity : AppCompatActivity() {
 
     companion object {
         private const val EXTRA_SKILL_ID = "skill_id"
+        private const val EXTRA_CREATE = "create_skill"
 
         fun intent(context: Context, skillId: String) = Intent(context, SkillEditorActivity::class.java)
             .putExtra(EXTRA_SKILL_ID, skillId)
+
+        fun newIntent(context: Context) = Intent(context, SkillEditorActivity::class.java)
+            .putExtra(EXTRA_CREATE, true)
     }
 }
 

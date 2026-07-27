@@ -8,16 +8,19 @@ import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
+import com.agent.voiceassistant.agent.ReplyDetailPolicy
 import com.agent.voiceassistant.ui.ChatRole.BOT
 import com.agent.voiceassistant.ui.ChatRole.SYSTEM
 import com.agent.voiceassistant.ui.ChatRole.USER
-import timber.log.Timber
+import io.noties.markwon.Markwon
+import io.noties.markwon.ext.tables.TablePlugin
 import kotlin.math.roundToInt
 
 class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
 
     private val messages = mutableListOf<ChatMessage>()
     private val maxMessages = 500
+    private var markwon: Markwon? = null
 
     fun setMessages(items: List<ChatMessage>) {
         messages.clear()
@@ -25,13 +28,21 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         notifyDataSetChanged()
     }
 
-    fun addMessage(msg: ChatMessage) {
+    fun addMessage(msg: ChatMessage): Boolean {
+        if (!msg.messageId.isNullOrBlank()) {
+            val existing = messages.indexOfFirst { it.messageId == msg.messageId }
+            if (existing >= 0) {
+                messages[existing] = msg
+                notifyItemChanged(existing, PAYLOAD_TEXT)
+                return false
+            }
+        }
         if (!msg.toolCallId.isNullOrBlank()) {
             val existing = messages.indexOfFirst { it.toolCallId == msg.toolCallId }
             if (existing >= 0) {
                 messages[existing] = msg
                 notifyItemChanged(existing)
-                return
+                return false
             }
         }
         messages.add(msg)
@@ -40,19 +51,39 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             notifyItemRemoved(0)
         }
         notifyItemInserted(messages.size - 1)
+        return true
+    }
+
+    fun removeMessage(messageId: String) {
+        val index = messages.indexOfFirst { it.messageId == messageId }
+        if (index < 0) return
+        messages.removeAt(index)
+        notifyItemRemoved(index)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val v = LayoutInflater.from(parent.context)
             .inflate(R.layout.item_chat_message, parent, false)
-        return VH(v)
+        val markdownRenderer = markwon ?: Markwon.builder(parent.context.applicationContext)
+            .usePlugin(TablePlugin.create(parent.context.applicationContext))
+            .build()
+            .also { markwon = it }
+        return VH(v, markdownRenderer)
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) = holder.bind(messages[position])
 
+    override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
+        if (payloads.contains(PAYLOAD_TEXT)) {
+            holder.bindStreamingText(messages[position])
+        } else {
+            holder.bind(messages[position])
+        }
+    }
+
     override fun getItemCount() = messages.size
 
-    class VH(view: View) : RecyclerView.ViewHolder(view) {
+    class VH(view: View, private val markwon: Markwon) : RecyclerView.ViewHolder(view) {
         private val llBubble = view.findViewById<LinearLayout>(R.id.llBubble)
         private val tvRole = view.findViewById<TextView>(R.id.tvRole)
         private val tvText = view.findViewById<TextView>(R.id.tvText)
@@ -96,7 +127,11 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                 }
                 BOT -> {
                     llBubble.gravity = android.view.Gravity.START
-                    tvRole.text = ctx.getString(R.string.chat_role_bot)
+                    tvRole.text = when (msg.streamState) {
+                        ChatStreamState.STREAMING -> ctx.getString(R.string.chat_role_bot_streaming)
+                        ChatStreamState.INTERRUPTED -> ctx.getString(R.string.chat_role_bot_interrupted)
+                        else -> ctx.getString(R.string.chat_role_bot)
+                    }
                     tvText.background = ContextCompat.getDrawable(
                         ctx,
                         if (msg.presentation == ChatPresentation.PERSONALIZED_VOICE) {
@@ -114,8 +149,26 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                     tvText.setTextColor(ContextCompat.getColor(ctx, android.R.color.white))
                 }
             }
-            tvText.text = msg.text
+            bindText(msg)
             tvTime.text = msg.timeStr
+        }
+
+        fun bindStreamingText(msg: ChatMessage) {
+            bindText(msg)
+            tvRole.text = when (msg.streamState) {
+                ChatStreamState.STREAMING -> itemView.context.getString(R.string.chat_role_bot_streaming)
+                ChatStreamState.INTERRUPTED -> itemView.context.getString(R.string.chat_role_bot_interrupted)
+                else -> itemView.context.getString(R.string.chat_role_bot)
+            }
+            tvTime.text = msg.timeStr
+        }
+
+        private fun bindText(msg: ChatMessage) {
+            if (msg.role == BOT) {
+                markwon.setMarkdown(tvText, ReplyDetailPolicy.forDisplay(msg.text))
+            } else {
+                tvText.text = msg.text
+            }
         }
 
         private fun inferToolStatus(text: String): ToolDisplayStatus = when {
@@ -123,5 +176,9 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             text.trimEnd().endsWith("❌") -> ToolDisplayStatus.FAILED
             else -> ToolDisplayStatus.RUNNING
         }
+    }
+
+    private companion object {
+        const val PAYLOAD_TEXT = "chat_text"
     }
 }

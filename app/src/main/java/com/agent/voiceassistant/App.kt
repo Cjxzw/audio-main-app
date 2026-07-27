@@ -84,7 +84,7 @@ class App : Application() {
                 append(" ")
                 append(level)
                 append("/")
-                append(tag ?: "?")
+                append(tag ?: inferTag(message))
                 append(": ")
                 append(message)
                 if (t != null) {
@@ -98,6 +98,25 @@ class App : Application() {
                     rotateIfNeeded(line.toByteArray().size)
                     FileWriter(file, true).use { it.write(line) }
                 } catch (_: Exception) {}
+            }
+        }
+
+        private fun inferTag(message: String): String {
+            val normalized = message.trimStart()
+            return when {
+                normalized.startsWith("Latency LLM") || normalized.startsWith("LLM") -> "VA_LLM"
+                normalized.startsWith("Latency TTS") || normalized.startsWith("TTS") -> "VA_TTS"
+                normalized.startsWith("Cloud ASR") || normalized.startsWith("CloudRecorder") ||
+                    normalized.startsWith("SimpleVad") -> "VA_ASR"
+                normalized.startsWith("Audio") || normalized.startsWith("Earcon") ||
+                    normalized.startsWith("MediaPlayer") -> "VA_AUDIO"
+                normalized.startsWith("LocalToolExecutor") || normalized.startsWith("调用工具") ||
+                    normalized.startsWith("工具结果") -> "VA_TOOL"
+                normalized.startsWith("SongTask") || normalized.startsWith("Task") -> "VA_TASK"
+                normalized.startsWith("Location") -> "VA_LOCATION"
+                normalized.startsWith("Network") || normalized.startsWith("HTTP") -> "VA_NETWORK"
+                normalized.startsWith("UI") || normalized.startsWith("LogBus") -> "VA_UI"
+                else -> "VA_APP"
             }
         }
 

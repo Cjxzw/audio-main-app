@@ -133,4 +133,23 @@ class SkillRegistryTest {
             registry.readFile("notes", "../secret.txt")
         }
     }
+
+    @Test
+    fun `creates a standard editable single file skill`() {
+        val runtime = Files.createTempDirectory("skill-create").toFile()
+        val modified = runtime.resolve("skills-user-modified")
+        val registry = SkillRegistry(
+            runtime.resolve("skills"),
+            runtime.resolve("disabled"),
+            runtime.resolve("deleted"),
+            modified,
+        )
+
+        val skill = registry.create("案件复盘", "按步骤复盘案件")
+
+        assertEquals("案件复盘", skill.name)
+        assertEquals(listOf("SKILL.md"), registry.files(skill.id).map { it.relativePath })
+        assertTrue(registry.coreBody(skill.id).contains("适用场景"))
+        assertTrue(modified.readText().contains(skill.id))
+    }
 }

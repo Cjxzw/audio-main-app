@@ -22,9 +22,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
 import androidx.core.view.GravityCompat
 import androidx.appcompat.widget.TooltipCompat
+import androidx.core.view.doOnNextLayout
 import androidx.lifecycle.lifecycleScope
-import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.data.ConversationSummary
 import com.agent.voiceassistant.databinding.ActivityMainBinding
@@ -68,6 +69,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingCameraFile: File? = null
     private var agentListening = false
     private var pendingLegacyShareUris: List<Uri> = emptyList()
+    private var chatTailFollowPending = false
+    private var chatTailFollowEnabled = true
 
     private val filePicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         importUris(uris)
@@ -150,7 +153,18 @@ class MainActivity : AppCompatActivity() {
                 stackFromEnd = true
             }
             adapter = chatAdapter
-            itemAnimator = DefaultItemAnimator().apply { addDuration = 150 }
+            // A streamed message changes many times per second; per-item animations make it jump.
+            itemAnimator = null
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                    when (newState) {
+                        RecyclerView.SCROLL_STATE_DRAGGING -> chatTailFollowEnabled = false
+                        RecyclerView.SCROLL_STATE_IDLE -> if (!chatTailFollowPending) {
+                            chatTailFollowEnabled = !recyclerView.canScrollVertically(1)
+                        }
+                    }
+                }
+            })
         }
         taskAdapter = TaskAdapter(
             onOpen = ::showTaskDetails,
@@ -405,10 +419,15 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             EventBus.chatMessages.collectLatest { msg ->
-                chatAdapter.addMessage(msg)
-                homeBinding.rvChat.scrollToPosition(chatAdapter.itemCount - 1)
-                refreshConversations()
+                val inserted = chatAdapter.addMessage(msg)
+                if (chatTailFollowEnabled) scheduleChatTailFollow()
+                if (inserted) refreshConversations()
                 Timber.d("UI chat: [${msg.role}] ${msg.text}")
+            }
+        }
+        lifecycleScope.launch {
+            EventBus.chatRemovals.collectLatest { messageId ->
+                chatAdapter.removeMessage(messageId)
             }
         }
         lifecycleScope.launch {
@@ -426,12 +445,36 @@ class MainActivity : AppCompatActivity() {
             }
         }
         lifecycleScope.launch {
+            EventBus.conversationBusy.collectLatest { busy ->
+                binding.btnNewConversation.isEnabled = !busy
+            }
+        }
+        lifecycleScope.launch {
             EventBus.userNotices.collectLatest(::showMessage)
         }
         lifecycleScope.launch {
             EventBus.volumeEvents.collectLatest { level ->
                 homeBinding.inputVoiceBar.setLevel(level)
             }
+        }
+    }
+
+    private fun scheduleChatTailFollow() {
+        if (chatTailFollowPending || chatAdapter.itemCount == 0) return
+        chatTailFollowPending = true
+        homeBinding.rvChat.doOnNextLayout {
+            chatTailFollowPending = false
+            if (!chatTailFollowEnabled) return@doOnNextLayout
+            val recyclerView = homeBinding.rvChat
+            val layoutManager = recyclerView.layoutManager as? LinearLayoutManager ?: return@doOnNextLayout
+            val lastPosition = chatAdapter.itemCount - 1
+            val lastView = layoutManager.findViewByPosition(lastPosition)
+            if (lastView == null) {
+                recyclerView.scrollToPosition(lastPosition)
+                return@doOnNextLayout
+            }
+            val overflow = lastView.bottom - (recyclerView.height - recyclerView.paddingBottom)
+            if (overflow > 0) recyclerView.scrollBy(0, overflow)
         }
     }
 

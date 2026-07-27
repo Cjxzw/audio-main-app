@@ -40,6 +40,11 @@ interface LlmClient {
     fun close() = Unit
 }
 
+internal class LlmHttpException(
+    val statusCode: Int,
+    val responseBody: String,
+) : IOException("LLM HTTP $statusCode: ${responseBody.take(500)}")
+
 class OpenAiCompatibleLlmClient(
     private val config: LLMConfig,
 ) : LlmClient {
@@ -78,7 +83,7 @@ class OpenAiCompatibleLlmClient(
                 call.execute().use { response ->
                     val body = response.body?.string().orEmpty()
                     if (!response.isSuccessful) {
-                        throw IOException("LLM models HTTP ${response.code}: ${body.take(500)}")
+                        throw LlmHttpException(response.code, body)
                     }
                     summarizeModelsResponse(body)
                 }
@@ -128,7 +133,10 @@ class OpenAiCompatibleLlmClient(
             put("temperature", config.temperature)
         }
         putJsonArray("messages") {
-            request.messages.forEach { message -> add(message.toJson()) }
+            request.messages.forEach { message ->
+                message.toolCalls.forEach(ToolCallSafety::requireValid)
+                add(message.toJson())
+            }
             if (config.providerMode == LlmProviderMode.OPENAI_COMPATIBLE &&
                 request.thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED
             ) {
@@ -181,7 +189,7 @@ class OpenAiCompatibleLlmClient(
                 call.execute().use { response ->
                     val body = response.body ?: throw IOException("LLM response body is empty")
                     if (!response.isSuccessful) {
-                        throw IOException("LLM HTTP ${response.code}: ${body.string().take(500)}")
+                        throw LlmHttpException(response.code, body.string())
                     }
                     val contentType = body.contentType()?.toString().orEmpty()
                     if (!contentType.contains("text/event-stream", ignoreCase = true)) {

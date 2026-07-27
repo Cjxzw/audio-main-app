@@ -1,8 +1,8 @@
 package com.agent.voiceassistant.agent.runtime
 
 import com.agent.voiceassistant.agent.StructuredOutputParser
-import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.cloud.ToolCallSafety
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CoroutineStart
@@ -79,7 +79,11 @@ class AgentLoop(
         fun toolDisplayName(toolName: String): String
         suspend fun executeTool(call: CloudSpeechClient.ToolCall): ToolExecution
         fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String): CloudSpeechClient.LlmMessage
-        suspend fun finishAssistant(message: CloudSpeechClient.LlmMessage, streamedSpeech: Boolean): Boolean
+        suspend fun finishAssistant(
+            turnId: String,
+            message: CloudSpeechClient.LlmMessage,
+            streamedSpeech: Boolean,
+        ): Boolean
     }
 
     suspend fun run(config: Config, turnId: String = UUID.randomUUID().toString()): Outcome {
@@ -102,7 +106,6 @@ class AgentLoop(
         try {
             suspend fun requestModel(
                 tools: List<CloudSpeechClient.ToolDefinition>,
-                emitFinishedEvent: Boolean = true,
             ): Pair<ModelTurn, CloudSpeechClient.LlmMessage> {
                 modelCall += 1
                 eventSink(AgentEvent.MessageStarted(turnId, modelCall))
@@ -122,15 +125,13 @@ class AgentLoop(
                             eventSink(AgentEvent.ContentDelta(turnId, streamEvent.text))
                         is CloudSpeechClient.ChatStreamEvent.ReasoningDelta ->
                             eventSink(AgentEvent.ReasoningDelta(turnId, streamEvent.text))
-                        is CloudSpeechClient.ChatStreamEvent.ToolCallDelta,
+                        is CloudSpeechClient.ChatStreamEvent.ToolCallDelta ->
+                            eventSink(AgentEvent.ToolCallDetected(turnId, streamEvent.name.orEmpty()))
                         is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
                     }
                 }
                 playedSpeech = playedSpeech || streamed.streamedSpeech
                 val assistant = runtime.normalizeAssistant(streamed.completion.message)
-                if (emitFinishedEvent && !(tools.isEmpty() && assistant.toolCalls.isNotEmpty())) {
-                    eventSink(AgentEvent.MessageFinished(turnId, assistant))
-                }
                 return streamed to assistant
             }
 
@@ -138,14 +139,12 @@ class AgentLoop(
                 streamed: ModelTurn,
                 assistant: CloudSpeechClient.LlmMessage,
                 allowFormatRepair: Boolean = true,
-                emitFinishedOnSuccess: Boolean = false,
+                emitFinishedOnSuccess: Boolean = true,
             ): Outcome.Completed {
                 val finalText = assistant.content.orEmpty().trim()
                 if (finalText.isBlank()) error("模型未返回最终正文")
                 val invalidFinal = assistant.toolCalls.isNotEmpty() ||
-                    StructuredOutputParser.containsToolProtocol(finalText) ||
-                    SpokenReplyPolicy.hasUnsupportedUnfencedStructure(finalText) ||
-                    SpokenReplyPolicy.isDetailsOnly(finalText)
+                    StructuredOutputParser.containsToolProtocol(finalText)
                 if (invalidFinal) {
                     if (allowFormatRepair) {
                         workingMessages += CloudSpeechClient.LlmMessage(
@@ -154,7 +153,6 @@ class AgentLoop(
                         )
                         val (repairedStreamed, repairedAssistant) = requestModel(
                             tools = emptyList(),
-                            emitFinishedEvent = false,
                         )
                         return completeAssistant(
                             streamed = repairedStreamed,
@@ -164,7 +162,6 @@ class AgentLoop(
                         )
                     }
                     val fallback = invalidFinalFallback()
-                    eventSink(AgentEvent.MessageFinished(turnId, fallback))
                     return completeAssistant(
                         streamed = ModelTurn(
                             completion = CloudSpeechClient.ChatCompletion(fallback, "format_guard"),
@@ -177,7 +174,7 @@ class AgentLoop(
                 if (emitFinishedOnSuccess) {
                     eventSink(AgentEvent.MessageFinished(turnId, assistant))
                 }
-                playedSpeech = runtime.finishAssistant(assistant, streamed.streamedSpeech) || playedSpeech
+                playedSpeech = runtime.finishAssistant(turnId, assistant, streamed.streamedSpeech) || playedSpeech
                 eventSink(AgentEvent.TurnFinished(turnId, finalText))
                 eventSink(AgentEvent.AgentFinished(turnId))
                 return Outcome.Completed(finalText, playedSpeech)
@@ -196,14 +193,10 @@ class AgentLoop(
                 repeat(MAX_FINAL_PROTOCOL_ATTEMPTS) { attempt ->
                     val (streamed, assistant) = requestModel(
                         tools = emptyList(),
-                        emitFinishedEvent = false,
                     )
                     val invalid = assistant.toolCalls.isNotEmpty() ||
-                        StructuredOutputParser.containsToolProtocol(assistant.content.orEmpty()) ||
-                        SpokenReplyPolicy.hasUnsupportedUnfencedStructure(assistant.content.orEmpty()) ||
-                        SpokenReplyPolicy.isDetailsOnly(assistant.content.orEmpty())
+                        StructuredOutputParser.containsToolProtocol(assistant.content.orEmpty())
                     if (!invalid) {
-                        eventSink(AgentEvent.MessageFinished(turnId, assistant))
                         return completeAssistant(streamed, assistant)
                     }
                     workingMessages += CloudSpeechClient.LlmMessage(
@@ -218,7 +211,6 @@ class AgentLoop(
                 }
 
                 val fallback = invalidFinalFallback()
-                eventSink(AgentEvent.MessageFinished(turnId, fallback))
                 return completeAssistant(
                     streamed = ModelTurn(
                         completion = CloudSpeechClient.ChatCompletion(fallback, "protocol_guard"),
@@ -234,8 +226,38 @@ class AgentLoop(
                 )
                 val (streamed, assistant) = requestModel(tools)
 
+                val allowedToolNames = tools.mapTo(mutableSetOf()) { it.name }
+                val rejectedCalls = assistant.toolCalls.mapNotNull { call ->
+                    ToolCallSafety.invalidReason(call)?.let { reason -> call to reason }
+                }
+                if (rejectedCalls.isNotEmpty()) {
+                    rejectedCalls.forEach { (call, reason) ->
+                        eventSink(
+                            AgentEvent.ToolCallRejected(
+                                turnId = turnId,
+                                toolCallId = call.id,
+                                toolName = call.name,
+                                reason = reason,
+                            ),
+                        )
+                    }
+                    workingMessages += CloudSpeechClient.LlmMessage(
+                        role = "system",
+                        content = buildToolCallRepairInstruction(rejectedCalls.map { it.second }),
+                    )
+                    consecutiveToolFailureRounds += 1
+                    if (consecutiveToolFailureRounds >= MAX_CONSECUTIVE_TOOL_FAILURE_ROUNDS) {
+                        return forceFinalSummary("连续 $consecutiveToolFailureRounds 轮工具调用格式非法")
+                    }
+                    return@repeat
+                }
+
                 if (tools.isEmpty() && assistant.toolCalls.isNotEmpty()) {
                     error("当前阶段返回了未授权工具调用")
+                }
+
+                if (assistant.toolCalls.isNotEmpty()) {
+                    eventSink(AgentEvent.MessageFinished(turnId, assistant))
                 }
 
                 val escalationCalls = assistant.toolCalls.filter(runtime::isReasoningEscalation)
@@ -295,6 +317,8 @@ class AgentLoop(
                 val pendingTools = assistant.toolCalls.map { call ->
                     eventSink(AgentEvent.ToolStarted(turnId, call, runtime.toolDisplayName(call.name)))
                     val blockedReason = when {
+                        call.name !in allowedToolNames ->
+                            "工具未在本轮注册，调用未执行。请改用本轮提供的工具或直接回答。"
                         !completedToolCallIds.add(call.id) ->
                             "重复的 tool_call_id，调用未再次执行。请基于已有结果继续。"
                         repeatedBatch ->
@@ -417,11 +441,19 @@ class AgentLoop(
         private const val DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD = 3
 
         private fun buildFinalFormatRepairInstruction() = buildString {
-            append("上一条正文格式不受支持，已被系统拦截。")
+            append("上一条正文包含疑似伪工具调用协议，已被系统拦截。")
             append("如果意图调用工具，必须使用 API 原生 tool_calls；当前最终总结阶段不得再调用工具。")
-            append("如果只是展示 JSON、XML、命令或代码，必须放入 Markdown 三反引号围栏，")
-            append("并在围栏外提供至少一句无 Markdown 的简短口语总结。")
-            append("不要只返回代码块，也不要输出裸露的 XML、JSON、工具标签或解释规则。")
+            append("如果只是展示 JSON、XML、命令或代码，先给出简短自然语言结论，")
+            append("再把不需要播报的 Markdown 详情放入 <DETAILS>...</DETAILS>。")
+            append("不要在正文中输出 tool_call、function、parameter 等伪工具标签。")
+        }
+
+        private fun buildToolCallRepairInstruction(reasons: List<String>) = buildString {
+            append("上一批工具调用已被系统拒绝，原因：")
+            append(reasons.distinct().joinToString("；"))
+            append("。请重新决定是否需要调用工具。")
+            append("如需调用，只能使用本轮提供的工具名称，arguments 必须是完整的 JSON 对象。")
+            append("不要复述或继续刚才的非法工具调用。")
         }
 
         private fun invalidFinalFallback() = CloudSpeechClient.LlmMessage(

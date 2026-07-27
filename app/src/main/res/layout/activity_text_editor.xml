@@ -47,6 +47,44 @@
             android:text="@string/text_editor_preview_mode" />
     </com.google.android.material.button.MaterialButtonToggleGroup>
 
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/ruleTitleLayout"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:hint="@string/context_asset_rule_name"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/textEditorModes"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/ruleTitleInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textCapSentences"
+            android:maxLines="1" />
+    </com.google.android.material.textfield.TextInputLayout>
+
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/memoryTagsLayout"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:hint="@string/context_asset_memory_tags"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/ruleTitleLayout"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/memoryTagsInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="text"
+            android:maxLines="2" />
+    </com.google.android.material.textfield.TextInputLayout>
+
     <EditText
         android:id="@+id/textEditorInput"
         android:layout_width="0dp"
@@ -57,11 +95,12 @@
         android:inputType="textMultiLine|textNoSuggestions"
         android:padding="16dp"
         android:scrollbars="vertical"
+        android:overScrollMode="always"
         android:textColor="?attr/colorOnSurface"
         android:textColorHint="?attr/colorOnSurfaceVariant"
         android:textCursorDrawable="@null"
         android:textSize="14sp"
-        app:layout_constraintTop_toBottomOf="@id/textEditorModes"
+        app:layout_constraintTop_toBottomOf="@id/memoryTagsLayout"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
@@ -72,7 +111,7 @@
         android:layout_height="0dp"
         android:background="?attr/colorSurface"
         android:visibility="gone"
-        app:layout_constraintTop_toBottomOf="@id/textEditorModes"
+        app:layout_constraintTop_toBottomOf="@id/memoryTagsLayout"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">

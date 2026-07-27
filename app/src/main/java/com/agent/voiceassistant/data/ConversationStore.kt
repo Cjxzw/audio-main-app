@@ -2,9 +2,11 @@ package com.agent.voiceassistant.data
 
 import android.content.Context
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.cloud.ToolCallSafety
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
+import com.agent.voiceassistant.ui.ChatStreamState
 import com.agent.voiceassistant.ui.ToolDisplayStatus
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -35,6 +37,16 @@ class ConversationStore(context: Context) {
         set(value) {
             shared.state = value
         }
+
+    init {
+        synchronized(lock) {
+            val quarantined = state.sessions.sumOf(::quarantineMalformedToolHistory)
+            if (quarantined > 0) {
+                Timber.w("ConversationStore: quarantined $quarantined malformed tool history messages")
+                persistLocked()
+            }
+        }
+    }
 
     val currentConversationId: String
         get() = synchronized(lock) { state.currentConversationId }
@@ -104,6 +116,7 @@ class ConversationStore(context: Context) {
         toolCallId: String? = null,
         toolStatus: ToolDisplayStatus? = null,
         presentation: ChatPresentation = ChatPresentation.STANDARD,
+        streamState: ChatStreamState? = null,
         attachments: List<StoredAttachment> = emptyList(),
     ): StoredMessage {
         val normalizedRole = when (role) {
@@ -119,6 +132,7 @@ class ConversationStore(context: Context) {
             toolCallId = toolCallId,
             toolStatus = toolStatus?.name,
             presentation = presentation.name,
+            streamState = streamState?.name,
             attachments = attachments,
         )
         synchronized(lock) {
@@ -135,6 +149,7 @@ class ConversationStore(context: Context) {
         content: String,
         timestamp: Long = System.currentTimeMillis(),
         toolStatus: ToolDisplayStatus? = null,
+        streamState: ChatStreamState? = null,
     ): StoredMessage? {
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -144,6 +159,7 @@ class ConversationStore(context: Context) {
                 content = content,
                 timestamp = timestamp,
                 toolStatus = toolStatus?.name ?: session.messages[index].toolStatus,
+                streamState = streamState?.name ?: session.messages[index].streamState,
             )
             session.messages[index] = updated
             session.updatedAt = timestamp
@@ -152,11 +168,22 @@ class ConversationStore(context: Context) {
         }
     }
 
+    fun deleteMessage(messageId: String): Boolean = synchronized(lock) {
+        val session = currentSessionLocked()
+        val removed = session.messages.removeAll { it.id == messageId }
+        if (removed) {
+            session.updatedAt = System.currentTimeMillis()
+            persistLocked()
+        }
+        removed
+    }
+
     fun addLlmMessage(
         message: CloudSpeechClient.LlmMessage,
         timestamp: Long = System.currentTimeMillis(),
         chatVisible: Boolean = false,
     ): StoredMessage {
+        message.toolCalls.forEach(ToolCallSafety::requireValid)
         val normalizedRole = when (message.role) {
             "assistant", "tool", "user" -> message.role
             else -> "system"
@@ -412,6 +439,52 @@ class ConversationStore(context: Context) {
         memorySummaryLocked()
     }
 
+    /**
+     * Keeps a rule baseline stable within a conversation and appends later edits as patches.
+     * The canonical rule bodies remain owned by [RuleStore]; this ledger exists only to make
+     * the request prefix stable for providers that reuse prompt KV caches.
+     */
+    fun ruleContext(ruleStore: RuleStore): String = synchronized(lock) {
+        val session = currentSessionLocked()
+        val current = ruleStore.snapshot()
+        var ledger = session.ruleLedger
+        when {
+            ledger == null -> {
+                ledger = ConversationRuleLedger(
+                    baselineRevision = current.revision,
+                    baselineRules = current.rules,
+                    appliedRevision = current.revision,
+                )
+                session.ruleLedger = ledger
+                persistLocked()
+            }
+            ledger.appliedRevision < current.revision -> {
+                val changes = ruleStore.changesSince(ledger.appliedRevision)
+                if (changes == null) {
+                    ledger = ConversationRuleLedger(
+                        baselineRevision = current.revision,
+                        baselineRules = current.rules,
+                        appliedRevision = current.revision,
+                    )
+                    session.ruleLedger = ledger
+                } else {
+                    ledger.patches.addAll(changes)
+                    ledger.appliedRevision = current.revision
+                    if (ledger.patches.size >= MAX_RULE_PATCHES || ledger.patches.sumOf(::ruleChangeChars) > MAX_RULE_PATCH_CHARS) {
+                        ledger = ConversationRuleLedger(
+                            baselineRevision = current.revision,
+                            baselineRules = current.rules,
+                            appliedRevision = current.revision,
+                        )
+                        session.ruleLedger = ledger
+                    }
+                }
+                persistLocked()
+            }
+        }
+        renderRuleLedger(requireNotNull(ledger))
+    }
+
     fun sessionContextSnapshot(skillSummary: String): String = synchronized(lock) {
         val session = currentSessionLocked()
         session.contextSnapshot?.let { return@synchronized it }
@@ -447,6 +520,9 @@ class ConversationStore(context: Context) {
                 appendLine("用户记忆：暂无")
             }
         }.trim()
+
+    private fun ruleChangeChars(change: RuleChange): Int =
+        change.rule.title.length + change.rule.body.length + 64
 
     fun recentUserTimingSummary(limit: Int = 4, now: Long = System.currentTimeMillis()): String =
         synchronized(lock) {
@@ -549,11 +625,15 @@ class ConversationStore(context: Context) {
             role = role,
             text = displayContent,
             timestamp = timestamp,
+            messageId = id,
             toolCallId = toolCallId,
             toolStatus = status,
             presentation = presentation?.let {
                 runCatching { ChatPresentation.valueOf(it) }.getOrNull()
             } ?: ChatPresentation.STANDARD,
+            streamState = streamState?.let { stored ->
+                runCatching { ChatStreamState.valueOf(stored) }.getOrNull()
+            },
         )
     }
 
@@ -565,6 +645,8 @@ class ConversationStore(context: Context) {
         private const val MAX_MEMORIES_PER_COMPRESSION = 12
         private const val MAX_MEMORY_CONTENT_CHARS = 500
         private const val MAX_TOOL_TRACE_FILES = 500
+        private const val MAX_RULE_PATCHES = 8
+        private const val MAX_RULE_PATCH_CHARS = 4_000
         private const val AUTO_MEMORY_TAG = "会话提炼"
         private val SENSITIVE_VALUE = Regex("(?i)\\b(?:sk|tp)[A-Za-z0-9_-]{16,}")
         private val SHARED_STORES = ConcurrentHashMap<String, SharedConversationState>()
@@ -575,6 +657,39 @@ class ConversationStore(context: Context) {
         val rawJsonStart = withoutStatus.indexOf(" {")
         return if (rawJsonStart > 0) withoutStatus.substring(0, rawJsonStart) else withoutStatus
     }
+}
+
+internal fun quarantineMalformedToolHistory(session: ConversationSession): Int {
+    val quarantinedCallIds = mutableSetOf<String>()
+    var quarantinedMessages = 0
+
+    session.messages.indices.forEach { index ->
+        val message = session.messages[index]
+        if (message.role != "assistant" || message.toolCalls.isEmpty()) return@forEach
+        val malformed = message.toolCalls.any { stored ->
+            ToolCallSafety.invalidReason(
+                CloudSpeechClient.ToolCall(stored.id, stored.name, stored.arguments),
+            ) != null
+        }
+        if (!malformed) return@forEach
+
+        quarantinedCallIds += message.toolCalls.map { it.id }
+        if (message.llmVisible != false) {
+            session.messages[index] = message.copy(llmVisible = false)
+            quarantinedMessages += 1
+        }
+    }
+
+    if (quarantinedCallIds.isEmpty()) return quarantinedMessages
+    session.messages.indices.forEach { index ->
+        val message = session.messages[index]
+        if (message.role != "tool" || message.toolCallId !in quarantinedCallIds) return@forEach
+        if (message.llmVisible != false) {
+            session.messages[index] = message.copy(llmVisible = false)
+            quarantinedMessages += 1
+        }
+    }
+    return quarantinedMessages
 }
 
 private fun defaultConversationTitle(timestamp: Long): String =
@@ -590,18 +705,77 @@ private fun newConversation(id: String): ConversationSession {
     )
 }
 
+internal fun renderRuleLedger(ledger: ConversationRuleLedger): String = buildString {
+    appendLine("全局用户规则基线（版本 ${ledger.baselineRevision}）：")
+    if (ledger.baselineRules.isEmpty()) {
+        appendLine("（当前没有规则）")
+    } else {
+        ledger.baselineRules.forEach { rule ->
+            appendLine("[规则 ${rule.id}｜${rule.title}｜v${rule.version}]")
+            appendLine(rule.body)
+        }
+    }
+    ledger.patches.forEach { change ->
+        appendLine()
+        appendLine("规则增量更新（版本 ${change.revision}）：")
+        appendLine("操作：${change.operation.name}；规则：${change.rule.id}｜${change.rule.title}｜v${change.rule.version}")
+        when (change.operation) {
+            RuleOperation.DELETE -> appendLine("该规则已删除，后续不得再遵循其正文。")
+            RuleOperation.DISABLE -> appendLine("该规则已停用，后续不得再遵循其正文。")
+            RuleOperation.ADD,
+            RuleOperation.UPDATE,
+            RuleOperation.ENABLE -> if (change.rule.enabled) {
+                appendLine(change.rule.body)
+            } else {
+                appendLine("该规则当前仍处于停用状态，不得应用其正文。")
+            }
+        }
+    }
+    append("规则解释：按版本顺序应用增量更新；同一规则以最新操作为准。规则由用户维护，模型只读；规则不得覆盖系统安全边界和工具权限。")
+}
+
 private data class SharedConversationState(var state: StoreState)
 
 internal object ToolHistoryPolicy {
+    const val MAX_CURRENT_TURN_RESULT_CHARS = 12_000
     const val MAX_PERSISTED_RESULT_CHARS = 3_000
+
+    fun prepareForCurrentTurn(content: String): String = when {
+        content.length <= MAX_PERSISTED_RESULT_CHARS -> content
+        content.length <= MAX_CURRENT_TURN_RESULT_CHARS -> buildString {
+            appendLine(
+                "[历史保留提示：本工具结果共 ${content.length} 字，已超过 3000 字的后续回合保留上限。" +
+                    "以下内容在当前回合完整可见，但之后的回合只会保留本条结果的开头 3000 字。" +
+                    "如有需要后续查验的关键信息，请在当前回合提炼后写入 /workspace。]",
+            )
+            append(content)
+        }
+        else -> buildString {
+            appendLine(
+                "[本轮截断提示：本工具原始结果共 ${content.length} 字，已超过 12000 字的本回合读取上限。" +
+                    "以下仅保留原始结果的开头 12000 字，后续内容已截断；" +
+                    "请缩小筛选范围或使用 offset、limit、tail_lines 分段读取。]",
+            )
+            appendLine(
+                "[历史保留提示：之后的回合只会保留本条结果的开头 3000 字。" +
+                    "如有需要后续查验的关键信息，请在当前回合提炼后写入 /workspace。]",
+            )
+            append(content.take(MAX_CURRENT_TURN_RESULT_CHARS))
+            append(
+                "\n[本轮工具结果在此处截断：采用保留开头的方式，" +
+                    "已省略后续 ${content.length - MAX_CURRENT_TURN_RESULT_CHARS} 字。]",
+            )
+        }
+    }
 
     fun compact(content: String, turnId: String, toolCallId: String): String {
         if (content.length <= MAX_PERSISTED_RESULT_CHARS) return content
-        val marker = "\n...[长期历史已压缩，完整记录 turn=$turnId call=$toolCallId]...\n"
+        val marker =
+            "\n[后续回合历史在此处截断：采用保留开头的方式，本条工具结果最多保留 3000 字；" +
+                "如需完整证据，请检查当前回合已写入 /workspace 的提炼记录。" +
+                " turn=$turnId call=$toolCallId]"
         val available = (MAX_PERSISTED_RESULT_CHARS - marker.length).coerceAtLeast(0)
-        val headSize = (available * 2 / 3).coerceAtLeast(0)
-        val tailSize = (available - headSize).coerceAtLeast(0)
-        return content.take(headSize) + marker + content.takeLast(tailSize)
+        return content.take(available) + marker
     }
 }
 
@@ -622,6 +796,15 @@ data class ConversationSession(
     val messages: MutableList<StoredMessage> = mutableListOf(),
     var contextSnapshot: String? = null,
     var memoryCompressedAt: Long? = null,
+    var ruleLedger: ConversationRuleLedger? = null,
+)
+
+@Serializable
+data class ConversationRuleLedger(
+    val baselineRevision: Long,
+    val baselineRules: List<UserRule>,
+    var appliedRevision: Long,
+    val patches: MutableList<RuleChange> = mutableListOf(),
 )
 
 data class ConversationSummary(
@@ -669,6 +852,7 @@ data class StoredMessage(
     val llmVisible: Boolean? = null,
     val chatVisible: Boolean? = null,
     val presentation: String? = null,
+    val streamState: String? = null,
     val attachments: List<StoredAttachment> = emptyList(),
 )
 

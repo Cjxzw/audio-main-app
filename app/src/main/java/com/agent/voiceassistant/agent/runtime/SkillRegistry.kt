@@ -83,6 +83,29 @@ class SkillRegistry(
         return existed
     }
 
+    fun create(name: String, description: String): Skill {
+        val normalizedName = name.trim()
+        val normalizedDescription = description.trim()
+        require(normalizedName.isNotBlank()) { "名称不能为空" }
+        require(normalizedDescription.isNotBlank()) { "简介不能为空" }
+        val id = uniqueId(slug(normalizedName).ifBlank { "skill" })
+        val target = File(skillsRoot, id)
+        require(target.mkdirs()) { "无法创建 Skill：$id" }
+        return try {
+            val body = "# $normalizedName\n\n请在此描述该技能的适用场景、执行流程和输出要求。"
+            File(target, "SKILL.md").writeText(
+                renderSkill(normalizedName, normalizedDescription, body),
+                Charsets.UTF_8,
+            )
+            markModified(id)
+            removeDeletedTombstone(id)
+            loadSkill(target, enabled = true) ?: error("Skill 创建后无法解析")
+        } catch (error: Exception) {
+            target.deleteRecursively()
+            throw error
+        }
+    }
+
     fun update(id: String, name: String, description: String, body: String): Skill {
         val current = listAll().firstOrNull { it.id == id } ?: error("Skill 不存在：$id")
         val root = File(if (current.enabled) skillsRoot else disabledSkillsRoot, current.id)

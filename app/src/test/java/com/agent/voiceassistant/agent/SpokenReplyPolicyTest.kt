@@ -6,7 +6,7 @@ import org.junit.Test
 
 class SpokenReplyPolicyTest {
     @Test
-    fun `keeps complete long reply while removing markdown`() {
+    fun `ordinary multi paragraph reply is not truncated`() {
         val input = """
             **第一条** 这是第一条资讯，包含了完整背景、关键结论、事件时间、影响范围以及后续值得继续关注的变化。
 
@@ -17,11 +17,11 @@ class SpokenReplyPolicyTest {
 
         val spoken = SpokenReplyPolicy.fallback(input)
 
-        assertTrue(spoken.length > 120)
         assertTrue(spoken.contains("第一条资讯"))
         assertTrue(spoken.contains("第二条资讯"))
         assertTrue(spoken.contains("最后一条资讯"))
         assertFalse(spoken.contains("**"))
+        assertFalse(spoken.contains(SpokenReplyPolicy.DETAILS_NOTICE))
     }
 
     @Test
@@ -41,7 +41,7 @@ class SpokenReplyPolicyTest {
     }
 
     @Test
-    fun `details only response has no speakable text`() {
+    fun `details only response asks user to view the phone`() {
         val input = """
             ```xml
             <result>detail</result>
@@ -49,6 +49,47 @@ class SpokenReplyPolicyTest {
         """.trimIndent()
 
         assertTrue(SpokenReplyPolicy.isDetailsOnly(input))
-        assertTrue(SpokenReplyPolicy.fallback(input).isEmpty())
+        assertTrue(SpokenReplyPolicy.fallback(input) == SpokenReplyPolicy.DETAILS_NOTICE)
+    }
+
+    @Test
+    fun `raw json is kept on screen without a detail notice`() {
+        val spoken = SpokenReplyPolicy.fallback("{\"status\":\"ok\",\"items\":[1,2]}")
+
+        assertTrue(spoken.isEmpty())
+    }
+
+    @Test
+    fun `ordinary speech is not limited to three sentences`() {
+        val spoken = SpokenReplyPolicy.fallback("第一句。第二句。第三句。第四句。第五句。")
+
+        assertTrue(spoken.contains("第四句。第五句。"))
+        assertFalse(spoken.contains(SpokenReplyPolicy.DETAILS_NOTICE))
+    }
+
+    @Test
+    fun `details block supports nested markdown and is omitted from speech`() {
+        val input = """
+            任务已经完成，主要结果正常。
+            <DETAILS>
+            ## 技术详情
+            | 字段 | 值 |
+            | --- | --- |
+            | status | ok |
+            ```json
+            {"status":"ok"}
+            ```
+            </DETAILS>
+        """.trimIndent()
+
+        val spoken = SpokenReplyPolicy.fallback(input)
+        val display = ReplyDetailPolicy.forDisplay(input)
+
+        assertTrue(spoken.startsWith("任务已经完成"))
+        assertFalse(spoken.contains("status"))
+        assertTrue(spoken.endsWith(SpokenReplyPolicy.DETAILS_NOTICE))
+        assertFalse(display.contains("<DETAILS>"))
+        assertTrue(display.contains("## 技术详情"))
+        assertTrue(display.contains("```json"))
     }
 }

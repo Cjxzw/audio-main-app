@@ -1,5 +1,6 @@
 package com.agent.voiceassistant.cloud
 
+import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -66,14 +67,66 @@ class SpeechSegmenterTest {
     }
 
     @Test
-    fun `details only markdown emits no speech`() {
+    fun `details only markdown emits a phone notice`() {
         val extractor = StreamingSpeechExtractor()
         val speech = buildString {
             append(extractor.feed("```xml\n<result>detail</result>\n```"))
             append(extractor.finish())
         }
 
+        assertEquals("该回复中有详细信息，请查看手机。", speech)
+    }
+
+    @Test
+    fun `leading json is display content without a detail notice`() {
+        val extractor = StreamingSpeechExtractor()
+        val speech = buildString {
+            append(extractor.feed("{\"status\":\"ok\"}"))
+            append(extractor.finish())
+        }
+
         assertEquals("", speech)
+    }
+
+    @Test
+    fun `details marker stops nested markdown from entering speech`() {
+        val extractor = StreamingSpeechExtractor()
+        val speech = buildString {
+            append(extractor.feed("问题已经定位，修复点在会话恢复流程。\n<DETA"))
+            append(extractor.feed("ILS>\n## 详细信息\n```json\n{\"status\":\"ok\"}\n```\n</DETAILS>"))
+            append(extractor.finish())
+        }
+
+        assertTrue(speech.startsWith("问题已经定位"))
+        assertTrue(!speech.contains("##"))
+        assertTrue(!speech.contains("后续内容"))
+        assertTrue(speech.endsWith("该回复中有详细信息，请查看手机。"))
+    }
+
+    @Test
+    fun `streaming speech is not limited to three sentences`() {
+        val extractor = StreamingSpeechExtractor()
+        val speech = buildString {
+            append(extractor.feed("第一句。第二句。第三句。第四句。第五句。"))
+            append(extractor.finish())
+        }
+
+        assertTrue(speech.contains("第一句。第二句。第三句。第四句。第五句。"))
+        assertTrue(!speech.contains("该回复中有详细信息，请查看手机。"))
+    }
+
+    @Test
+    fun `markdown table is skipped without a detail notice`() {
+        val extractor = StreamingSpeechExtractor()
+        val speech = buildString {
+            append(extractor.feed("结论正常。\n| 字段 | 值 |\n| --- | --- |\n| status | ok |\n\n后续正文继续播报。"))
+            append(extractor.finish())
+        }
+
+        assertTrue(speech.contains("结论正常"))
+        assertTrue(speech.contains("后续正文继续播报"))
+        assertTrue(!speech.contains("status"))
+        assertTrue(!speech.contains(SpokenReplyPolicy.DETAILS_NOTICE))
     }
 
     @Test

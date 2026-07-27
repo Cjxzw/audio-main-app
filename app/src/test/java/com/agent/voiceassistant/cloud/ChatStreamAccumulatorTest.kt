@@ -117,6 +117,33 @@ class ChatStreamAccumulatorTest {
         assertFalse(payload.containsKey("temperature"))
     }
 
+    @Test(expected = MalformedToolCallException::class)
+    fun `payload rejects malformed tool arguments before network request`() {
+        val client = CloudSpeechClient(
+            LLMConfig(
+                apiKey = "test",
+                baseUrl = "https://example.com/v1",
+                modelName = "mimo-v2.5",
+            ),
+        )
+
+        client.buildChatPayload(
+            CloudSpeechClient.ChatRequest(
+                messages = listOf(
+                    CloudSpeechClient.LlmMessage(
+                        role = "assistant",
+                        toolCalls = listOf(
+                            CloudSpeechClient.ToolCall("call_bad", "read", "{\"path\":\"unterminated"),
+                        ),
+                    ),
+                ),
+                tools = emptyList(),
+                thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                maxCompletionTokens = 1_024,
+            ),
+        )
+    }
+
     @Test
     fun `tts payload requests connected slightly faster speech and streaming`() {
         val client = CloudSpeechClient(

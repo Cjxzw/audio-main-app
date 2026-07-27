@@ -1,9 +1,20 @@
 package com.agent.voiceassistant.tasks
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TaskReportPolicyTest {
+    @Test
+    fun `report style keeps audio concise and moves technical detail to display block`() {
+        val instructions = TaskReportPolicy.styleInstructions()
+
+        assertTrue(instructions.contains("不超过三句"))
+        assertTrue(instructions.contains("代码函数名"))
+        assertTrue(instructions.contains("结果”仍必须压缩成一句话"))
+        assertTrue(instructions.contains("<DETAILS>...</DETAILS>"))
+    }
+
     @Test
     fun `active idle conversation reports through audio`() {
         assertEquals(

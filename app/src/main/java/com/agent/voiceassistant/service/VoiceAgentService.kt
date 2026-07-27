@@ -38,6 +38,7 @@ import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.LlmClient
+import com.agent.voiceassistant.cloud.LlmHttpException
 import com.agent.voiceassistant.cloud.MultimodalImageEncoder
 import com.agent.voiceassistant.cloud.ListeningInactivityPolicy
 import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
@@ -50,7 +51,9 @@ import com.agent.voiceassistant.cloud.VoiceReplyDirectiveParser
 import com.agent.voiceassistant.cloud.VoiceReplyMode
 import com.agent.voiceassistant.cloud.VoiceReplyOptions
 import com.agent.voiceassistant.data.ConversationStore
+import com.agent.voiceassistant.data.ToolHistoryPolicy
 import com.agent.voiceassistant.data.ConversationMemoryCompactor
+import com.agent.voiceassistant.data.RuleStore
 import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.media.AssistantNotificationContract
@@ -72,6 +75,7 @@ import com.agent.voiceassistant.tasks.TaskReportPolicy
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
+import com.agent.voiceassistant.ui.ChatStreamState
 import com.agent.voiceassistant.ui.ToolDisplayStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -115,6 +119,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
 class VoiceAgentService : Service() {
@@ -126,14 +131,18 @@ class VoiceAgentService : Service() {
         private const val ENABLE_PLAYBACK_DONE_EARCON = false
         private const val SLOW_NETWORK_FEEDBACK_MS = 3_000L
         private const val TOTAL_INACTIVITY_SLEEP_MS = 15_000L
+        private const val AUDIO_RECORD_RETRY_DELAY_MS = 200L
+        private const val NEW_CONVERSATION_DEBOUNCE_MS = 1_500L
         private const val TTS_FADE_MS = 18
         private const val TTS_FINAL_SILENCE_MS = 90
         private const val DEEP_MAX_TOOL_ROUNDS = 10
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
-        private const val MAX_TOOL_RESULT_CHARS = 12_000
         private const val MAX_IMAGE_HISTORY_TURNS = 3
         private const val MAX_IMAGE_INPUTS = 4
+        private const val DRAFT_PERSIST_CHARS = 64
+        private const val DRAFT_UI_INTERVAL_MS = 50L
+        private val DRAFT_PERSIST_MARKS = setOf('。', '！', '？', '.', '!', '?', '\n')
         private const val LEGACY_STREAM_BLUETOOTH_SCO = 6
         private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif")
         private const val SESSION_GREETING_MESSAGE_ID = "__session_greeting__"
@@ -299,6 +308,7 @@ class VoiceAgentService : Service() {
     private var routeManager: AudioRouteManager? = null
     private var player: MediaPlayer? = null
     private lateinit var store: ConversationStore
+    private lateinit var ruleStore: RuleStore
     private lateinit var llmProviderRepository: LlmProviderRepository
     private lateinit var speechPreferences: SpeechPreferences
     private lateinit var capabilityResolver: AppCapabilityResolver
@@ -315,8 +325,11 @@ class VoiceAgentService : Service() {
     private var dormant = true
     private val turnMutex = Mutex()
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
+    private val assistantDrafts = ConcurrentHashMap<String, AssistantDraft>()
     private val thinkingFeedbackLock = Any()
     private val speechInterruptedForUrgentReport = AtomicBoolean(false)
+    private val newConversationInProgress = AtomicBoolean(false)
+    private val lastNewConversationRequestAt = AtomicLong(0L)
     private var lastThinkingFeedbackAudio: Int? = null
     @Volatile private var activeSourceTurnId: String = ""
 
@@ -326,6 +339,7 @@ class VoiceAgentService : Service() {
         super.onCreate()
         DiagLog.i("service.create", "pid=${android.os.Process.myPid()}", showInUi = true)
         store = ConversationStore(this)
+        ruleStore = RuleStore(this)
         llmProviderRepository = LlmProviderRepository(this)
         speechPreferences = SpeechPreferences(this)
         capabilityResolver = AppCapabilityResolver(this)
@@ -393,9 +407,7 @@ class VoiceAgentService : Service() {
             }
             ACTION_NEW_CONVERSATION -> {
                 ensureForegroundForCurrentState()
-                serviceScope.launch {
-                    turnMutex.withLock { createNewConversation("历史会话按钮", greet = false) }
-                }
+                serviceScope.launch { requestNewConversation("历史会话按钮", greet = false) }
             }
             ACTION_SWITCH_CONVERSATION -> {
                 ensureForegroundForCurrentState()
@@ -600,8 +612,8 @@ class VoiceAgentService : Service() {
     }
 
     private fun buildTaskReportPrompt(tasks: List<TaskEntity>): String = buildString {
-        appendLine("这是内部异步任务完成事件。请用一到三句自然、适合语音播报的中文汇报结果。")
-        appendLine("不要调用工具，不要解释内部机制，不要使用 Markdown。")
+        appendLine("这是内部异步任务完成事件。")
+        appendLine(TaskReportPolicy.styleInstructions())
         tasks.forEach { task ->
             appendLine("- 任务：${task.title}")
             appendLine("  状态：${task.status}")
@@ -627,6 +639,7 @@ class VoiceAgentService : Service() {
     private fun wakeAgent() {
         DiagLog.i("agent.wake.begin", "dormant=$dormant loop=${loopJob?.isActive == true}", showInUi = true)
         if (loopJob?.isActive == true && !dormant) return
+        locationProvider.refreshInBackground("agent_wake")
         val foregroundReady = runCatching {
             ensureForeground("唤醒中...", microphoneActive = true)
         }.onFailure { error ->
@@ -703,7 +716,7 @@ class VoiceAgentService : Service() {
                 emitLog("请说话")
                 earcons.listening()
                 val inactivityStartedAt = SystemClock.elapsedRealtime()
-                when (val capture = recorder?.recordNextUtterance() ?: SimpleVadRecorder.CaptureResult.Stopped) {
+                when (val capture = recordNextUtteranceWithFallback()) {
                     is SimpleVadRecorder.CaptureResult.Recorded -> {
                         handleRecordedCapture(capture.recording)
                     }
@@ -731,10 +744,10 @@ class VoiceAgentService : Service() {
                         val followUp = if (remainingMs == 0L) {
                             SimpleVadRecorder.CaptureResult.InactivitySleep
                         } else {
-                            recorder?.recordNextUtterance(
+                            recordNextUtteranceWithFallback(
                                 inactivitySleepMs = remainingMs,
                                 warningAlreadyPlayed = true,
-                            ) ?: SimpleVadRecorder.CaptureResult.Stopped
+                            )
                         }
                         when (followUp) {
                             is SimpleVadRecorder.CaptureResult.Recorded -> {
@@ -773,6 +786,34 @@ class VoiceAgentService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private suspend fun recordNextUtteranceWithFallback(
+        inactivityWarningMs: Long = 10_000L,
+        inactivitySleepMs: Long = 15_000L,
+        warningAlreadyPlayed: Boolean = false,
+    ): SimpleVadRecorder.CaptureResult {
+        val activeRecorder = recorder ?: return SimpleVadRecorder.CaptureResult.Stopped
+        val first = activeRecorder.recordNextUtterance(
+            inactivityWarningMs = inactivityWarningMs,
+            inactivitySleepMs = inactivitySleepMs,
+            warningAlreadyPlayed = warningAlreadyPlayed,
+        )
+        if (first !is SimpleVadRecorder.CaptureResult.RouteUnavailable ||
+            !first.summary.contains("错误码 -4")
+        ) {
+            return first
+        }
+        val fallback = routeManager?.fallbackToPhoneAudio("audio_record_dead_object") ?: return first
+        DiagLog.w("audio.microphone.retry", fallback, showInUi = true)
+        emitLog("麦克风连接已失效，正在切换到手机麦克风重试")
+        delay(AUDIO_RECORD_RETRY_DELAY_MS)
+        return activeRecorder.recordNextUtterance(
+            inactivityWarningMs = inactivityWarningMs,
+            inactivitySleepMs = inactivitySleepMs,
+            warningAlreadyPlayed = warningAlreadyPlayed,
+        )
+    }
+
     private suspend fun handleRecordedCapture(recording: SimpleVadRecorder.Recording) {
         updateNotification("识别中...")
         emitLog("录音完成 ${recording.durationMs}ms，停止收音")
@@ -807,6 +848,10 @@ class VoiceAgentService : Service() {
         turnNote: String? = null,
         attachments: List<String> = emptyList(),
     ) {
+        if (LocalConversationCommandPolicy.classify(userText) == LocalConversationCommandPolicy.Command.NEW_TOPIC) {
+            requestNewConversation(userText, greet = true)
+            return
+        }
         turnMutex.withLock {
             val speakReplies = source != "text" || !speechPreferences.muteTextReplies
             try {
@@ -859,6 +904,8 @@ class VoiceAgentService : Service() {
                 updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: LlmHttpException) {
+                handleLlmHttpFailure(e)
             } catch (e: NetworkTimeoutException) {
                 handleConnectionLost("agent", e)
             } catch (e: IOException) {
@@ -1112,12 +1159,12 @@ class VoiceAgentService : Service() {
                     blockedToolCall(call, reason)
 
                 override suspend fun finishAssistant(
+                    turnId: String,
                     message: CloudSpeechClient.LlmMessage,
                     streamedSpeech: Boolean,
                 ): Boolean {
                     val finalText = message.content.orEmpty().trim()
-                    store.addMessage("assistant", finalText)
-                    EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, finalText))
+                    finishAssistantDraft(turnId, finalText)
                     emitLog("助手: $finalText")
                     if (!streamedSpeech) {
                         awaitReasoningFeedback()
@@ -1205,10 +1252,13 @@ class VoiceAgentService : Service() {
                 "agent.turn.finished",
                 "turn=${event.turnId} chars=${event.finalText.length}",
             )
-            is AgentEvent.AgentFailed -> DiagLog.w(
-                "agent.loop.failed",
-                "turn=${event.turnId} error=${event.error}",
-            )
+            is AgentEvent.AgentFailed -> {
+                interruptAssistantDraft(event.turnId)
+                DiagLog.w(
+                    "agent.loop.failed",
+                    "turn=${event.turnId} error=${event.error}",
+                )
+            }
             is AgentEvent.MessageFinished -> {
                 val persistentCalls = if (event.message.toolCalls.any(toolRegistry::isTerminalPresentation)) {
                     emptyList()
@@ -1216,6 +1266,7 @@ class VoiceAgentService : Service() {
                     event.message.toolCalls.filterNot(toolRegistry::isReasoningEscalation)
                 }
                 if (persistentCalls.isNotEmpty()) {
+                    suppressAssistantDraft(event.turnId)
                     store.addLlmMessage(
                         event.message.copy(
                             reasoningContent = null,
@@ -1224,12 +1275,134 @@ class VoiceAgentService : Service() {
                     )
                 }
             }
-            is AgentEvent.AgentFinished,
-            is AgentEvent.ContentDelta,
-            is AgentEvent.MessageStarted,
+            is AgentEvent.ToolCallRejected -> {
+                suppressAssistantDraft(event.turnId)
+                DiagLog.w(
+                    "agent.tool.rejected",
+                    "turn=${event.turnId} id=${event.toolCallId.take(80)} " +
+                        "name=${event.toolName.take(80)} reason=${event.reason}",
+                    showInUi = true,
+                )
+            }
+            is AgentEvent.MessageStarted -> {
+                discardAssistantDraft(event.turnId)
+                assistantDrafts[event.turnId] = AssistantDraft()
+            }
+            is AgentEvent.ContentDelta -> appendAssistantDraft(event.turnId, event.text)
+            is AgentEvent.ToolCallDetected -> suppressAssistantDraft(event.turnId)
+            is AgentEvent.AgentFinished -> assistantDrafts.remove(event.turnId)
             is AgentEvent.ReasoningDelta,
             is AgentEvent.ToolProgress -> Unit
         }
+    }
+
+    private fun appendAssistantDraft(turnId: String, delta: String) {
+        if (delta.isEmpty()) return
+        val draft = assistantDrafts.computeIfAbsent(turnId) { AssistantDraft() }
+        if (draft.suppressed) return
+        draft.text.append(delta)
+        if (!draft.released) {
+            val first = draft.text.firstOrNull { !it.isWhitespace() } ?: return
+            if (first == '{' || first == '[' || first == '<') return
+            draft.released = true
+        }
+        val text = draft.text.toString()
+        if (draft.messageId == null) {
+            val stored = store.addMessage(
+                role = "assistant",
+                content = text,
+                streamState = ChatStreamState.STREAMING,
+            )
+            draft.messageId = stored.id
+            draft.timestamp = stored.timestamp
+            draft.persistedLength = text.length
+        } else if (text.length - draft.persistedLength >= DRAFT_PERSIST_CHARS || text.lastOrNull() in DRAFT_PERSIST_MARKS) {
+            store.updateMessage(
+                requireNotNull(draft.messageId),
+                text,
+                streamState = ChatStreamState.STREAMING,
+            )
+            draft.persistedLength = text.length
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (draft.lastEmittedAt == 0L ||
+            now - draft.lastEmittedAt >= DRAFT_UI_INTERVAL_MS ||
+            text.lastOrNull() in DRAFT_PERSIST_MARKS
+        ) {
+            draft.lastEmittedAt = now
+            EventBus.emitChatMessage(draft.toChatMessage(text, ChatStreamState.STREAMING))
+        }
+    }
+
+    private fun finishAssistantDraft(turnId: String, finalText: String) {
+        val draft = assistantDrafts.remove(turnId)
+        val messageId = draft?.messageId
+        if (messageId == null) {
+            val stored = store.addMessage(
+                role = "assistant",
+                content = finalText,
+                streamState = ChatStreamState.COMPLETED,
+            )
+            EventBus.emitChatMessage(
+                ChatMessage(
+                    role = ChatRole.BOT,
+                    text = finalText,
+                    timestamp = stored.timestamp,
+                    messageId = stored.id,
+                    streamState = ChatStreamState.COMPLETED,
+                ),
+            )
+            return
+        }
+        store.updateMessage(messageId, finalText, streamState = ChatStreamState.COMPLETED)
+        EventBus.emitChatMessage(draft.toChatMessage(finalText, ChatStreamState.COMPLETED))
+    }
+
+    private fun interruptAssistantDraft(turnId: String) {
+        val draft = assistantDrafts.remove(turnId) ?: return
+        val messageId = draft.messageId ?: return
+        val text = draft.text.toString().trim()
+        if (text.isBlank()) {
+            discardStoredDraft(messageId)
+            return
+        }
+        store.updateMessage(messageId, text, streamState = ChatStreamState.INTERRUPTED)
+        EventBus.emitChatMessage(draft.toChatMessage(text, ChatStreamState.INTERRUPTED))
+    }
+
+    private fun discardAssistantDraft(turnId: String) {
+        val messageId = assistantDrafts.remove(turnId)?.messageId ?: return
+        discardStoredDraft(messageId)
+    }
+
+    private fun suppressAssistantDraft(turnId: String) {
+        val draft = assistantDrafts.computeIfAbsent(turnId) { AssistantDraft() }
+        draft.messageId?.let(::discardStoredDraft)
+        draft.messageId = null
+        draft.suppressed = true
+    }
+
+    private fun discardStoredDraft(messageId: String) {
+        store.deleteMessage(messageId)
+        EventBus.emitChatRemoval(messageId)
+    }
+
+    private data class AssistantDraft(
+        val text: StringBuilder = StringBuilder(),
+        var messageId: String? = null,
+        var timestamp: Long = System.currentTimeMillis(),
+        var released: Boolean = false,
+        var suppressed: Boolean = false,
+        var persistedLength: Int = 0,
+        var lastEmittedAt: Long = 0L,
+    ) {
+        fun toChatMessage(content: String, state: ChatStreamState) = ChatMessage(
+            role = ChatRole.BOT,
+            text = content,
+            timestamp = timestamp,
+            messageId = messageId,
+            streamState = state,
+        )
     }
 
     private suspend fun executeToolCall(
@@ -1240,7 +1413,7 @@ class VoiceAgentService : Service() {
             return AgentLoop.ToolExecution(
                 message = CloudSpeechClient.LlmMessage(
                     role = "tool",
-                    content = "未受支持的工具调用格式。请立即使用 API 提供的原生 tool_calls 重新输出；不要在正文中输出 XML、JSON、代码块、工具标签或解释文字。如果原内容不是工具调用而是展示资料，请用 Markdown 三反引号围栏包裹，并在围栏外提供一句自然语言结论。",
+                    content = "未受支持的工具调用格式。请立即使用 API 提供的原生 tool_calls 重新输出；不要在正文中输出工具标签或伪工具 JSON。如果原内容只是展示资料，请先给出自然语言结论，再将不需要播报的 Markdown 详情放入 <DETAILS>...</DETAILS>。",
                     toolCallId = call.id,
                 ),
                 succeeded = false,
@@ -1255,7 +1428,7 @@ class VoiceAgentService : Service() {
         return AgentLoop.ToolExecution(
             message = CloudSpeechClient.LlmMessage(
                 role = "tool",
-                content = result.contextText.take(MAX_TOOL_RESULT_CHARS),
+                content = ToolHistoryPolicy.prepareForCurrentTurn(result.contextText),
                 toolCallId = call.id,
             ),
             succeeded = result.success,
@@ -1540,6 +1713,8 @@ class VoiceAgentService : Service() {
             append(executionEnv.credentialProfileSummary())
             append("\n\n会话上下文资产快照：\n")
             append(store.sessionContextSnapshot(skillRegistry.promptSummary()))
+            append("\n\n全局用户规则：\n")
+            append(store.ruleContext(ruleStore))
             append("\n\n跨会话长期记忆：\n")
             append(store.contextSummary())
         }.trim()
@@ -1695,11 +1870,14 @@ class VoiceAgentService : Service() {
     }
 
     private suspend fun createNewConversation(text: String, greet: Boolean): Boolean {
-        compactConversationIntoMemory(store.currentConversationId, userVisible = false)
+        val previousConversationId = store.currentConversationId
         store.startNewConversation(reason = text)
         locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
         EventBus.emitConversationUpdate()
+        serviceScope.launch {
+            compactConversationIntoMemory(previousConversationId, userVisible = false)
+        }
         if (!greet) {
             emitLog("已开启新会话")
             return true
@@ -1733,6 +1911,28 @@ class VoiceAgentService : Service() {
             emitLog("新话题问候失败，使用本地问候")
             emitSessionGreetingFallback(client)
             true
+        }
+    }
+
+    private suspend fun requestNewConversation(text: String, greet: Boolean): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        val previous = lastNewConversationRequestAt.get()
+        if (now - previous < NEW_CONVERSATION_DEBOUNCE_MS ||
+            !lastNewConversationRequestAt.compareAndSet(previous, now)
+        ) {
+            EventBus.emitUserNotice("正在开启新话题，请稍候")
+            return false
+        }
+        if (!newConversationInProgress.compareAndSet(false, true)) {
+            EventBus.emitUserNotice("正在开启新话题，请稍候")
+            return false
+        }
+        EventBus.emitConversationBusy(true)
+        return try {
+            turnMutex.withLock { createNewConversation(text, greet) }
+        } finally {
+            newConversationInProgress.set(false)
+            EventBus.emitConversationBusy(false)
         }
     }
 
@@ -2585,6 +2785,26 @@ class VoiceAgentService : Service() {
         DiagLog.w(
             "network.connection_lost",
             "operation=$operation reason=${error.message}",
+            showInUi = true,
+        )
+        store.addMessage("system", message)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+        emitLog(message)
+        earcons.error()
+        updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
+    }
+
+    private suspend fun handleLlmHttpFailure(error: LlmHttpException) {
+        val message = when (error.statusCode) {
+            400 -> "模型服务拒绝了本轮请求，可能存在不兼容的会话格式。错误已经记录，助手仍保持在线。"
+            401, 403 -> "模型服务鉴权失败，请检查当前专属 LLM 配置。助手仍保持在线。"
+            429 -> "模型服务当前请求过多，请稍后重试。助手仍保持在线。"
+            else -> "模型服务返回 HTTP ${error.statusCode}，请稍后重试。助手仍保持在线。"
+        }
+        Timber.w(error, "LLM HTTP request failed")
+        DiagLog.w(
+            "llm.http.failed",
+            "status=${error.statusCode} body=${error.responseBody.take(500)}",
             showInUi = true,
         )
         store.addMessage("system", message)
