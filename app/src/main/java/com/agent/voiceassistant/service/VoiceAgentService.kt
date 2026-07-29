@@ -36,10 +36,13 @@ import com.agent.voiceassistant.agent.runtime.MainAgentHarness
 import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
+import com.agent.voiceassistant.audio.AudioFeedbackPolicy
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.cloud.FallbackLlmClient
 import com.agent.voiceassistant.cloud.LlmClient
 import com.agent.voiceassistant.cloud.LlmHttpException
 import com.agent.voiceassistant.cloud.MultimodalImageEncoder
+import com.agent.voiceassistant.cloud.MultimodalTranscriber
 import com.agent.voiceassistant.cloud.ListeningInactivityPolicy
 import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
@@ -319,6 +322,8 @@ class VoiceAgentService : Service() {
     private lateinit var executionEnv: AndroidExecutionEnv
     private lateinit var skillRegistry: SkillRegistry
     private lateinit var imageEncoder: MultimodalImageEncoder
+    private lateinit var multimodalTranscriber: MultimodalTranscriber
+    private lateinit var deviceContextProvider: DeviceContextProvider
     private val agentHarness = MainAgentHarness()
     private val memoryCompactor = ConversationMemoryCompactor()
     private lateinit var earcons: EarconPlayer
@@ -332,6 +337,7 @@ class VoiceAgentService : Service() {
     private val lastNewConversationRequestAt = AtomicLong(0L)
     private var lastThinkingFeedbackAudio: Int? = null
     @Volatile private var activeSourceTurnId: String = ""
+    @Volatile private var activeTextTurnSilent: Boolean = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -361,6 +367,15 @@ class VoiceAgentService : Service() {
             executionEnv.modifiedSkillsManifest,
         )
         imageEncoder = MultimodalImageEncoder(executionEnv.workspaceRoot)
+        multimodalTranscriber = MultimodalTranscriber(this) {
+            OpenAiCompatibleLlmClient(capabilityResolver.defaultLlmConfig())
+        }
+        deviceContextProvider = DeviceContextProvider(
+            this,
+            capabilityResolver,
+            llmProviderRepository,
+            speechPreferences,
+        )
         toolRegistry = MainToolRegistry(
             LocalToolExecutor(
                 store = store,
@@ -374,6 +389,7 @@ class VoiceAgentService : Service() {
                 MainToolRegistry.TaskToolContext(
                     conversationId = store.currentConversationId,
                     sourceTurnId = activeSourceTurnId,
+                    silentAudio = activeTextTurnSilent,
                 )
             },
         )
@@ -487,7 +503,8 @@ class VoiceAgentService : Service() {
         val sameConversation = first.conversationId == store.currentConversationId
         val external = AudioRouteManager(this).externalOutput().connected
         val capabilities = capabilityResolver.capabilities()
-        val audioReportsEnabled = !speechPreferences.muteTextReplies &&
+        val audioReportsEnabled = AudioFeedbackPolicy.allowProactiveTaskReports(speechPreferences.muteTextReplies) &&
+            batch.none { AudioFeedbackPolicy.taskRequiresSilentReport(it.inputJson) } &&
             capabilities.speechAvailable && capabilities.llmAvailable
         if (!dormant &&
             audioReportsEnabled && external &&
@@ -848,22 +865,16 @@ class VoiceAgentService : Service() {
         turnNote: String? = null,
         attachments: List<String> = emptyList(),
     ) {
+        val speakReplies = AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies)
         if (LocalConversationCommandPolicy.classify(userText) == LocalConversationCommandPolicy.Command.NEW_TOPIC) {
-            requestNewConversation(userText, greet = true)
+            requestNewConversation(userText, greet = true, speakReplies = speakReplies)
             return
         }
         turnMutex.withLock {
-            val speakReplies = source != "text" || !speechPreferences.muteTextReplies
+            activeTextTurnSilent = source == "text" && !speakReplies
             try {
                 if (handleLocalConversationCommand(userText)) return
                 val client = ensureSpeechClient()
-                val llmClient = runCatching { createLlmClient() }.getOrElse { error ->
-                    val message = error.message ?: "请先配置可用的 LLM"
-                    store.addMessage("system", message)
-                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
-                    emitLog(message)
-                    return
-                }
                 val displayText = buildString {
                     append(userText)
                     if (attachments.isNotEmpty()) {
@@ -882,6 +893,31 @@ class VoiceAgentService : Service() {
                 emitLog("你($source): $userText attachments=${attachments.size}")
                 updateNotification("正在回应...")
 
+                val visualTranscript = prepareVisualTranscript(
+                    userText = userText,
+                    currentUserMessageId = currentUserMessage.id,
+                    attachments = attachments,
+                )
+                visualTranscript?.let { transcript ->
+                    store.setLlmContent(
+                        currentUserMessage.id,
+                        buildString {
+                            append(displayText)
+                            append("\n\n<multimodal_transcript>\n")
+                            append(transcript)
+                            append("\n</multimodal_transcript>")
+                            append("\n以上内容由默认多模态模型转写，不是用户原文，可能遗漏细节。")
+                        },
+                    )
+                }
+                val llmClient = runCatching { createLlmClient() }.getOrElse { error ->
+                    val message = error.message ?: "请先配置可用的 LLM"
+                    store.addMessage("system", message)
+                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+                    emitLog(message)
+                    return
+                }
+
                 speechInterruptedForUrgentReport.set(false)
                 val outcome = runAgentLoop(
                     llmClient = llmClient,
@@ -893,6 +929,7 @@ class VoiceAgentService : Service() {
                         source = source,
                         turnNote = turnNote,
                         attachments = attachments,
+                        visualTranscript = visualTranscript,
                     ),
                     initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
@@ -932,6 +969,8 @@ class VoiceAgentService : Service() {
                     earcons.error()
                 }
                 updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
+            } finally {
+                activeTextTurnSilent = false
             }
         }
     }
@@ -950,6 +989,7 @@ class VoiceAgentService : Service() {
         var reasoningFeedbackJob: Job? = null
 
         fun startReasoningFeedback(source: String) {
+            if (!speakReplies) return
             if (reasoningFeedbackJob?.isActive == true) return
             reasoningFeedbackJob = serviceScope.launch {
                 val startedAt = System.currentTimeMillis()
@@ -1532,7 +1572,7 @@ class VoiceAgentService : Service() {
         val waitFeedbackPlayed = AtomicBoolean(false)
         val slowNetworkFeedback = launch {
             delay(SLOW_NETWORK_FEEDBACK_MS)
-            if (!firstModelEvent.get() && waitFeedbackPlayed.compareAndSet(false, true)) {
+            if (speakReplies && !firstModelEvent.get() && waitFeedbackPlayed.compareAndSet(false, true)) {
                 DiagLog.i("network.wait_feedback", "elapsedMs=$SLOW_NETWORK_FEEDBACK_MS")
                 emitLog("网络响应较慢，仍在等待")
                 earcons.waiting()
@@ -1674,12 +1714,44 @@ class VoiceAgentService : Service() {
         return spoken
     }
 
+    private suspend fun prepareVisualTranscript(
+        userText: String,
+        currentUserMessageId: String,
+        attachments: List<String>,
+    ): String? {
+        val imagePaths = attachments.filter(::isImageAttachment)
+        if (imagePaths.isEmpty() || llmProviderRepository.activeProfile().supportsImages) return null
+        if (!capabilityResolver.defaultLlmAvailable()) {
+            return "[视觉转写不可用：默认多模态模型未配置。不得猜测图片内容。]"
+        }
+        val images = imagePaths.mapNotNull { path ->
+            runCatching { imageEncoder.encode(path) }
+                .onFailure { Timber.w(it, "Multimodal transcription image encode failed path=$path") }
+                .getOrNull()
+        }
+        if (images.isEmpty()) return "[视觉转写失败：附件无法读取。不得猜测图片内容。]"
+        val recent = store.llmHistory(excludeMessageId = currentUserMessageId)
+            .filter { it.role == "user" || it.role == "assistant" }
+            .takeLast(6)
+        return runCatching {
+            multimodalTranscriber.transcribe(userText, recent, images)
+        }.onFailure { error ->
+            Timber.w(error, "Multimodal transcription failed")
+            val notice = "图片转写失败：${error.message ?: error.javaClass.simpleName}"
+            store.addMessage("system", notice)
+            EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, notice))
+        }.getOrElse {
+            "[视觉转写失败：默认多模态模型未能理解附件。不得猜测图片内容。]"
+        }
+    }
+
     private suspend fun buildMessages(
         userText: String,
         currentUserMessageId: String,
         source: String,
         turnNote: String? = null,
         attachments: List<String> = emptyList(),
+        visualTranscript: String? = null,
     ): List<CloudSpeechClient.LlmMessage> {
         val history = store.llmHistory(excludeMessageId = currentUserMessageId)
         val currentAttachmentPaths = attachments.filter(::isImageAttachment)
@@ -1707,6 +1779,8 @@ class VoiceAgentService : Service() {
         return buildList {
         add(CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()))
         val runtimeContext = buildString {
+            appendLine(deviceContextProvider.build(source, currentNetworkLabel()))
+            appendLine()
             append("Agent 虚拟文件系统：\n")
             append(executionEnv.virtualRootSummary())
             append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
@@ -1740,7 +1814,14 @@ class VoiceAgentService : Service() {
                 ) + buildString {
                     if (attachments.isNotEmpty()) append("\n本轮附件：\n${attachments.joinToString("\n") { "- $it" }}")
                     if (!providerSupportsImages && currentAttachmentPaths.isNotEmpty()) {
-                        append("\n当前聊天模型未启用图片输入能力，只能看到图片路径，不能直接理解画面。")
+                        if (visualTranscript != null) {
+                            append("\n\n<multimodal_transcript>\n")
+                            append(visualTranscript)
+                            append("\n</multimodal_transcript>")
+                            append("\n以上内容由默认多模态模型转写，不是用户原文，可能遗漏细节；不得把其中不确定内容当成事实。")
+                        } else {
+                            append("\n当前聊天模型未启用图片输入能力，只能看到图片路径，不能直接理解画面。")
+                        }
                     }
                 },
                 attachmentPaths = attachments,
@@ -1869,7 +1950,11 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private suspend fun createNewConversation(text: String, greet: Boolean): Boolean {
+    private suspend fun createNewConversation(
+        text: String,
+        greet: Boolean,
+        speakReplies: Boolean = true,
+    ): Boolean {
         val previousConversationId = store.currentConversationId
         store.startNewConversation(reason = text)
         locationProvider.refreshInBackground("new_topic")
@@ -1884,14 +1969,14 @@ class VoiceAgentService : Service() {
         }
         emitLog("已开启新话题，准备主动问候")
 
-        val client = ensureSpeechClient()
+        val client = if (speakReplies) ensureSpeechClient() else null
 
         updateNotification("正在问候...")
         return try {
             runAgentLoop(
                 llmClient = createLlmClient(),
-                speechClient = client,
-                speakReplies = client != null,
+                speechClient = if (speakReplies) client else null,
+                speakReplies = speakReplies && client != null,
                 messages = buildMessages(
                     userText = SESSION_GREETING_TRIGGER,
                     currentUserMessageId = SESSION_GREETING_MESSAGE_ID,
@@ -1909,12 +1994,16 @@ class VoiceAgentService : Service() {
         } catch (error: Exception) {
             Timber.w(error, "Session greeting failed")
             emitLog("新话题问候失败，使用本地问候")
-            emitSessionGreetingFallback(client)
+            emitSessionGreetingFallback(if (speakReplies) client else null)
             true
         }
     }
 
-    private suspend fun requestNewConversation(text: String, greet: Boolean): Boolean {
+    private suspend fun requestNewConversation(
+        text: String,
+        greet: Boolean,
+        speakReplies: Boolean = true,
+    ): Boolean {
         val now = SystemClock.elapsedRealtime()
         val previous = lastNewConversationRequestAt.get()
         if (now - previous < NEW_CONVERSATION_DEBOUNCE_MS ||
@@ -1929,7 +2018,7 @@ class VoiceAgentService : Service() {
         }
         EventBus.emitConversationBusy(true)
         return try {
-            turnMutex.withLock { createNewConversation(text, greet) }
+            turnMutex.withLock { createNewConversation(text, greet, speakReplies) }
         } finally {
             newConversationInProgress.set(false)
             EventBus.emitConversationBusy(false)
@@ -2007,8 +2096,28 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun createLlmClient(): LlmClient =
-        OpenAiCompatibleLlmClient(capabilityResolver.llmConfig())
+    private fun createLlmClient(): LlmClient {
+        val active = llmProviderRepository.activeProfile()
+        val primary = OpenAiCompatibleLlmClient(capabilityResolver.llmConfig())
+        if (active.builtIn || !capabilityResolver.defaultLlmAvailable()) return primary
+        return FallbackLlmClient(
+            primary = primary,
+            fallbackProvider = {
+                OpenAiCompatibleLlmClient(capabilityResolver.defaultLlmConfig())
+            },
+            onFallback = { error ->
+                llmProviderRepository.activateBuiltIn()
+                val reason = when (error) {
+                    is LlmHttpException -> "HTTP ${error.statusCode}"
+                    else -> error.message ?: error.javaClass.simpleName
+                }
+                val message = "自定义 LLM 当前不可用，已切回默认模型。原因：$reason"
+                store.addMessage("system", message)
+                EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+                emitLog(message)
+            },
+        )
+    }
 
     private suspend fun playFullTtsSentence(client: CloudSpeechClient, sentence: String) {
         if (sentence.isBlank()) return

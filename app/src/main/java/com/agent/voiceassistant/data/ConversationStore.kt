@@ -99,7 +99,7 @@ class ConversationStore(context: Context) {
             .map { message ->
                 CloudSpeechClient.LlmMessage(
                     role = message.role,
-                    content = message.content,
+                    content = message.llmContent ?: message.content,
                     toolCalls = message.toolCalls.map { call ->
                         CloudSpeechClient.ToolCall(call.id, call.name, call.arguments)
                     },
@@ -142,6 +142,15 @@ class ConversationStore(context: Context) {
             persistLocked()
         }
         return message
+    }
+
+    fun setLlmContent(messageId: String, content: String) = synchronized(lock) {
+        val session = currentSessionLocked()
+        val index = session.messages.indexOfFirst { it.id == messageId }
+        if (index < 0) return@synchronized
+        session.messages[index] = session.messages[index].copy(llmContent = content)
+        session.updatedAt = System.currentTimeMillis()
+        persistLocked()
     }
 
     fun updateMessage(
@@ -845,6 +854,7 @@ data class StoredMessage(
     val id: String,
     val role: String,
     val content: String,
+    val llmContent: String? = null,
     val timestamp: Long,
     val toolCalls: List<StoredToolCall> = emptyList(),
     val toolCallId: String? = null,

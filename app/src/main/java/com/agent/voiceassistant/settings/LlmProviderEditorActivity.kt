@@ -76,7 +76,11 @@ class LlmProviderEditorActivity : AppCompatActivity() {
             )
         }.onSuccess {
             repository.setActive(it.id)
-            Toast.makeText(this, R.string.provider_saved, Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                if (it.supportsImages) getString(R.string.provider_saved) else getString(R.string.provider_saved_text_only_warning),
+                Toast.LENGTH_LONG,
+            ).show()
             finish()
         }.onFailure { showError(it.message ?: "保存失败") }
     }

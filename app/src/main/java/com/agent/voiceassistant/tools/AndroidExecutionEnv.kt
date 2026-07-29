@@ -3,6 +3,7 @@ package com.agent.voiceassistant.tools
 import android.content.Context
 import android.util.Base64
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
+import com.agent.voiceassistant.workspace.WorkspaceTrashRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -73,6 +74,7 @@ class AndroidExecutionEnv(
     val deletedSkillsManifest = File(runtimeRoot, "skills-deleted")
     val modifiedSkillsManifest = File(runtimeRoot, "skills-user-modified")
     private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot, skillsRoot)
+    private val workspaceTrash = WorkspaceTrashRepository(appContext)
 
     init {
         listOf(runtimeRoot, logsRoot, workspaceRoot, skillsRoot, disabledSkillsRoot).forEach(File::mkdirs)
@@ -163,6 +165,9 @@ class AndroidExecutionEnv(
         return WriteResult(pathResolver.normalize(path), content.toByteArray().size, mode.lowercase())
     }
 
+    fun trashWorkspacePath(path: String, conversationId: String? = null): WorkspaceTrashRepository.TrashEntry =
+        workspaceTrash.moveAgentPathToTrash(path, conversationId = conversationId)
+
     suspend fun exec(
         command: String,
         timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
@@ -170,6 +175,9 @@ class AndroidExecutionEnv(
     ): ExecResult {
         require(command.isNotBlank()) { "command 不能为空" }
         require(command.length <= MAX_COMMAND_CHARS) { "command 过长" }
+        require(!WorkspaceDeletePolicy.attemptsDirectDeletion(command)) {
+            "exec 不允许直接删除文件；请使用 workspace_delete，以便将 Agent 删除的内容移入回收站"
+        }
         val timeout = timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS)
         val normalizedCwd = pathResolver.normalize(cwd)
         val physicalCwd = pathResolver.resolve(normalizedCwd, write = false)

@@ -41,6 +41,7 @@ class LocalToolExecutor(
             "web.search", "websearch", "web_search" -> webSearch(action.payload)
             "read" -> readFile(action.payload)
             "write" -> writeFile(action.payload)
+            "workspace.delete" -> deleteWorkspacePath(action.payload)
             "exec" -> execCommand(action.payload)
             "http_request" -> httpRequest(action.payload)
             "code.graph.search" -> codeGraphSearch(action.payload)
@@ -356,6 +357,22 @@ class LocalToolExecutor(
                 )
             },
             onFailure = { error -> failed("write", "写入失败", error) },
+        )
+    }
+
+    private fun deleteWorkspacePath(payload: JsonObject): ToolResult {
+        val path = payload.string("path") ?: return invalidArguments("workspace.delete", "缺少 path 字段")
+        val env = executionEnv ?: return unavailable("workspace.delete")
+        return runCatching { env.trashWorkspacePath(path, store.currentConversationId) }.fold(
+            onSuccess = { entry ->
+                ToolResult(
+                    actionType = "workspace.delete",
+                    displayText = "移入回收站：${entry.name}",
+                    contextText = "已将 /workspace/${entry.originalPath} 移入回收站，保留 30 天。",
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("workspace.delete", "删除失败", error) },
         )
     }
 

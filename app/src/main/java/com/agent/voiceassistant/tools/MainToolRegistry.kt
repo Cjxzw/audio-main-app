@@ -21,7 +21,11 @@ class MainToolRegistry(
     private val taskCoordinator: AsyncTaskCoordinator? = null,
     private val taskContext: () -> TaskToolContext = { TaskToolContext("default", "") },
 ) {
-    data class TaskToolContext(val conversationId: String, val sourceTurnId: String)
+    data class TaskToolContext(
+        val conversationId: String,
+        val sourceTurnId: String,
+        val silentAudio: Boolean = false,
+    )
 
     enum class Profile {
         STANDALONE,
@@ -56,6 +60,7 @@ class MainToolRegistry(
         add(cancelTask())
         add(readFile())
         add(writeFile())
+        add(workspaceDelete())
         add(execCommand())
         add(httpRequest())
         add(codeGraphSearch())
@@ -111,6 +116,7 @@ class MainToolRegistry(
             TOOL_WEB_SEARCH -> "web.search"
             TOOL_READ -> "read"
             TOOL_WRITE -> "write"
+            TOOL_WORKSPACE_DELETE -> "workspace.delete"
             TOOL_EXEC -> "exec"
             TOOL_HTTP_REQUEST -> "http_request"
             TOOL_CODE_GRAPH_SEARCH -> "code.graph.search"
@@ -144,6 +150,10 @@ class MainToolRegistry(
                     ?: return LocalToolExecutor.ToolResult(call.name, "唱歌任务创建失败", "sing_song 缺少 lyrics。", true, false)
                 require(lyrics.length <= 2_000) { "歌词不能超过 2000 字" }
                 val title = payload.text("title") ?: "未命名歌曲"
+                val taskPayload = buildJsonObject {
+                    payload.forEach { (key, value) -> put(key, value) }
+                    put("_silent_audio", context.silentAudio)
+                }
                 val task = coordinator.submit(
                     TaskSubmission(
                         taskType = SongGenerationExecutor.TYPE,
@@ -153,7 +163,7 @@ class MainToolRegistry(
                         conversationId = context.conversationId,
                         sourceTurnId = context.sourceTurnId,
                         priority = if (payload.text("urgent")?.toBooleanStrictOrNull() == true) TaskPriority.URGENT else TaskPriority.NORMAL,
-                        inputJson = payload.toString(),
+                        inputJson = taskPayload.toString(),
                         idempotencyKey = "tool:${call.id}",
                     ),
                 )
@@ -202,6 +212,7 @@ class MainToolRegistry(
         TOOL_WEB_SEARCH -> "网络搜索"
         TOOL_READ -> "读取文件"
         TOOL_WRITE -> "写入文件"
+        TOOL_WORKSPACE_DELETE -> "移入回收站"
         TOOL_EXEC -> "执行命令"
         TOOL_HTTP_REQUEST -> "发送网络请求"
         TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
@@ -231,6 +242,7 @@ class MainToolRegistry(
             TOOL_READ -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
                 ?: (payload["paths"] as? JsonArray)?.size?.let { "$it 个项目" }
             TOOL_WRITE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
+            TOOL_WORKSPACE_DELETE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
             TOOL_EXEC -> payload.text("command")?.lineSequence()?.firstOrNull()
             TOOL_HTTP_REQUEST -> payload.text("url")
             TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
@@ -541,9 +553,20 @@ class MainToolRegistry(
         }
     }
 
+    private fun workspaceDelete() = tool(
+        name = TOOL_WORKSPACE_DELETE,
+        description = "删除 /workspace 中的文件或目录。Agent 删除内容时必须使用本工具，内容会移入用户可恢复的回收站并保留 30 天；不要通过 exec 的 rm、rmdir、unlink 或 find -delete 绕过回收站。",
+        required = listOf("path"),
+    ) {
+        putJsonObject("path") {
+            put("type", "string")
+            put("description", "需要删除的 /workspace 绝对虚拟路径；不能删除工作区根目录")
+        }
+    }
+
     private fun execCommand() = tool(
         name = TOOL_EXEC,
-        description = "在 Android App 自身 UID 沙箱中执行一次性 shell 命令。通过 cwd 选择 /source、/logs、/workspace 或 /skills 虚拟工作目录；适合日志诊断、文本处理、网络探测和短脚本，不得启动驻留或交互进程。",
+        description = "在 App 自身 UID 沙箱中执行一次性 shell 命令。通过 cwd 选择 /source、/logs、/workspace 或 /skills 虚拟工作目录；适合日志诊断、文本处理、网络探测和短脚本，不得启动驻留或交互进程。删除工作区内容必须改用 workspace_delete。",
         required = listOf("command"),
     ) {
         putJsonObject("command") {
@@ -639,6 +662,7 @@ class MainToolRegistry(
         const val TOOL_WEB_SEARCH = "web_search"
         const val TOOL_READ = "read"
         const val TOOL_WRITE = "write"
+        const val TOOL_WORKSPACE_DELETE = "workspace_delete"
         const val TOOL_EXEC = "exec"
         const val TOOL_HTTP_REQUEST = "http_request"
         const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"

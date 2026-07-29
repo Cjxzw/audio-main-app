@@ -208,6 +208,14 @@ class WorkspaceRepository(context: Context) {
         return target.lastModified()
     }
 
+    fun deletePermanently(relativePath: String) {
+        val target = resolve(relativePath)
+        require(target != root) { "不能删除工作区根目录" }
+        require(target.exists()) { "文件不存在：$relativePath" }
+        val deleted = if (target.isDirectory) target.deleteRecursively() else target.delete()
+        require(deleted) { "无法删除：$relativePath" }
+    }
+
     /**
      * Some older sharing apps still expose a raw file:// URI. On modern Android,
      * resolving its indexed MediaStore row gives us a permission-aware content URI.

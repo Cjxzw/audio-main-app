@@ -277,6 +277,13 @@ class LlmProvidersFragment : PreferenceFragmentCompat() {
                 val selected = profiles.firstOrNull { it.id == newValue } ?: return@setOnPreferenceChangeListener false
                 repository.setActive(selected.id)
                 preference.summary = selected.displayName
+                if (!selected.supportsImages) {
+                    Toast.makeText(
+                        requireContext(),
+                        R.string.provider_text_only_selection_warning,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
                 true
             }
         })
@@ -288,7 +295,10 @@ class LlmProvidersFragment : PreferenceFragmentCompat() {
         profiles.forEach { profile ->
             providerCategory.addPreference(Preference(requireContext()).apply {
                 title = profile.displayName
-                summary = "${profile.modelId} · ${profile.baseUrl}"
+                summary = buildString {
+                    append("${profile.modelId} · ${profile.baseUrl}")
+                    if (!profile.supportsImages) append(" · 纯文本")
+                }
                 isEnabled = !profile.builtIn
                 if (!profile.builtIn) {
                     setOnPreferenceClickListener {

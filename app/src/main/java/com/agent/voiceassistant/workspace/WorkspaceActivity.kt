@@ -18,6 +18,8 @@ import com.agent.voiceassistant.R
 import com.agent.voiceassistant.databinding.ActivityWorkspaceBinding
 import com.agent.voiceassistant.editor.TextEditorActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.badge.BadgeDrawable
+import com.google.android.material.badge.BadgeUtils
 import java.text.DateFormat
 import java.util.Date
 
@@ -26,16 +28,26 @@ class WorkspaceActivity : AppCompatActivity() {
     private lateinit var repository: WorkspaceRepository
     private lateinit var adapter: WorkspaceAdapter
     private var currentDirectory = ""
+    private var trashBadge: BadgeDrawable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityWorkspaceBinding.inflate(layoutInflater)
         setContentView(binding.root)
         repository = WorkspaceRepository(this)
-        adapter = WorkspaceAdapter(::openEntry)
+        adapter = WorkspaceAdapter(::openEntry, ::confirmDelete)
         binding.rvWorkspace.layoutManager = LinearLayoutManager(this)
         binding.rvWorkspace.adapter = adapter
         binding.workspaceToolbar.setNavigationOnClickListener { navigateBack() }
+        binding.workspaceToolbar.inflateMenu(R.menu.menu_workspace)
+        binding.workspaceToolbar.setOnMenuItemClickListener { item ->
+            if (item.itemId == R.id.action_workspace_trash) {
+                startActivity(Intent(this, WorkspaceTrashActivity::class.java))
+                true
+            } else {
+                false
+            }
+        }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = navigateBack()
         })
@@ -47,6 +59,7 @@ class WorkspaceActivity : AppCompatActivity() {
     }
 
     private fun reload() {
+        updateTrashBadge()
         runCatching { repository.list(currentDirectory) }
             .onSuccess { entries ->
                 binding.tvWorkspacePath.text = "/workspace${currentDirectory.takeIf(String::isNotBlank)?.let { "/$it" }.orEmpty()}"
@@ -67,6 +80,7 @@ class WorkspaceActivity : AppCompatActivity() {
             if (repository.canEdit(entry.relativePath)) add(getString(R.string.workspace_edit))
             add(getString(R.string.workspace_open_external))
             add(getString(R.string.workspace_share))
+            add(getString(R.string.workspace_delete_permanently))
         }
         MaterialAlertDialogBuilder(this)
             .setTitle(entry.name)
@@ -82,9 +96,41 @@ class WorkspaceActivity : AppCompatActivity() {
                     )
                     getString(R.string.workspace_open_external) -> openExternal(entry)
                     getString(R.string.workspace_share) -> share(entry)
+                    getString(R.string.workspace_delete_permanently) -> confirmDelete(entry)
                 }
             }
             .show()
+    }
+
+    private fun confirmDelete(entry: WorkspaceRepository.Entry) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.workspace_delete_confirm_title)
+            .setMessage(getString(R.string.workspace_delete_confirm_message, entry.name))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.workspace_delete_permanently) { _, _ ->
+                runCatching { repository.deletePermanently(entry.relativePath) }
+                    .onSuccess { reload() }
+                    .onFailure { showError(it.message ?: "删除失败") }
+            }
+            .show()
+    }
+
+    @androidx.annotation.OptIn(com.google.android.material.badge.ExperimentalBadgeUtils::class)
+    private fun updateTrashBadge() {
+        val menuItem = binding.workspaceToolbar.menu.findItem(R.id.action_workspace_trash) ?: return
+        val repository = WorkspaceTrashRepository(this)
+        if (!repository.hasUnread()) {
+            trashBadge?.let { BadgeUtils.detachBadgeDrawable(it, binding.workspaceToolbar, menuItem.itemId) }
+            trashBadge = null
+            return
+        }
+        trashBadge?.let { BadgeUtils.detachBadgeDrawable(it, binding.workspaceToolbar, menuItem.itemId) }
+        val badge = BadgeDrawable.create(this).apply {
+            backgroundColor = ContextCompat.getColor(this@WorkspaceActivity, android.R.color.holo_red_dark)
+            isVisible = true
+        }
+        trashBadge = badge
+        BadgeUtils.attachBadgeDrawable(badge, binding.workspaceToolbar, menuItem.itemId)
     }
 
     private fun openExternal(entry: WorkspaceRepository.Entry) {
@@ -124,6 +170,7 @@ class WorkspaceActivity : AppCompatActivity() {
 
 private class WorkspaceAdapter(
     private val onClick: (WorkspaceRepository.Entry) -> Unit,
+    private val onLongClick: (WorkspaceRepository.Entry) -> Unit,
 ) : RecyclerView.Adapter<WorkspaceAdapter.Holder>() {
     private val entries = mutableListOf<WorkspaceRepository.Entry>()
     private val dateFormat = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
@@ -154,6 +201,10 @@ private class WorkspaceAdapter(
                 "${formatBytes(entry.size)} · ${dateFormat.format(Date(entry.modifiedAt))}"
             }
             itemView.setOnClickListener { onClick(entry) }
+            itemView.setOnLongClickListener {
+                onLongClick(entry)
+                true
+            }
         }
 
         private fun formatBytes(bytes: Long): String = when {

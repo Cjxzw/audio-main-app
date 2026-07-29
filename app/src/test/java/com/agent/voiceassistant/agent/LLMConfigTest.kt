@@ -9,17 +9,19 @@ class LLMConfigTest {
     fun systemPromptContainsOnlyStableInstructions() {
         val prompt = buildMainSystemPrompt()
 
-        assertTrue(prompt.contains("喊我（Hanwo）"))
-        assertTrue(prompt.contains("独立运行在 Android 手机上"))
-        assertTrue(prompt.contains("绝不能要求用户必须连接外部设备"))
+        assertTrue(prompt.contains("英文名“Hanwo”"))
+        assertTrue(prompt.contains("独立运行在手机上"))
+        assertFalse(prompt.contains("独立运行在 Android 手机上"))
         assertFalse(prompt.contains("本回合思考策略"))
         assertFalse(prompt.contains("当前时间"))
         assertFalse(prompt.contains("当前是快速模式"))
         assertTrue(prompt.contains("agent_sleep"))
         assertTrue(prompt.contains("用户只是讨论、引用或询问这些词语时不得调用"))
         assertTrue(prompt.contains("<DETAILS>...</DETAILS>"))
-        assertTrue(prompt.contains("普通 JSON、数组、Markdown 和代码围栏都是合法正文"))
-        assertTrue(prompt.contains("复杂回复案例"))
+        assertTrue(prompt.contains("<device_context>"))
+        assertTrue(prompt.contains("<multimodal_transcript>"))
+        assertTrue(prompt.contains("workspace_delete"))
+        assertTrue(prompt.contains("回收站"))
         assertTrue(prompt.contains("不得在尚未搜索时直接回答“不知道”"))
         assertTrue(prompt.contains("资料可能冷门"))
         assertTrue(prompt.contains("只有用户意图或必要条件不明确时才简短追问"))
@@ -29,9 +31,8 @@ class LLMConfigTest {
         assertTrue(prompt.contains("两个相互独立的可靠来源交叉验证"))
         assertTrue(prompt.contains("不得编造来源、数字或引用"))
         assertFalse(buildTurnGuidance().contains("不要使用 Markdown"))
-        assertTrue(buildTurnGuidance().contains("搜索不依赖深度思考"))
-        assertTrue(buildTurnGuidance().contains("结果不足、噪声大或互相冲突时"))
-        assertTrue(buildTurnGuidance().contains("关键事实优先使用一手来源"))
+        assertTrue(buildTurnGuidance().contains("连续3轮"))
+        assertTrue(buildTurnGuidance().contains("每个用户回合最多申请一次"))
     }
 
     @Test

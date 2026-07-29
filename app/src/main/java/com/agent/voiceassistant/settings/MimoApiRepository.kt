@@ -77,5 +77,9 @@ class AppCapabilityResolver(context: Context) {
         return if (!active.builtIn) llmProviders.runtimeConfig(active) else mimo.runtimeConfig(active.modelId)
     }
 
+    fun defaultLlmAvailable(): Boolean = mimo.hasValidKey()
+
+    fun defaultLlmConfig(): LLMConfig = mimo.runtimeConfig()
+
     fun speechConfig(): LLMConfig = mimo.runtimeConfig()
 }

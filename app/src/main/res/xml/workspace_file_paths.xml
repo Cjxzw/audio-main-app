@@ -3,4 +3,7 @@
     <files-path
         name="workspace"
         path="agent-runtime/workspace/" />
+    <files-path
+        name="workspace_trash"
+        path="agent-runtime/workspace-trash/data/" />
 </paths>

@@ -40,6 +40,8 @@ class LlmProviderRepository(context: Context) {
         preferences.edit().putString(KEY_ACTIVE, id).apply()
     }
 
+    fun activateBuiltIn() = setActive(BUILT_IN_ID)
+
     fun profile(id: String?): LlmProviderProfile? = profiles().firstOrNull { it.id == id }
 
     fun save(

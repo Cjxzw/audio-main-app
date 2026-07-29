@@ -7,6 +7,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.transition.AutoTransition
+import android.transition.TransitionManager
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -142,9 +145,17 @@ class MainActivity : AppCompatActivity() {
         )
         val pageAdapter = MainPageAdapter(mainPages)
         binding.pagePager.adapter = pageAdapter
+        // Use ViewPager2's paging slop so short horizontal drags in the chat do not switch pages.
+        (binding.pagePager.getChildAt(0) as? RecyclerView)
+            ?.setScrollingTouchSlop(RecyclerView.TOUCH_SLOP_PAGING)
         pageTabsMediator = TabLayoutMediator(binding.pageTabs, binding.pagePager) { tab, position ->
             tab.setText(pageAdapter.pages[position].titleRes)
         }.also(TabLayoutMediator::attach)
+        binding.pagePager.registerOnPageChangeCallback(object : androidx.viewpager2.widget.ViewPager2.OnPageChangeCallback() {
+            override fun onPageSelected(position: Int) {
+                if (position != 0) hideAttachmentPanel()
+            }
+        })
         MainMediaLibraryService.ensureStarted(this)
         ensureNotificationPermissionAndBootstrap()
 
@@ -206,7 +217,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        homeBinding.btnAttach.setOnClickListener { showAttachmentMenu() }
+        homeBinding.btnAttach.setOnClickListener { toggleAttachmentPanel() }
+        homeBinding.btnAttachmentPhotos.setOnClickListener {
+            hideAttachmentPanel()
+            photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        }
+        homeBinding.btnAttachmentCamera.setOnClickListener {
+            hideAttachmentPanel()
+            runCatching { workspace.createCameraTarget() }
+                .onSuccess { (file, uri) ->
+                    pendingCameraFile = file
+                    camera.launch(uri)
+                }
+                .onFailure { showMessage(it.message ?: "无法启动相机") }
+        }
+        homeBinding.btnAttachmentFiles.setOnClickListener {
+            hideAttachmentPanel()
+            filePicker.launch(arrayOf("*/*"))
+        }
         binding.btnNewConversation.setOnClickListener {
             showMessage(getString(R.string.conversation_new_preparing))
             VoiceAgentService.newConversation(this)
@@ -223,6 +251,8 @@ class MainActivity : AppCompatActivity() {
             override fun handleOnBackPressed() {
                 if (binding.drawerLayout.isDrawerOpen(GravityCompat.START)) {
                     binding.drawerLayout.closeDrawer(GravityCompat.START)
+                } else if (isAttachmentPanelVisible()) {
+                    hideAttachmentPanel()
                 } else {
                     isEnabled = false
                     onBackPressedDispatcher.onBackPressed()
@@ -240,6 +270,17 @@ class MainActivity : AppCompatActivity() {
             } else {
                 false
             }
+        }
+        homeBinding.etTextInput.setOnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) hideAttachmentPanel(animate = false)
+        }
+        homeBinding.etTextInput.setOnTouchListener { _, event ->
+            // This runs before EditText asks the system to show the IME. Removing the panel
+            // synchronously lets adjustResize measure the composer against the keyboard.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                hideAttachmentPanel(animate = false)
+            }
+            false
         }
 
         observeEventBus()
@@ -283,32 +324,41 @@ class MainActivity : AppCompatActivity() {
         val attachments = pendingAttachments.map(WorkspaceRepository.Entry::virtualPath)
         val effectiveText = text.ifBlank { "请查看这些附件。" }
         homeBinding.etTextInput.setText("")
+        hideAttachmentPanel()
         pendingAttachments.clear()
         updatePendingAttachments()
         VoiceAgentService.sendText(this, effectiveText, attachments)
     }
 
-    private fun showAttachmentMenu() {
-        val labels = arrayOf(
-            getString(R.string.attachment_files),
-            getString(R.string.attachment_photos),
-            getString(R.string.attachment_camera),
-        )
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.attachment_add)
-            .setItems(labels) { _, which ->
-                when (which) {
-                    0 -> filePicker.launch(arrayOf("*/*"))
-                    1 -> photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    2 -> runCatching { workspace.createCameraTarget() }
-                        .onSuccess { (file, uri) ->
-                            pendingCameraFile = file
-                            camera.launch(uri)
-                        }
-                        .onFailure { showMessage(it.message ?: "无法启动相机") }
-                }
-            }
-            .show()
+    private fun toggleAttachmentPanel() {
+        if (isAttachmentPanelVisible()) {
+            hideAttachmentPanel()
+            return
+        }
+        homeBinding.etTextInput.clearFocus()
+        hideKeyboard()
+        setAttachmentPanelVisible(true)
+    }
+
+    private fun hideAttachmentPanel(animate: Boolean = true) = setAttachmentPanelVisible(false, animate)
+
+    private fun isAttachmentPanelVisible(): Boolean =
+        homeBinding.attachmentPanel.visibility == View.VISIBLE
+
+    private fun setAttachmentPanelVisible(visible: Boolean, animate: Boolean = true) {
+        if (isAttachmentPanelVisible() == visible) return
+        if (animate && homeBinding.root.isLaidOut) {
+            TransitionManager.beginDelayedTransition(
+                homeBinding.root,
+                AutoTransition().apply { duration = ATTACHMENT_PANEL_ANIMATION_MS },
+            )
+        }
+        homeBinding.attachmentPanel.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    private fun hideKeyboard() {
+        val inputManager = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        inputManager.hideSoftInputFromWindow(homeBinding.etTextInput.windowToken, 0)
     }
 
     private fun importUris(uris: List<Uri>) {
@@ -627,5 +677,6 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         private const val MAX_ATTACHMENTS_PER_TURN = 6
+        private const val ATTACHMENT_PANEL_ANIMATION_MS = 220L
     }
 }
