@@ -79,6 +79,10 @@
             android:exported="false" />
 
         <activity
+            android:name=".reflection.ReflectionActivity"
+            android:exported="false" />
+
+        <activity
             android:name=".settings.SkillEditorActivity"
             android:exported="false" />
 

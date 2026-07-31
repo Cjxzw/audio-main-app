@@ -1,6 +1,7 @@
 package com.agent.voiceassistant
 
 import android.app.Application
+import com.agent.voiceassistant.hub.HubRuntime
 import timber.log.Timber
 import java.io.File
 import java.io.FileWriter
@@ -26,6 +27,8 @@ class App : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        HubRuntime.initialize(this)
 
         if (BuildConfig.DEBUG) {
             Timber.plant(Timber.DebugTree())

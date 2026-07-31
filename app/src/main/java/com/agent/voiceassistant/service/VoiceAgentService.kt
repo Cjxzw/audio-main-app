@@ -60,6 +60,11 @@ import com.agent.voiceassistant.data.RuleStore
 import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.media.AssistantNotificationContract
+import com.agent.voiceassistant.reflection.ReflectionStore
+import com.agent.voiceassistant.reflection.ReflectionValidator
+import com.agent.voiceassistant.reflection.TurnMetrics
+import com.agent.voiceassistant.reflection.TurnMetricsTracker
+import com.agent.voiceassistant.reflection.TurnReflectionRecord
 import com.agent.voiceassistant.settings.LlmProviderRepository
 import com.agent.voiceassistant.settings.SpeechPreferences
 import com.agent.voiceassistant.settings.AppCapabilityResolver
@@ -68,6 +73,8 @@ import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CodeGraphIndex
 import com.agent.voiceassistant.tools.LocationProvider
 import com.agent.voiceassistant.tools.MainToolRegistry
+import com.agent.voiceassistant.hub.HubConnectionState
+import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.tasks.AsyncTaskCoordinator
 import com.agent.voiceassistant.tasks.DelayedTestExecutor
 import com.agent.voiceassistant.tasks.SongGenerationExecutor
@@ -100,6 +107,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import timber.log.Timber
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -107,6 +116,7 @@ import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.CancellationException
@@ -324,11 +334,13 @@ class VoiceAgentService : Service() {
     private lateinit var imageEncoder: MultimodalImageEncoder
     private lateinit var multimodalTranscriber: MultimodalTranscriber
     private lateinit var deviceContextProvider: DeviceContextProvider
+    private lateinit var reflectionStore: ReflectionStore
     private val agentHarness = MainAgentHarness()
     private val memoryCompactor = ConversationMemoryCompactor()
     private lateinit var earcons: EarconPlayer
     private var dormant = true
     private val turnMutex = Mutex()
+    private val reflectionMutex = Mutex()
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
     private val assistantDrafts = ConcurrentHashMap<String, AssistantDraft>()
     private val thinkingFeedbackLock = Any()
@@ -347,6 +359,7 @@ class VoiceAgentService : Service() {
         store = ConversationStore(this)
         ruleStore = RuleStore(this)
         llmProviderRepository = LlmProviderRepository(this)
+        reflectionStore = ReflectionStore(this)
         speechPreferences = SpeechPreferences(this)
         capabilityResolver = AppCapabilityResolver(this)
         locationProvider = LocationProvider(this, store)
@@ -919,6 +932,9 @@ class VoiceAgentService : Service() {
                 }
 
                 speechInterruptedForUrgentReport.set(false)
+                val metricsTracker = TurnMetricsTracker()
+                var reflectionContext = emptyList<CloudSpeechClient.LlmMessage>()
+                var reflectionTools = emptyList<CloudSpeechClient.ToolDefinition>()
                 val outcome = runAgentLoop(
                     llmClient = llmClient,
                     speechClient = client,
@@ -934,7 +950,28 @@ class VoiceAgentService : Service() {
                     initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
                     allowReasoningEscalation = true,
+                    metricsTracker = metricsTracker,
+                    onContextFinalized = { _, messages -> reflectionContext = messages },
+                    onInitialTools = { tools -> reflectionTools = tools },
                 )
+                val metrics = metricsTracker.snapshot()
+                val triggerReasons = metrics.reflectionTriggers()
+                val reflectionRecord = TurnReflectionRecord(
+                    turnId = metrics.turnId,
+                    conversationId = store.currentConversationId,
+                    userRequest = userText,
+                    source = source,
+                    metrics = metrics,
+                    triggerReasons = triggerReasons,
+                    status = if (triggerReasons.isEmpty()) "not_triggered" else "pending",
+                    reflectionModel = llmProviderRepository.activeProfile().modelId,
+                    contextHash = reflectionContextHash(reflectionContext),
+                )
+                reflectionStore.save(reflectionRecord)
+                logTurnMetrics(metrics, triggerReasons)
+                if (triggerReasons.isNotEmpty() && reflectionContext.isNotEmpty()) {
+                    scheduleTurnReflection(reflectionRecord, reflectionContext, reflectionTools)
+                }
                 if (ENABLE_PLAYBACK_DONE_EARCON && outcome.playedSpeech) {
                     earcons.playbackDone()
                 }
@@ -985,8 +1022,12 @@ class VoiceAgentService : Service() {
         allowReasoningEscalation: Boolean,
         toolsEnabled: Boolean = true,
         beforeSpeech: suspend () -> Unit = {},
+        metricsTracker: TurnMetricsTracker? = null,
+        onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
+        onInitialTools: (List<CloudSpeechClient.ToolDefinition>) -> Unit = {},
     ): AgentLoop.Outcome.Completed {
         var reasoningFeedbackJob: Job? = null
+        var initialToolsCaptured = false
 
         fun startReasoningFeedback(source: String) {
             if (!speakReplies) return
@@ -1013,7 +1054,11 @@ class VoiceAgentService : Service() {
                 override fun toolDefinitions(allowReasoningEscalation: Boolean) =
                     if (toolsEnabled) {
                         toolRegistry.definitions(
-                            profile = MainToolRegistry.Profile.STANDALONE,
+                            profile = if (HubRuntime.state().value == HubConnectionState.CONNECTED) {
+                                MainToolRegistry.Profile.CONNECTED
+                            } else {
+                                MainToolRegistry.Profile.STANDALONE
+                            },
                             allowReasoningEscalation = allowReasoningEscalation,
                         )
                     } else {
@@ -1024,17 +1069,25 @@ class VoiceAgentService : Service() {
                     request: CloudSpeechClient.ChatRequest,
                     beforeSpeech: suspend () -> Unit,
                     onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
-                ): AgentLoop.ModelTurn = streamModelTurn(
-                    llmClient = llmClient,
-                    speechClient = speechClient,
-                    speakReplies = speakReplies,
-                    request = request,
-                    beforeSpeech = {
-                        awaitReasoningFeedback()
-                        beforeSpeech()
-                    },
-                    onStreamEvent = onStreamEvent,
-                )
+                ): AgentLoop.ModelTurn {
+                    if (!initialToolsCaptured) {
+                        initialToolsCaptured = true
+                        onInitialTools(request.tools)
+                    }
+                    return streamModelTurn(
+                        llmClient = llmClient,
+                        speechClient = speechClient,
+                        speakReplies = speakReplies,
+                        request = request,
+                        beforeSpeech = {
+                            awaitReasoningFeedback()
+                            beforeSpeech()
+                        },
+                        onStreamEvent = onStreamEvent,
+                        onModelStreamDone = { metricsTracker?.markModelStreamDone() },
+                        onAudioStarted = { metricsTracker?.markAudioStarted() },
+                    )
+                }
 
                 override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) =
                     normalizeLegacyMessage(message)
@@ -1210,14 +1263,21 @@ class VoiceAgentService : Service() {
                         awaitReasoningFeedback()
                         beforeSpeech()
                         if (speakReplies && speechClient != null) {
-                            speakAssistantText(speechClient, optimizeSpokenReply(finalText))
+                            speakAssistantText(
+                                speechClient,
+                                optimizeSpokenReply(finalText),
+                                onAudioStarted = { metricsTracker?.markAudioStarted() },
+                            )
                             return true
                         }
                     }
                     return false
                 }
             },
-            eventSink = ::onAgentEvent,
+            eventSink = { event ->
+                metricsTracker?.onEvent(event)
+                onAgentEvent(event)
+            },
         )
         return try {
             when (val outcome = agentHarness.run(
@@ -1230,6 +1290,7 @@ class VoiceAgentService : Service() {
                     fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
                     deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
                     beforeSpeech = beforeSpeech,
+                    onContextFinalized = onContextFinalized,
                 ),
             )) {
                 is AgentLoop.Outcome.Completed -> outcome
@@ -1558,6 +1619,8 @@ class VoiceAgentService : Service() {
         request: CloudSpeechClient.ChatRequest,
         beforeSpeech: suspend () -> Unit,
         onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
+        onModelStreamDone: () -> Unit = {},
+        onAudioStarted: () -> Unit = {},
     ): AgentLoop.ModelTurn = coroutineScope {
         val allowDirectSpeech = speakReplies && speechClient != null && shouldStreamDirectSpeech(request)
         val extractor = StreamingSpeechExtractor()
@@ -1593,7 +1656,7 @@ class VoiceAgentService : Service() {
         )
         val playbackJob = launch {
             if (speechClient == null || !speakReplies) return@launch
-            val playbackSession = StreamingTtsPlaybackSession(speechClient)
+            val playbackSession = StreamingTtsPlaybackSession(speechClient, onAudioStarted)
             try {
                 var speechGateOpened = false
                 var segment = ttsQueue.receiveCatching().getOrNull()
@@ -1662,6 +1725,7 @@ class VoiceAgentService : Service() {
                     is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
                 }
             }
+            onModelStreamDone()
             if (allowDirectSpeech) {
                 val tail = extractor.finish()
                 for (segment in segmenter.feed(tail)) {
@@ -1753,6 +1817,13 @@ class VoiceAgentService : Service() {
         attachments: List<String> = emptyList(),
         visualTranscript: String? = null,
     ): List<CloudSpeechClient.LlmMessage> {
+        val hubFacts = if (HubRuntime.state().value == HubConnectionState.CONNECTED) {
+            HubRuntime.facts().value.let { facts ->
+                if (facts.eventId.isBlank()) HubRuntime.refreshFacts() else facts
+            }
+        } else {
+            null
+        }
         val history = store.llmHistory(excludeMessageId = currentUserMessageId)
         val currentAttachmentPaths = attachments.filter(::isImageAttachment)
         val providerSupportsImages = llmProviderRepository.activeProfile().supportsImages
@@ -1791,6 +1862,20 @@ class VoiceAgentService : Service() {
             append(store.ruleContext(ruleStore))
             append("\n\n跨会话长期记忆：\n")
             append(store.contextSummary())
+            if (hubFacts != null) {
+                append("\n\n枢卫 Hub 可派遣 Agent 路由表（已排除当前 Main，facts 只读）：\n")
+                val facts = hubFacts
+                val dispatchableAgents = HubRuntime.dispatchableAgents(facts)
+                if (dispatchableAgents.isEmpty()) {
+                    append("当前没有可用远程 Agent。\n")
+                } else {
+                    dispatchableAgents.forEach { agent ->
+                        val model = listOf(agent.model, agent.version).filter { it.isNotBlank() }.joinToString(" ")
+                        appendLine("- ${agent.agentId}：${agent.name}，类型=${if (agent.companion) "companion" else "executor"}，型号=$model，能力=${agent.capabilities.joinToString(",")}，说明=${agent.description}")
+                    }
+                }
+                appendLine("factsVersion=${facts.factsVersion}，委派时只能使用上表中的 agentId；不得选择 Main 自身或编造 ID。")
+            }
         }.trim()
         add(CloudSpeechClient.LlmMessage("system", runtimeContext))
         addAll(hydratedHistory)
@@ -1896,13 +1981,17 @@ class VoiceAgentService : Service() {
         }
     }.getOrElse { "蜂窝网络" }
 
-    private suspend fun speakAssistantText(client: CloudSpeechClient, text: String) {
+    private suspend fun speakAssistantText(
+        client: CloudSpeechClient,
+        text: String,
+        onAudioStarted: () -> Unit = {},
+    ) {
         val sentenceBuffer = SpeechSegmenter()
         val sentences = buildList {
             addAll(sentenceBuffer.feed(text))
             sentenceBuffer.flush()?.let { add(it) }
         }
-        val playbackSession = StreamingTtsPlaybackSession(client)
+        val playbackSession = StreamingTtsPlaybackSession(client, onAudioStarted)
         var streamedAny = false
         try {
             for (sentence in sentences) {
@@ -2096,7 +2185,147 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun createLlmClient(): LlmClient {
+    private fun scheduleTurnReflection(
+        record: TurnReflectionRecord,
+        contextMessages: List<CloudSpeechClient.LlmMessage>,
+        tools: List<CloudSpeechClient.ToolDefinition>,
+    ) {
+        serviceScope.launch {
+            reflectionMutex.withLock {
+                runTurnReflection(record, contextMessages, tools)
+            }
+        }
+    }
+
+    private suspend fun runTurnReflection(
+        record: TurnReflectionRecord,
+        contextMessages: List<CloudSpeechClient.LlmMessage>,
+        tools: List<CloudSpeechClient.ToolDefinition>,
+    ) {
+        val baseMessages = contextMessages + CloudSpeechClient.LlmMessage(
+            role = "system",
+            content = buildReflectionInstruction(record),
+        )
+        var correction = ""
+        var lastFailure = "unknown"
+        repeat(3) { attempt ->
+            val client = runCatching { createLlmClient(silent = true) }.getOrElse { error ->
+                lastFailure = error.message ?: error.javaClass.simpleName
+                return@repeat
+            }
+            try {
+                val messages = if (correction.isBlank()) {
+                    baseMessages
+                } else {
+                    baseMessages + CloudSpeechClient.LlmMessage("system", correction)
+                }
+                val completion = withTimeoutOrNull(60_000) {
+                    client.streamChat(
+                        CloudSpeechClient.ChatRequest(
+                            messages = messages,
+                            tools = tools,
+                            thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
+                            maxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
+                        ),
+                    ) { }
+                }
+                if (completion == null) {
+                    lastFailure = "timeout"
+                    correction = reflectionRepairInstruction("上次反思请求超时")
+                    return@repeat
+                }
+                if (completion.message.toolCalls.isNotEmpty()) {
+                    lastFailure = "tool_call_returned"
+                    correction = reflectionRepairInstruction("上次返回了工具调用")
+                    return@repeat
+                }
+                val content = completion.message.content.orEmpty().trim()
+                val parsed = ReflectionValidator.parse(content)
+                if (parsed.isFailure) {
+                    lastFailure = parsed.exceptionOrNull()?.message ?: "invalid_json"
+                    correction = reflectionRepairInstruction("上次输出校验失败：$lastFailure")
+                    return@repeat
+                }
+                reflectionStore.save(
+                    record.copy(
+                        status = "completed",
+                        analysis = parsed.getOrThrow(),
+                        rawReflection = content,
+                        attemptCount = attempt + 1,
+                        completedAt = System.currentTimeMillis(),
+                    ),
+                )
+                DiagLog.i(
+                    "agent.reflection.completed",
+                    "turn=${record.turnId} attempts=${attempt + 1} triggers=${record.triggerReasons.joinToString("|")}",
+                )
+                return
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                lastFailure = error.message ?: error.javaClass.simpleName
+                correction = reflectionRepairInstruction("上次反思请求失败：$lastFailure")
+            } finally {
+                client.close()
+            }
+        }
+        reflectionStore.save(
+            record.copy(
+                status = "failed",
+                attemptCount = 3,
+                completedAt = System.currentTimeMillis(),
+            ),
+        )
+        DiagLog.w("agent.reflection.failed", "turn=${record.turnId} reason=$lastFailure")
+    }
+
+    private fun buildReflectionInstruction(record: TurnReflectionRecord): String = buildString {
+        appendLine("这是内部反思回合，不是用户的新请求。切勿调用任何工具，不得向用户答复。")
+        appendLine("请结合前面的完整会话和本回合运行轨迹，判断用户实际交办了什么任务、任务性质、是否更适合委派，以及本次为什么没有或已经进行了委派。")
+        appendLine("反思结果仅用于影子统计，不会直接改变路由策略。不要输出思考过程，只输出一个严格 JSON 对象，不要使用 Markdown 代码围栏。")
+        appendLine("本回合客观指标：${Json.encodeToString(record.metrics)}")
+        appendLine("触发原因：${record.triggerReasons.joinToString("；")}")
+        appendLine("JSON 必须严格包含以下字段：")
+        appendLine(
+            "{\"title\":\"[反思] 简短标题\",\"taskSummary\":\"任务摘要\"," +
+                "\"taskNature\":[\"research\"],\"complexity\":\"low|medium|high\"," +
+                "\"delegationAssessment\":\"prefer_delegate|prefer_local|uncertain\"," +
+                "\"preferredCapabilities\":[\"research\"],\"whyDelegateOrNot\":\"判断依据\"," +
+                "\"whyNotDelegated\":\"未委派原因；已委派则说明触发原因\"," +
+                "\"lesson\":\"可供统计归纳的经验\",\"confidence\":0.0}",
+        )
+    }
+
+    private fun reflectionRepairInstruction(reason: String): String =
+        "$reason。请重新完成内部反思。不得调用任何工具，只能输出上一条系统消息指定的严格 JSON 对象。"
+
+    private fun reflectionContextHash(messages: List<CloudSpeechClient.LlmMessage>): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        messages.forEach { message ->
+            digest.update(message.role.toByteArray())
+            digest.update(message.content.orEmpty().toByteArray())
+            message.toolCalls.forEach { call ->
+                digest.update(call.id.toByteArray())
+                digest.update(call.name.toByteArray())
+                digest.update(call.arguments.toByteArray())
+            }
+            message.imageInputs.forEach { image -> digest.update(image.base64Data.toByteArray()) }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun logTurnMetrics(metrics: TurnMetrics, triggers: List<String>) {
+        DiagLog.i(
+            "agent.turn.metrics",
+            "turn=${metrics.turnId} totalMs=${metrics.totalDurationMs} firstContentMs=${metrics.timeToFirstContentMs} " +
+                "firstAudioMs=${metrics.timeToFirstAudioMs} streamMs=${metrics.streamingDurationMs} " +
+                "tools=${metrics.toolCallCount} rounds=${metrics.toolRoundCount} " +
+                "toolWallMs=${metrics.toolWallDurationMs} toolSumMs=${metrics.toolAccumulatedDurationMs} " +
+                "triggers=${triggers.joinToString("|")}",
+        )
+    }
+
+    private fun createLlmClient(silent: Boolean = false): LlmClient {
         val active = llmProviderRepository.activeProfile()
         val primary = OpenAiCompatibleLlmClient(capabilityResolver.llmConfig())
         if (active.builtIn || !capabilityResolver.defaultLlmAvailable()) return primary
@@ -2112,9 +2341,13 @@ class VoiceAgentService : Service() {
                     else -> error.message ?: error.javaClass.simpleName
                 }
                 val message = "自定义 LLM 当前不可用，已切回默认模型。原因：$reason"
-                store.addMessage("system", message)
-                EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
-                emitLog(message)
+                if (silent) {
+                    DiagLog.w("agent.reflection.fallback", message)
+                } else {
+                    store.addMessage("system", message)
+                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
+                    emitLog(message)
+                }
             },
         )
     }
@@ -2174,6 +2407,7 @@ class VoiceAgentService : Service() {
 
     private inner class StreamingTtsPlaybackSession(
         private val client: CloudSpeechClient,
+        private val onAudioStarted: () -> Unit = {},
     ) {
         private var audioTrack: AudioTrack? = null
         private var bytesWritten = 0
@@ -2378,6 +2612,7 @@ class VoiceAgentService : Service() {
         private fun logPlaybackStarted() {
             if (!playbackStartedLogged) {
                 playbackStartedLogged = true
+                onAudioStarted()
                 Timber.i(
                     "Latency audio playback_start elapsed=${System.currentTimeMillis() - startedAt}ms " +
                         "bufferedBytes=$bytesWritten",

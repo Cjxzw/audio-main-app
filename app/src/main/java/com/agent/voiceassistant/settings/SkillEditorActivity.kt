@@ -19,6 +19,7 @@ import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.databinding.ActivitySkillEditorBinding
 import com.agent.voiceassistant.editor.TextEditorActivity
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
+import com.agent.voiceassistant.ui.showLightDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.text.DateFormat
 import java.util.Date
@@ -136,12 +137,12 @@ class SkillEditorActivity : AppCompatActivity() {
             finish()
             return
         }
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.text_editor_discard_title)
             .setMessage(R.string.text_editor_discard_message)
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(R.string.text_editor_discard) { _, _ -> finish() }
-            .show()
+            .showLightDialog()
     }
 
     private fun fail(message: String) {

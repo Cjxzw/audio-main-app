@@ -17,6 +17,7 @@ import com.agent.voiceassistant.data.StoredMemory
 import com.agent.voiceassistant.data.UserRule
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.workspace.WorkspaceRepository
+import com.agent.voiceassistant.ui.showLightDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.tables.TablePlugin
@@ -197,12 +198,12 @@ class TextEditorActivity : AppCompatActivity() {
             finish()
             return
         }
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.text_editor_discard_title)
             .setMessage(R.string.text_editor_discard_message)
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(R.string.text_editor_discard) { _, _ -> finish() }
-            .show()
+            .showLightDialog()
     }
 
     private fun fail(message: String) {

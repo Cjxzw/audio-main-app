@@ -15,6 +15,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.databinding.ActivityWorkspaceBinding
+import com.agent.voiceassistant.ui.showLightDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.text.DateFormat
 import java.util.Date
@@ -57,7 +58,7 @@ class WorkspaceTrashActivity : AppCompatActivity() {
             add(getString(R.string.workspace_restore))
             add(getString(R.string.workspace_delete_permanently))
         }
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(entry.name)
             .setItems(labels.toTypedArray()) { _, index ->
                 when (labels[index]) {
@@ -67,17 +68,17 @@ class WorkspaceTrashActivity : AppCompatActivity() {
                     getString(R.string.workspace_delete_permanently) -> confirmDelete(entry)
                 }
             }
-            .show()
+            .showLightDialog()
     }
 
     private fun preview(entry: WorkspaceTrashRepository.TrashEntry) {
         runCatching { repository.readPreview(entry) }
             .onSuccess { text ->
-                MaterialAlertDialogBuilder(this)
+                MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
                     .setTitle(entry.name)
                     .setMessage(text)
                     .setPositiveButton(android.R.string.ok, null)
-                    .show()
+                    .showLightDialog()
             }
             .onFailure { showError(it.message ?: "预览失败") }
     }
@@ -103,7 +104,7 @@ class WorkspaceTrashActivity : AppCompatActivity() {
     }
 
     private fun confirmDelete(entry: WorkspaceTrashRepository.TrashEntry) {
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.workspace_delete_confirm_title)
             .setMessage(getString(R.string.workspace_delete_confirm_message, entry.name))
             .setNegativeButton(android.R.string.cancel, null)
@@ -111,7 +112,7 @@ class WorkspaceTrashActivity : AppCompatActivity() {
                 repository.deletePermanently(entry.id)
                 reload()
             }
-            .show()
+            .showLightDialog()
     }
 
     private fun showError(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()

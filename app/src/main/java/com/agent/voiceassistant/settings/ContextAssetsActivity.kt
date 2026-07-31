@@ -17,6 +17,7 @@ import com.agent.voiceassistant.data.RuleStore
 import com.agent.voiceassistant.databinding.ActivityContextAssetsBinding
 import com.agent.voiceassistant.editor.TextEditorActivity
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
+import com.agent.voiceassistant.ui.showLightDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 
@@ -117,7 +118,7 @@ class ContextAssetsActivity : AppCompatActivity() {
     }
 
     private fun confirmDelete(item: ContextAssetItem) {
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.context_asset_delete_confirm_title)
             .setMessage(getString(R.string.context_asset_delete_confirm_message, item.title))
             .setNegativeButton(android.R.string.cancel, null)
@@ -129,7 +130,7 @@ class ContextAssetsActivity : AppCompatActivity() {
                 }
                 reload()
             }
-            .show()
+            .showLightDialog()
     }
 
     private fun showError(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()

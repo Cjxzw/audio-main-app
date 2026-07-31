@@ -15,6 +15,10 @@
         <item name="android:navigationBarColor">@color/app_background</item>
         <item name="android:statusBarColor">@color/white</item>
         <item name="android:windowLightStatusBar">true</item>
+        <item name="preferenceTheme">@style/PreferenceThemeOverlay.VoiceAssistant</item>
+        <item name="materialAlertDialogTheme">@style/Theme.VoiceAssistant.PreferenceDialog</item>
+        <item name="alertDialogTheme">@style/Theme.VoiceAssistant.PreferenceDialog</item>
+        <item name="android:alertDialogTheme">@style/Theme.VoiceAssistant.PreferenceDialog</item>
     </style>
 
     <style name="Theme.VoiceAssistant.Assist" parent="@android:style/Theme.Translucent.NoTitleBar">
@@ -34,6 +38,29 @@
         <item name="android:textColorSecondary">@color/text_secondary</item>
         <item name="textAppearanceLargePopupMenu">@style/TextAppearance.VoiceAssistant.PopupMenu</item>
         <item name="textAppearanceSmallPopupMenu">@style/TextAppearance.VoiceAssistant.PopupMenu</item>
+    </style>
+
+    <style name="PreferenceThemeOverlay.VoiceAssistant" parent="PreferenceThemeOverlay.v14.Material">
+        <item name="android:windowBackground">@color/white</item>
+        <item name="android:colorBackground">@color/white</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="materialAlertDialogTheme">@style/Theme.VoiceAssistant.PreferenceDialog</item>
+        <item name="alertDialogTheme">@style/Theme.VoiceAssistant.PreferenceDialog</item>
+        <item name="android:alertDialogTheme">@style/Theme.VoiceAssistant.PreferenceDialog</item>
+    </style>
+
+    <style name="Theme.VoiceAssistant.PreferenceDialog" parent="Theme.Material3.Light.Dialog.Alert">
+        <item name="colorSurface">@color/white</item>
+        <item name="colorSurfaceContainerHigh">@color/white</item>
+        <item name="colorOnSurface">@color/black</item>
+        <item name="colorOnSurfaceVariant">@color/text_primary</item>
+        <item name="android:colorBackground">@color/white</item>
+        <item name="android:windowBackground">@color/white</item>
+        <item name="android:textColorPrimary">@color/black</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:backgroundDimAmount">0.55</item>
     </style>
 
     <style name="TextAppearance.VoiceAssistant.PopupMenu" parent="TextAppearance.AppCompat.Widget.PopupMenu.Large">

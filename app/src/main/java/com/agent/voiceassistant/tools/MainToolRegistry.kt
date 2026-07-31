@@ -2,6 +2,7 @@ package com.agent.voiceassistant.tools
 
 import com.agent.voiceassistant.agent.AgentAction
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.tasks.AsyncTaskCoordinator
 import com.agent.voiceassistant.tasks.SongGenerationExecutor
 import com.agent.voiceassistant.tasks.TaskPriority
@@ -68,10 +69,7 @@ class MainToolRegistry(
         add(skillRegister())
         if (allowReasoningEscalation) add(reasoningEscalation())
 
-        // Hub tools are added here once the connected profile has a live Hub client.
-        if (profile == Profile.DIAGNOSTIC) {
-            // Diagnostic currently changes event visibility, not the model's authority.
-        }
+        if (profile == Profile.CONNECTED) add(hubDispatchTask())
     }
 
     fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean =
@@ -104,6 +102,9 @@ class MainToolRegistry(
 
     suspend fun execute(call: CloudSpeechClient.ToolCall): Execution {
         val payload = parseArguments(call.arguments)
+        if (call.name == TOOL_HUB_DISPATCH_TASK) {
+            return Execution(call, executeHubDispatch(payload))
+        }
         if (call.name in ASYNC_TASK_TOOL_NAMES) {
             return Execution(call, executeAsyncTaskTool(call, payload))
         }
@@ -130,6 +131,94 @@ class MainToolRegistry(
             rawJson = call.arguments,
         )
         return Execution(call, executor.execute(action))
+    }
+
+    private suspend fun executeHubDispatch(payload: JsonObject): LocalToolExecutor.ToolResult {
+        val target = payload.text("target_agent_id") ?: payload.text("targetAgentId")
+        val title = payload.text("title")
+        val summary = payload.text("summary")
+        val instructions = payload.text("instructions")
+        val expectedOutput = payload.text("expected_output") ?: payload.text("expectedOutput")
+        if (listOf(target, title, summary, instructions, expectedOutput).any { it.isNullOrBlank() }) {
+            return LocalToolExecutor.ToolResult(
+                TOOL_HUB_DISPATCH_TASK,
+                "远程任务创建失败",
+                "Hub dispatch_task 缺少 target_agent_id、title、summary、instructions 或 expected_output。",
+                true,
+                false,
+            )
+        }
+        val targetFact = HubRuntime.dispatchableAgents().firstOrNull { it.agentId == target }
+        if (targetFact == null) {
+            return LocalToolExecutor.ToolResult(
+                TOOL_HUB_DISPATCH_TASK,
+                "无法下发远程任务",
+                "目标 Agent 不在当前可派遣路由表中，请先刷新 Hub 路由表并选择在线执行器的 agentId。",
+                true,
+                false,
+            )
+        }
+        val context = taskContext()
+        val result = runCatching {
+            HubRuntime.submitAction(
+                actionType = "dispatch_task",
+                payload = buildJsonObject {
+                    put("targetAgentId", target!!)
+                    put("task", buildJsonObject {
+                        put("title", title!!)
+                        put("summary", summary!!)
+                        put("urgency", payload.text("urgency") ?: "normal")
+                        put("instructions", instructions!!)
+                        put("expectedOutput", expectedOutput!!)
+                    })
+                },
+                turnId = context.sourceTurnId,
+                conversationId = context.conversationId,
+            )
+        }.getOrElse { error ->
+            return LocalToolExecutor.ToolResult(
+                TOOL_HUB_DISPATCH_TASK,
+                "枢卫任务下发失败",
+                "Hub action 失败：${error.message ?: error.javaClass.simpleName}",
+                true,
+                false,
+            )
+        }
+        if (!result.ok) {
+            return LocalToolExecutor.ToolResult(
+                TOOL_HUB_DISPATCH_TASK,
+                "枢卫拒绝任务",
+                "Hub 拒绝任务：${result.errorCode} ${result.errorMessage}",
+                true,
+                false,
+            )
+        }
+        val taskId = result.result["taskId"]?.let { (it as? JsonPrimitive)?.content }
+            ?: result.result["task_id"]?.let { (it as? JsonPrimitive)?.content }
+            ?: "unknown"
+        return LocalToolExecutor.ToolResult(
+            TOOL_HUB_DISPATCH_TASK,
+            "已交给枢卫执行 · ${taskId.takeLast(12)}",
+            "Hub 已创建远程任务。task_id=$taskId，目标 Agent=$target。请告知用户任务已经交给远程 Agent，完成后会主动汇报。",
+            true,
+            true,
+        )
+    }
+
+    private fun hubDispatchTask() = tool(
+        name = TOOL_HUB_DISPATCH_TASK,
+        description = "通过枢卫 Hub 将重型任务交给当前路由表中的在线远程 Agent。只有用户明确要求后台执行、调研、编码或长任务时调用；必须从 Hub facts 选择真实 target_agent_id，不得编造 Agent。",
+        required = listOf("target_agent_id", "title", "summary", "instructions", "expected_output"),
+    ) {
+        putJsonObject("target_agent_id") { put("type", "string") }
+        putJsonObject("title") { put("type", "string") }
+        putJsonObject("summary") { put("type", "string") }
+        putJsonObject("instructions") { put("type", "string") }
+        putJsonObject("expected_output") { put("type", "string") }
+        putJsonObject("urgency") {
+            put("type", "string")
+            put("enum", buildJsonArray { listOf("normal", "urgent", "low").forEach { add(JsonPrimitive(it)) } })
+        }
     }
 
     private suspend fun executeAsyncTaskTool(
@@ -224,6 +313,7 @@ class MainToolRegistry(
         TOOL_SING_SONG -> "准备歌曲"
         TOOL_TASK_STATUS -> "查询任务"
         TOOL_CANCEL_TASK -> "取消任务"
+        TOOL_HUB_DISPATCH_TASK -> "下发远程任务"
         TOOL_PROTOCOL_REPAIR -> "修正工具调用格式"
         else -> toolName
     }
@@ -674,6 +764,7 @@ class MainToolRegistry(
         const val TOOL_SING_SONG = "sing_song"
         const val TOOL_TASK_STATUS = "task_status"
         const val TOOL_CANCEL_TASK = "cancel_task"
+        const val TOOL_HUB_DISPATCH_TASK = "hub_dispatch_task"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
 
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48

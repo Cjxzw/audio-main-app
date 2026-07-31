@@ -240,7 +240,7 @@ class MainMediaLibraryService : MediaLibraryService() {
         private const val EXTRA_TITLE = "title"
 
         fun ensureStarted(context: android.content.Context) {
-            context.startService(Intent(context, MainMediaLibraryService::class.java))
+            startServiceCompat(context, Intent(context, MainMediaLibraryService::class.java))
         }
 
         fun buildForegroundNotification(active: Boolean, status: String): Notification? {
@@ -262,7 +262,12 @@ class MainMediaLibraryService : MediaLibraryService() {
                 .putExtra(EXTRA_ACTIVE, active)
                 .putExtra(EXTRA_STATUS, status)
             if (!title.isNullOrBlank()) intent.putExtra(EXTRA_TITLE, title.take(120))
-            context.startService(intent)
+            startServiceCompat(context, intent)
+        }
+
+        private fun startServiceCompat(context: android.content.Context, intent: Intent) {
+            runCatching { context.startService(intent) }
+                .onFailure { DiagLog.w("media3.service.start_skipped", it.message ?: it.javaClass.simpleName) }
         }
     }
 }

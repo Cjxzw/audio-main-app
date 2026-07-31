@@ -34,6 +34,9 @@ import com.agent.voiceassistant.data.ConversationSummary
 import com.agent.voiceassistant.databinding.ActivityMainBinding
 import com.agent.voiceassistant.databinding.PageHomeBinding
 import com.agent.voiceassistant.databinding.PageTasksBinding
+import com.agent.voiceassistant.databinding.PageHubBinding
+import com.agent.voiceassistant.hub.HubConnectionState
+import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.ServiceState
@@ -44,6 +47,8 @@ import com.agent.voiceassistant.ui.ConversationAdapter
 import com.agent.voiceassistant.ui.MainPage
 import com.agent.voiceassistant.ui.MainPageAdapter
 import com.agent.voiceassistant.ui.TaskAdapter
+import com.agent.voiceassistant.ui.HubAgentAdapter
+import com.agent.voiceassistant.ui.showLightDialog
 import com.agent.voiceassistant.tasks.TaskEntity
 import com.agent.voiceassistant.tasks.TaskRepository
 import com.agent.voiceassistant.workspace.WorkspaceRepository
@@ -61,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var homeBinding: PageHomeBinding
     private lateinit var tasksBinding: PageTasksBinding
+    private lateinit var hubBinding: PageHubBinding
     private lateinit var pageTabsMediator: TabLayoutMediator
     private lateinit var store: ConversationStore
     private val chatAdapter = ChatAdapter()
@@ -68,6 +74,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var workspace: WorkspaceRepository
     private lateinit var taskRepository: TaskRepository
     private lateinit var taskAdapter: TaskAdapter
+    private lateinit var hubAgentAdapter: HubAgentAdapter
     private val pendingAttachments = mutableListOf<WorkspaceRepository.Entry>()
     private var pendingCameraFile: File? = null
     private var agentListening = false
@@ -138,10 +145,12 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         homeBinding = PageHomeBinding.inflate(layoutInflater)
         tasksBinding = PageTasksBinding.inflate(layoutInflater)
+        hubBinding = PageHubBinding.inflate(layoutInflater)
         setContentView(binding.root)
         val mainPages = listOf(
             MainPage(R.string.page_home, homeBinding.root),
             MainPage(R.string.page_tasks, tasksBinding.root),
+            MainPage(R.string.page_hub, hubBinding.root),
         )
         val pageAdapter = MainPageAdapter(mainPages)
         binding.pagePager.adapter = pageAdapter
@@ -221,6 +230,36 @@ class MainActivity : AppCompatActivity() {
         homeBinding.btnAttachmentPhotos.setOnClickListener {
             hideAttachmentPanel()
             photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        }
+        hubAgentAdapter = HubAgentAdapter()
+        hubBinding.rvHubAgents.apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            adapter = hubAgentAdapter
+        }
+        lifecycleScope.launch {
+            HubRuntime.facts().collectLatest { facts ->
+                val agents = HubRuntime.dispatchableAgents(facts)
+                hubAgentAdapter.submitList(agents)
+                hubBinding.tvHubEmpty.visibility = if (agents.isEmpty()) View.VISIBLE else View.GONE
+                if (HubRuntime.state().value == HubConnectionState.CONNECTED) {
+                    val settings = HubRuntime.settings()
+                    hubBinding.tvHubStatus.text = getString(R.string.hub_status_connected, agents.size) +
+                        if (settings.baseUrl.isNotBlank()) "\n${settings.baseUrl}" else ""
+                }
+            }
+        }
+        lifecycleScope.launch {
+            HubRuntime.state().collectLatest { state ->
+                val settings = HubRuntime.settings()
+                hubBinding.tvHubStatus.text = when (state) {
+                    HubConnectionState.DISABLED -> getString(R.string.hub_status_disabled)
+                    HubConnectionState.CONNECTING -> getString(R.string.hub_status_connecting)
+                    HubConnectionState.CONNECTED -> getString(R.string.hub_status_connected, HubRuntime.dispatchableAgents().size)
+                    HubConnectionState.AUTH_FAILED -> getString(R.string.hub_status_auth_failed)
+                    HubConnectionState.ERROR -> getString(R.string.hub_status_error)
+                    HubConnectionState.DISCONNECTED -> getString(R.string.hub_status_disconnected)
+                } + if (settings.baseUrl.isNotBlank()) "\n${settings.baseUrl}" else ""
+            }
         }
         homeBinding.btnAttachmentCamera.setOnClickListener {
             hideAttachmentPanel()
@@ -620,13 +659,16 @@ class MainActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             setSingleLine(true)
             hint = getString(R.string.conversation_rename_hint)
+            setTextColor(getColor(R.color.black))
+            setHintTextColor(getColor(R.color.text_secondary))
         }
         val container = android.widget.FrameLayout(this).apply {
+            setBackgroundColor(getColor(R.color.white))
             val horizontal = (20 * resources.displayMetrics.density).toInt()
             setPadding(horizontal, 0, horizontal, 0)
             addView(input)
         }
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.conversation_rename)
             .setView(container)
             .setNegativeButton(android.R.string.cancel, null)
@@ -634,18 +676,18 @@ class MainActivity : AppCompatActivity() {
                 val title = input.text.toString().trim()
                 if (title.isNotBlank()) VoiceAgentService.renameConversation(this, conversation.id, title)
             }
-            .show()
+            .showLightDialog()
     }
 
     private fun confirmDeleteConversation(conversation: ConversationSummary) {
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.conversation_delete_title)
             .setMessage(R.string.conversation_delete_message)
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(R.string.conversation_delete) { _, _ ->
                 VoiceAgentService.deleteConversation(this, conversation.id)
             }
-            .show()
+            .showLightDialog()
     }
 
     private fun showMessage(message: String) {
@@ -663,11 +705,11 @@ class MainActivity : AppCompatActivity() {
             if (task.error.isNotBlank()) appendLine("错误：${task.error}")
             if (task.outputPath.isNotBlank()) append("产物：${task.outputPath}")
         }.trim()
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(task.title)
             .setMessage(text)
             .setPositiveButton(android.R.string.ok, null)
-            .show()
+            .showLightDialog()
     }
 
     override fun onDestroy() {

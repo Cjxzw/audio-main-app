@@ -1,10 +1,30 @@
 package com.agent.voiceassistant.tasks
 
 import android.content.Context
+import com.agent.voiceassistant.hub.HubTaskFact
 import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
+
+private val HUB_REPORTABLE_TERMINAL_STATUSES = setOf(
+    TaskStatus.COMPLETED.name,
+    TaskStatus.FAILED.name,
+    TaskStatus.INTERRUPTED.name,
+)
+
+private val HUB_FINAL_STATUSES = HUB_REPORTABLE_TERMINAL_STATUSES + TaskStatus.CANCELLED.name
+
+internal fun nextHubReportState(
+    previousStatus: String?,
+    previousReportState: String?,
+    incomingStatus: String,
+): String = when {
+    incomingStatus !in HUB_REPORTABLE_TERMINAL_STATUSES -> TaskReportState.NONE.name
+    previousStatus == null -> TaskReportState.NONE.name
+    previousStatus in HUB_FINAL_STATUSES -> previousReportState ?: TaskReportState.NONE.name
+    else -> TaskReportState.PENDING.name
+}
 
 class TaskRepository(context: Context) {
     private val dao = TaskDatabase.get(context).taskDao()
@@ -42,6 +62,51 @@ class TaskRepository(context: Context) {
             dao.findByIdempotencyKey(submission.idempotencyKey)?.let { existing -> existing to false }
                 ?: throw it
         }
+    }
+
+    suspend fun upsertHubFact(fact: HubTaskFact) {
+        if (fact.taskId.isBlank()) return
+        val now = System.currentTimeMillis()
+        val status = when (fact.status.lowercase()) {
+            "completed" -> TaskStatus.COMPLETED.name
+            "failed" -> TaskStatus.FAILED.name
+            "interrupted" -> TaskStatus.INTERRUPTED.name
+            "cancelled" -> TaskStatus.CANCELLED.name
+            "blocked" -> TaskStatus.BLOCKED.name
+            "running" -> TaskStatus.RUNNING.name
+            "sent", "created" -> TaskStatus.QUEUED.name
+            else -> TaskStatus.QUEUED.name
+        }
+        val old = dao.get(fact.taskId)
+        val terminal = status in HUB_REPORTABLE_TERMINAL_STATUSES
+        val reportState = nextHubReportState(old?.status, old?.reportState, status)
+        dao.upsert(
+            TaskEntity(
+                taskId = fact.taskId,
+                idempotencyKey = old?.idempotencyKey ?: "hub:${fact.taskId}",
+                taskType = "hub_remote",
+                title = fact.title.ifBlank { "Hub 远程任务" },
+                origin = TaskOrigin.HUB.name,
+                executorId = fact.agentId,
+                executorName = fact.agentId,
+                conversationId = old?.conversationId ?: "default",
+                sourceTurnId = old?.sourceTurnId ?: "hub",
+                priority = old?.priority ?: TaskPriority.NORMAL.name,
+                status = status,
+                progress = if (terminal) 100 else if (status == TaskStatus.RUNNING.name) 50 else 0,
+                inputJson = old?.inputJson ?: "{}",
+                summary = fact.summary,
+                details = fact.details,
+                error = fact.failureReason.orEmpty(),
+                remoteRevision = fact.updatedAt.hashCode().toLong(),
+                reportState = reportState,
+                reportedAt = if (reportState == TaskReportState.REPORTED.name) old?.reportedAt else null,
+                createdAt = old?.createdAt ?: now,
+                startedAt = old?.startedAt ?: if (status == TaskStatus.RUNNING.name) now else null,
+                completedAt = if (terminal) old?.completedAt ?: now else null,
+                updatedAt = now,
+            ),
+        )
     }
 
     suspend fun markRunning(task: TaskEntity) {

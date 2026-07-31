@@ -17,6 +17,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.databinding.ActivityWorkspaceBinding
 import com.agent.voiceassistant.editor.TextEditorActivity
+import com.agent.voiceassistant.ui.showLightDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.badge.BadgeDrawable
 import com.google.android.material.badge.BadgeUtils
@@ -82,7 +83,7 @@ class WorkspaceActivity : AppCompatActivity() {
             add(getString(R.string.workspace_share))
             add(getString(R.string.workspace_delete_permanently))
         }
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(entry.name)
             .setItems(labels.toTypedArray()) { _, index ->
                 val action = labels[index]
@@ -99,11 +100,11 @@ class WorkspaceActivity : AppCompatActivity() {
                     getString(R.string.workspace_delete_permanently) -> confirmDelete(entry)
                 }
             }
-            .show()
+            .showLightDialog()
     }
 
     private fun confirmDelete(entry: WorkspaceRepository.Entry) {
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.workspace_delete_confirm_title)
             .setMessage(getString(R.string.workspace_delete_confirm_message, entry.name))
             .setNegativeButton(android.R.string.cancel, null)
@@ -112,7 +113,7 @@ class WorkspaceActivity : AppCompatActivity() {
                     .onSuccess { reload() }
                     .onFailure { showError(it.message ?: "删除失败") }
             }
-            .show()
+            .showLightDialog()
     }
 
     @androidx.annotation.OptIn(com.google.android.material.badge.ExperimentalBadgeUtils::class)

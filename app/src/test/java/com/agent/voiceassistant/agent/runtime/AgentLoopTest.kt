@@ -53,6 +53,27 @@ class AgentLoopTest {
     }
 
     @Test
+    fun `finalized context includes tool exchange and final assistant`() = runBlocking {
+        val call = CloudSpeechClient.ToolCall("call-1", "read", "{\"path\":\"/source/a.kt\"}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(call)),
+                    message(content = "文件已经读完"),
+                ),
+            ),
+        )
+        var finalized = emptyList<CloudSpeechClient.LlmMessage>()
+
+        AgentLoop(runtime).run(config(onContextFinalized = { _, messages -> finalized = messages }))
+
+        assertEquals(listOf("user", "assistant", "tool", "assistant"), finalized.map { it.role })
+        assertEquals("call-1", finalized[1].toolCalls.single().id)
+        assertEquals("call-1", finalized[2].toolCallId)
+        assertEquals("文件已经读完", finalized.last().content)
+    }
+
+    @Test
     fun `rejects malformed tool arguments without execution or persistence`() = runBlocking {
         val malformed = CloudSpeechClient.ToolCall(
             "call-bad",
@@ -456,13 +477,17 @@ class AgentLoopTest {
         assertEquals(setOf("voice-1", "read-1"), runtime.blockedCalls.toSet())
     }
 
-    private fun config(maxToolRounds: Int = 2) = AgentLoop.Config(
+    private fun config(
+        maxToolRounds: Int = 2,
+        onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
+    ) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
         initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
         maxToolRounds = maxToolRounds,
         fastMaxCompletionTokens = 512,
         deepMaxCompletionTokens = 4_096,
         allowReasoningEscalation = true,
+        onContextFinalized = onContextFinalized,
     )
 
     private fun message(

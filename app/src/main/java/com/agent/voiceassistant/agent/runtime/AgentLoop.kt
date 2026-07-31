@@ -22,6 +22,7 @@ class AgentLoop(
         val allowReasoningEscalation: Boolean,
         val automaticReasoningToolThreshold: Int = DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD,
         val beforeSpeech: suspend () -> Unit = {},
+        val onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
     )
 
     data class ModelTurn(
@@ -175,6 +176,7 @@ class AgentLoop(
                     eventSink(AgentEvent.MessageFinished(turnId, assistant))
                 }
                 playedSpeech = runtime.finishAssistant(turnId, assistant, streamed.streamedSpeech) || playedSpeech
+                config.onContextFinalized(turnId, workingMessages + assistant)
                 eventSink(AgentEvent.TurnFinished(turnId, finalText))
                 eventSink(AgentEvent.AgentFinished(turnId))
                 return Outcome.Completed(finalText, playedSpeech)
@@ -293,6 +295,7 @@ class AgentLoop(
                     val terminal = runtime.executeTerminalPresentation(terminalCalls.single())
                     if (terminal.result.succeeded && !terminal.finalText.isNullOrBlank()) {
                         playedSpeech = playedSpeech || terminal.playedSpeech
+                        config.onContextFinalized(turnId, workingMessages + terminal.result.message)
                         eventSink(AgentEvent.TurnFinished(turnId, terminal.finalText))
                         eventSink(AgentEvent.AgentFinished(turnId))
                         return Outcome.Completed(terminal.finalText, playedSpeech)
@@ -315,7 +318,6 @@ class AgentLoop(
                 )
 
                 val pendingTools = assistant.toolCalls.map { call ->
-                    eventSink(AgentEvent.ToolStarted(turnId, call, runtime.toolDisplayName(call.name)))
                     val blockedReason = when {
                         call.name !in allowedToolNames ->
                             "工具未在本轮注册，调用未执行。请改用本轮提供的工具或直接回答。"
@@ -356,13 +358,24 @@ class AgentLoop(
 
                 suspend fun execute(pending: PendingTool): ToolExecution {
                     val call = pending.call
-                    return when {
+                    eventSink(AgentEvent.ToolStarted(turnId, call, runtime.toolDisplayName(call.name)))
+                    val execution = when {
                         pending.blockedReason != null ->
                             ToolExecution(runtime.blockedTool(call, pending.blockedReason), succeeded = false)
                         runtime.isReasoningEscalation(call) ->
                             runtime.reasoningEscalationResult(call)
                         else -> runtime.executeTool(call)
                     }
+                    eventSink(
+                        AgentEvent.ToolFinished(
+                            turnId = turnId,
+                            call = call,
+                            result = execution.message,
+                            success = execution.succeeded,
+                            blocked = pending.blockedReason != null,
+                        ),
+                    )
+                    return execution
                 }
 
                 val parallelTools = pendingTools.filter { pending ->
@@ -400,17 +413,7 @@ class AgentLoop(
                     results
                 }
 
-                for ((pending, execution) in executions) {
-                    val call = pending.call
-                    eventSink(
-                        AgentEvent.ToolFinished(
-                            turnId = turnId,
-                            call = call,
-                            result = execution.message,
-                            success = execution.succeeded,
-                            blocked = pending.blockedReason != null,
-                        ),
-                    )
+                for ((_, execution) in executions) {
                     workingMessages += execution.message
                 }
                 consecutiveToolFailureRounds = when {

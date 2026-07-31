@@ -4,6 +4,7 @@
     <string name="chat_role_bot">Hanwo</string>
     <string name="page_home">Home</string>
     <string name="page_hub">Shuwei Hub</string>
+    <string name="hub_agents_empty">No available agents</string>
     <string name="main_menu">Main menu</string>
     <string name="settings_about">About</string>
     <string name="settings_about_summary">Hanwo · Version %1$s</string>
@@ -12,5 +13,10 @@
     <string name="settings_about_version">Version</string>
     <string name="settings_about_version_value">%1$s (%2$d)</string>
     <string name="settings_about_github_summary">Project repository (placeholder)</string>
+    <string name="settings_reflections">Turn reflections</string>
+    <string name="settings_reflections_summary">Review latency, tool usage, and shadow reflections</string>
+    <string name="reflections_empty">No turn metrics yet</string>
+    <string name="reflections_detail_title">Turn metrics</string>
+    <string name="reflections_delete">Delete record</string>
     <string name="media_notification_description">%1$s status and media controls</string>
 </resources>

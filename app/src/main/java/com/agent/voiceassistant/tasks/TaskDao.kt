@@ -32,6 +32,9 @@ interface TaskDao {
     suspend fun insert(task: TaskEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(task: TaskEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertArtifacts(artifacts: List<TaskArtifactEntity>)
 
     @Insert
