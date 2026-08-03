@@ -324,11 +324,11 @@ data class HubActionResult(
 ) {
     companion object {
         fun from(message: JsonObject, json: Json): HubActionResult {
-            val error = message["error"]?.jsonObject
+            val error = message["error"] as? JsonObject
             return HubActionResult(
                 ok = message["ok"]?.jsonPrimitive?.booleanOrNull == true,
                 requestId = message["requestId"]?.jsonPrimitive?.content.orEmpty(),
-                result = message["result"]?.jsonObject ?: JsonObject(emptyMap()),
+                result = message["result"] as? JsonObject ?: JsonObject(emptyMap()),
                 errorCode = error?.get("code")?.jsonPrimitive?.content.orEmpty(),
                 errorMessage = error?.get("message")?.jsonPrimitive?.content.orEmpty(),
             )

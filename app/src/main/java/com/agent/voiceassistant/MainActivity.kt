@@ -58,6 +58,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.put
 import timber.log.Timber
 import java.io.File
 
@@ -511,7 +514,10 @@ class MainActivity : AppCompatActivity() {
                 val inserted = chatAdapter.addMessage(msg)
                 if (chatTailFollowEnabled) scheduleChatTailFollow()
                 if (inserted) refreshConversations()
-                Timber.d("UI chat: [${msg.role}] ${msg.text}")
+                Timber.d(
+                    "UI chat: role=${msg.role} state=${msg.streamState} " +
+                        "chars=${msg.text.length} preview=${msg.text.take(160)}",
+                )
             }
         }
         lifecycleScope.launch {
@@ -695,21 +701,42 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showTaskDetails(task: TaskEntity) {
+        val dialog = MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
+            .setTitle(task.title)
+            .setMessage(formatTaskDetails(task, task.summary, task.details))
+            .setPositiveButton(android.R.string.ok, null)
+            .showLightDialog()
+        if (task.origin != com.agent.voiceassistant.tasks.TaskOrigin.HUB.name) return
+
+        lifecycleScope.launch {
+            val result = runCatching {
+                HubRuntime.submitAction(
+                    actionType = "request_task_detail",
+                    payload = buildJsonObject { put("taskId", task.taskId) },
+                    turnId = "task-detail-${System.nanoTime()}",
+                    conversationId = task.conversationId,
+                )
+            }.getOrNull()
+            if (result?.ok != true || !dialog.isShowing) return@launch
+            val summary = (result.result["summary"] as? JsonPrimitive)?.content.orEmpty()
+            val details = (result.result["details"] as? JsonPrimitive)?.content.orEmpty()
+            dialog.setMessage(formatTaskDetails(task, summary, details))
+        }
+    }
+
+    private fun formatTaskDetails(task: TaskEntity, summary: String, details: String): String {
         val text = buildString {
             appendLine("任务 ID：${task.taskId}")
             appendLine("执行者：${task.executorName}（${task.executorId}）")
             appendLine("状态：${task.status} · 进度 ${task.progress}%")
             appendLine("优先级：${task.priority}")
             appendLine("汇报：${task.reportState}")
-            if (task.summary.isNotBlank()) appendLine("结果：${task.summary}")
+            if (summary.isNotBlank()) appendLine("结果：$summary")
+            if (details.isNotBlank() && details != summary) appendLine("\n正文：\n$details")
             if (task.error.isNotBlank()) appendLine("错误：${task.error}")
             if (task.outputPath.isNotBlank()) append("产物：${task.outputPath}")
         }.trim()
-        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
-            .setTitle(task.title)
-            .setMessage(text)
-            .setPositiveButton(android.R.string.ok, null)
-            .showLightDialog()
+        return text
     }
 
     override fun onDestroy() {

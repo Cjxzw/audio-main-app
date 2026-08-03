@@ -18,15 +18,32 @@ object ReplyDetailPolicy {
         .replace(boundaryTag, "")
         .trim()
 
-    fun stripDetails(text: String): DetailExtraction {
-        val hasMarkedDetails = completeBlock.containsMatchIn(text) || incompleteBlock.containsMatchIn(text)
-        val withoutComplete = text.replace(completeBlock, "")
-        val speakable = withoutComplete.replace(incompleteBlock, "")
-        return DetailExtraction(speakable, hasMarkedDetails)
+    fun extract(markdown: String): DetailExtraction {
+        val completeMatches = completeBlock.findAll(markdown).toList()
+        var mainText = markdown.replace(completeBlock, "")
+        val incompleteMatch = incompleteBlock.find(mainText)
+        val incompleteDetails = incompleteMatch?.value?.substringAfter('>')?.trim().orEmpty()
+        if (incompleteMatch != null) {
+            mainText = mainText.removeRange(incompleteMatch.range)
+        }
+        val detailsText = buildList {
+            completeMatches.map { it.groupValues[1].trim() }
+                .filter(String::isNotBlank)
+                .forEach(::add)
+            if (incompleteDetails.isNotBlank()) add(incompleteDetails)
+        }.joinToString("\n\n")
+        return DetailExtraction(
+            speakableText = mainText.trim(),
+            hasMarkedDetails = completeMatches.isNotEmpty() || incompleteMatch != null,
+            detailsText = detailsText,
+        )
     }
+
+    fun stripDetails(text: String): DetailExtraction = extract(text)
 
     data class DetailExtraction(
         val speakableText: String,
         val hasMarkedDetails: Boolean,
+        val detailsText: String = "",
     )
 }

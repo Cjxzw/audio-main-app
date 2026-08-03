@@ -2,7 +2,7 @@
 
 喊我 Hanwo 是一个以小米 MiMo 生态为核心的 Android 语音 Agent，可通过手机、蓝牙耳机或智能音频眼镜进行自然对话。
 
-当前版本已跑通语音闭环、持久会话、本地工具和原生函数调用。复杂执行任务和主动汇报将在接入 Hub 后继续完善。
+当前版本已跑通语音闭环、持久会话、本地工具、原生函数调用和本地异步任务汇报。Hub 远程工具和任务事实同步仍在继续完善。
 
 ## 许可证
 
@@ -23,6 +23,8 @@
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
 - 工具阶段与最终回复使用独立预算；达到上限或连续失败后仍会保留一次无工具总结。
+- 最终正文为空时在 AgentLoop 内部最多重试两次；重试只写入诊断日志，不把内部错误展示到聊天气泡或通知。
+- 聊天气泡将 `<DETAILS>...</DETAILS>` 与正文分开渲染，带分隔线和展开/折叠控件；最近三轮默认展开，更早详情自动折叠。
 - AgentLoop 已从语音 Service 抽离；Harness 提供串行回合、取消、`steer`/`followUp` 队列和统一事件。
 - 支持记忆、定位、天气、网络搜索、文件读写、Shell 和通用 HTTP 工具。
 - APK 自动携带不含密钥的源码快照，Agent 可读取源码与轮转日志进行交叉诊断。
@@ -59,9 +61,14 @@ ASR 和 TTS 当前只支持 MiMo。需要让聊天模型走其他服务时，可
 
 ## 编译
 
-```powershell
-.\gradlew.bat :app:assembleDebug
+代码变更后先刷新 APK 内置的 Graphify 代码图谱，再运行测试、Lint 和 Debug 构建：
+
+```bash
+graphify update .
+./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
+
+Windows PowerShell 使用 `./gradlew.bat testDebugUnitTest lintDebug assembleDebug`。
 
 生成的调试 APK：
 
@@ -82,6 +89,19 @@ adb devices
 ```powershell
 adb install -r app\build\outputs\apk\debug\hanwo-debug-0.1.0.apk
 ```
+
+`-r` 为覆盖安装，不会主动清除会话、记忆或 Android Keystore 数据。
+
+## 代码图谱
+
+Graphify 快照随 Debug APK 打包到 `assets/codegraph/`，供 App 内的 `code_graph_search` 和 `code_graph_explain` 只读查询。图谱只用于导航，修改和诊断结论仍需核对源码与运行日志。
+
+```bash
+graphify update .
+./gradlew :app:assembleDebug
+```
+
+更新后的报告位于 [app/src/main/assets/codegraph/GRAPH_REPORT.md](app/src/main/assets/codegraph/GRAPH_REPORT.md)，压缩图谱位于 `app/src/main/assets/codegraph/graph.json.gz`。
 
 ## Agent 调试 CLI
 
@@ -135,6 +155,12 @@ app/src/main/java/com/agent/voiceassistant/
 - 经典蓝牙设备启用 SCO 麦克风后，多功能键可能由 AVRCP 播放/暂停切换为 HFP 接听/挂断；系统不会把这类挂断事件交给纯媒体 App，需使用独立 BLE/HID 控制或避免持续占用 SCO。
 - 延迟已有关键埋点，但仍需持续采集实机数据调优。
 - `/source` 和 `/logs` 的只读限制由虚拟文件工具强制执行；`exec` 仍拥有 Android App UID 沙箱内的完整权限，不能把它当作独立安全沙箱。
+
+## 开发文档
+
+- [开发日志](开发日志.md)：按日期记录架构、实机验证和已知边界。
+- [Development Status](docs/development-status.md)：当前可运行能力、验证命令和限制摘要。
+- [Agent 调试 CLI](docs/agent-debug-cli.md)：通过无线 ADB 执行脱敏配置、会话和真实 Agent 回合诊断。
 
 ## Agent 执行环境
 

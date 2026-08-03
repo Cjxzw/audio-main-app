@@ -4,6 +4,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
@@ -20,11 +21,13 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
 
     private val messages = mutableListOf<ChatMessage>()
     private val maxMessages = 500
+    private val detailOverrides = mutableMapOf<String, Boolean>()
     private var markwon: Markwon? = null
 
     fun setMessages(items: List<ChatMessage>) {
         messages.clear()
         messages.addAll(items.takeLast(maxMessages))
+        detailOverrides.keys.retainAll(messages.mapIndexed { index, msg -> detailKey(msg, index) }.toSet())
         notifyDataSetChanged()
     }
 
@@ -57,7 +60,9 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
     fun removeMessage(messageId: String) {
         val index = messages.indexOfFirst { it.messageId == messageId }
         if (index < 0) return
+        val removedKey = detailKey(messages[index], index)
         messages.removeAt(index)
+        detailOverrides.remove(removedKey)
         notifyItemRemoved(index)
     }
 
@@ -68,22 +73,31 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             .usePlugin(TablePlugin.create(parent.context.applicationContext))
             .build()
             .also { markwon = it }
-        return VH(v, markdownRenderer)
+        return VH(v, markdownRenderer) { position, expanded ->
+            val message = messages.getOrNull(position) ?: return@VH
+            detailOverrides[detailKey(message, position)] = expanded
+            notifyItemChanged(position, PAYLOAD_TEXT)
+        }
     }
 
-    override fun onBindViewHolder(holder: VH, position: Int) = holder.bind(messages[position])
+    override fun onBindViewHolder(holder: VH, position: Int) =
+        holder.bind(messages[position], isDetailsExpanded(position))
 
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
         if (payloads.contains(PAYLOAD_TEXT)) {
-            holder.bindStreamingText(messages[position])
+            holder.bindStreamingText(messages[position], isDetailsExpanded(position))
         } else {
-            holder.bind(messages[position])
+            holder.bind(messages[position], isDetailsExpanded(position))
         }
     }
 
     override fun getItemCount() = messages.size
 
-    class VH(view: View, private val markwon: Markwon) : RecyclerView.ViewHolder(view) {
+    class VH(
+        view: View,
+        private val markwon: Markwon,
+        private val onDetailsToggle: (Int, Boolean) -> Unit,
+    ) : RecyclerView.ViewHolder(view) {
         private val llBubble = view.findViewById<LinearLayout>(R.id.llBubble)
         private val tvRole = view.findViewById<TextView>(R.id.tvRole)
         private val tvText = view.findViewById<TextView>(R.id.tvText)
@@ -91,13 +105,19 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         private val llToolStatus = view.findViewById<LinearLayout>(R.id.llToolStatus)
         private val tvToolSummary = view.findViewById<TextView>(R.id.tvToolSummary)
         private val tvToolState = view.findViewById<TextView>(R.id.tvToolState)
+        private val llDetails = view.findViewById<LinearLayout>(R.id.llDetails)
+        private val llDetailsHeader = view.findViewById<LinearLayout>(R.id.llDetailsHeader)
+        private val tvDetails = view.findViewById<TextView>(R.id.tvDetails)
+        private val ivDetailsToggle = view.findViewById<ImageView>(R.id.ivDetailsToggle)
+        private var detailsExpanded = false
 
-        fun bind(msg: ChatMessage) {
+        fun bind(msg: ChatMessage, detailsExpanded: Boolean) {
             val ctx = itemView.context
             val isToolStatus = !msg.toolCallId.isNullOrBlank()
             tvRole.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             tvTime.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             tvText.visibility = if (isToolStatus) View.GONE else View.VISIBLE
+            llDetails.visibility = View.GONE
             llToolStatus.visibility = if (isToolStatus) View.VISIBLE else View.GONE
             if (isToolStatus) {
                 llBubble.gravity = android.view.Gravity.START
@@ -149,12 +169,12 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                     tvText.setTextColor(ContextCompat.getColor(ctx, android.R.color.white))
                 }
             }
-            bindText(msg)
+            bindText(msg, detailsExpanded)
             tvTime.text = msg.timeStr
         }
 
-        fun bindStreamingText(msg: ChatMessage) {
-            bindText(msg)
+        fun bindStreamingText(msg: ChatMessage, detailsExpanded: Boolean) {
+            bindText(msg, detailsExpanded)
             tvRole.text = when (msg.streamState) {
                 ChatStreamState.STREAMING -> itemView.context.getString(R.string.chat_role_bot_streaming)
                 ChatStreamState.INTERRUPTED -> itemView.context.getString(R.string.chat_role_bot_interrupted)
@@ -163,12 +183,50 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             tvTime.text = msg.timeStr
         }
 
-        private fun bindText(msg: ChatMessage) {
+        private fun bindText(msg: ChatMessage, requestedDetailsExpanded: Boolean) {
             if (msg.role == BOT) {
-                markwon.setMarkdown(tvText, ReplyDetailPolicy.forDisplay(msg.text))
+                val extraction = ReplyDetailPolicy.extract(msg.text)
+                tvText.visibility = if (extraction.speakableText.isBlank()) View.GONE else View.VISIBLE
+                if (extraction.speakableText.isNotBlank()) {
+                    markwon.setMarkdown(tvText, extraction.speakableText)
+                } else {
+                    tvText.text = ""
+                }
+                bindDetails(extraction, requestedDetailsExpanded)
             } else {
+                tvText.visibility = View.VISIBLE
                 tvText.text = msg.text
+                llDetails.visibility = View.GONE
             }
+        }
+
+        private fun bindDetails(
+            extraction: ReplyDetailPolicy.DetailExtraction,
+            requestedExpanded: Boolean,
+        ) {
+            if (!extraction.hasMarkedDetails || extraction.detailsText.isBlank()) {
+                llDetails.visibility = View.GONE
+                return
+            }
+            llDetails.visibility = View.VISIBLE
+            tvDetails.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            markwon.setMarkdown(tvDetails, extraction.detailsText)
+            detailsExpanded = requestedExpanded
+            llDetailsHeader.setOnClickListener {
+                detailsExpanded = !detailsExpanded
+                setDetailsExpanded(detailsExpanded)
+                val position = bindingAdapterPosition
+                if (position != RecyclerView.NO_POSITION) onDetailsToggle(position, detailsExpanded)
+            }
+            setDetailsExpanded(detailsExpanded)
+        }
+
+        private fun setDetailsExpanded(expanded: Boolean) {
+            tvDetails.visibility = if (expanded) View.VISIBLE else View.GONE
+            ivDetailsToggle.rotation = if (expanded) 180f else 0f
+            ivDetailsToggle.contentDescription = itemView.context.getString(
+                if (expanded) R.string.chat_details_collapse else R.string.chat_details_expand,
+            )
         }
 
         private fun inferToolStatus(text: String): ToolDisplayStatus = when {
@@ -181,4 +239,14 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
     private companion object {
         const val PAYLOAD_TEXT = "chat_text"
     }
+
+    private fun isDetailsExpanded(position: Int): Boolean {
+        val message = messages[position]
+        return detailOverrides[detailKey(message, position)]
+            ?: ChatDetailsExpansionPolicy.defaultExpanded(messages, position)
+    }
+
+    private fun detailKey(message: ChatMessage, position: Int): String =
+        message.messageId?.takeIf(String::isNotBlank)?.let { "id:$it" }
+            ?: "fallback:${message.timestamp}:$position:${message.text.hashCode()}"
 }

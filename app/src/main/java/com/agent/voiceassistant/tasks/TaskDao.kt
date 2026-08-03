@@ -34,6 +34,52 @@ interface TaskDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(task: TaskEntity)
 
+    @Transaction
+    suspend fun upsertHubTask(task: TaskEntity) {
+        val current = get(task.taskId)
+        val reportState = nextHubReportState(current?.status, current?.reportState, task.status)
+        upsert(
+            task.copy(
+                idempotencyKey = current?.idempotencyKey ?: task.idempotencyKey,
+                conversationId = current?.conversationId ?: task.conversationId,
+                sourceTurnId = current?.sourceTurnId ?: task.sourceTurnId,
+                priority = current?.priority ?: task.priority,
+                inputJson = current?.inputJson ?: task.inputJson,
+                details = task.details.ifBlank { current?.details.orEmpty() },
+                reportState = reportState,
+                reportedAt = if (reportState == TaskReportState.REPORTED.name) current?.reportedAt else null,
+                createdAt = current?.createdAt ?: task.createdAt,
+                startedAt = current?.startedAt ?: task.startedAt,
+                completedAt = task.completedAt ?: current?.completedAt,
+            ),
+        )
+    }
+
+    @Transaction
+    suspend fun bindHubDispatch(seed: TaskEntity) {
+        val current = get(seed.taskId)
+        val reportState = if (
+            current?.status in HUB_REPORTABLE_TERMINAL_STATUSES &&
+            current?.reportState == TaskReportState.NONE.name
+        ) {
+            TaskReportState.PENDING.name
+        } else {
+            current?.reportState ?: seed.reportState
+        }
+        upsert(
+            current?.copy(
+                title = seed.title,
+                executorId = seed.executorId,
+                executorName = seed.executorName,
+                conversationId = seed.conversationId,
+                sourceTurnId = seed.sourceTurnId,
+                priority = seed.priority,
+                reportState = reportState,
+                updatedAt = seed.updatedAt,
+            ) ?: seed,
+        )
+    }
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertArtifacts(artifacts: List<TaskArtifactEntity>)
 
@@ -122,8 +168,20 @@ interface TaskDao {
     @Insert
     suspend fun insertReportAction(action: TaskReportActionEntity)
 
-    @Query("UPDATE tasks SET report_state = 'REPORTED', reported_at = :now, updated_at = :now WHERE task_id IN (:taskIds) AND report_state = 'PENDING'")
+    @Query("UPDATE tasks SET report_state = 'REPORTING', updated_at = :now WHERE task_id IN (:taskIds) AND report_state = 'PENDING'")
+    suspend fun markReporting(taskIds: List<String>, now: Long): Int
+
+    @Query("UPDATE tasks SET report_state = 'REPORTED', reported_at = :now, updated_at = :now WHERE task_id IN (:taskIds) AND report_state = 'REPORTING'")
     suspend fun markReported(taskIds: List<String>, now: Long): Int
+
+    @Query("UPDATE tasks SET report_state = 'PENDING', updated_at = :now WHERE task_id IN (:taskIds) AND report_state = 'REPORTING'")
+    suspend fun resetReports(taskIds: List<String>, now: Long): Int
+
+    @Query("UPDATE tasks SET report_state = 'PENDING', updated_at = :now WHERE report_state = 'REPORTING'")
+    suspend fun recoverReporting(now: Long): Int
+
+    @Query("UPDATE tasks SET summary = :summary, details = :details, updated_at = :now WHERE task_id = :taskId")
+    suspend fun updateResultContent(taskId: String, summary: String, details: String, now: Long): Int
 
     @Query("UPDATE task_report_actions SET state = :state, summary_text = :summaryText, error = :error, finished_at = :finishedAt WHERE report_action_id = :actionId")
     suspend fun finishReportAction(actionId: String, state: String, summaryText: String, error: String, finishedAt: Long): Int
@@ -132,11 +190,29 @@ interface TaskDao {
     suspend fun beginReport(action: TaskReportActionEntity, taskIds: List<String>) {
         require(taskIds.isNotEmpty())
         insertReportAction(action)
-        check(markReported(taskIds, action.startedAt) == taskIds.size) {
+        check(markReporting(taskIds, action.startedAt) == taskIds.size) {
             "待汇报任务状态已变化"
         }
         taskIds.forEach { taskId ->
             insertEvent(TaskEventEntity(taskId = taskId, type = "report_started", createdAt = action.startedAt))
         }
+    }
+
+    @Transaction
+    suspend fun completeReport(
+        actionId: String,
+        taskIds: List<String>,
+        state: String,
+        summaryText: String,
+        finishedAt: Long,
+    ) {
+        check(markReported(taskIds, finishedAt) == taskIds.size) { "任务汇报状态已变化" }
+        finishReportAction(actionId, state, summaryText, "", finishedAt)
+    }
+
+    @Transaction
+    suspend fun failReport(actionId: String, taskIds: List<String>, error: String, finishedAt: Long) {
+        resetReports(taskIds, finishedAt)
+        finishReportAction(actionId, "FAILED", "", error, finishedAt)
     }
 }

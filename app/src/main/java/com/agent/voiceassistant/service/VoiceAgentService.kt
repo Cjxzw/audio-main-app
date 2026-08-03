@@ -24,9 +24,13 @@ import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.R
+import com.agent.voiceassistant.agent.BodyToolCallStreamGate
+import com.agent.voiceassistant.agent.BodyToolCallTooLargeException
 import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
+import com.agent.voiceassistant.agent.ReplyDetailPolicy
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
+import com.agent.voiceassistant.agent.VoiceReplyLengthGate
 import com.agent.voiceassistant.agent.buildCurrentTurnUserContent
 import com.agent.voiceassistant.agent.buildMainSystemPrompt
 import com.agent.voiceassistant.agent.deepReasoningEnabledResult
@@ -109,6 +113,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import timber.log.Timber
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -151,6 +158,12 @@ class VoiceAgentService : Service() {
         private const val DEEP_MAX_TOOL_ROUNDS = 10
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
+        private const val VOICE_REPLY_SUMMARY_TIMEOUT_MS = 6_000L
+        private const val VOICE_REPLY_SUMMARY_MAX_TOKENS = 256
+        private const val VOICE_REPLY_SUMMARY_INPUT_CHARS = 24_000
+        private const val MAX_LOG_PREVIEW_CHARS = 500
+        private const val MAX_VOICE_FALLBACK_CHARS = 180
+        private val VOICE_SENTENCE_ENDINGS = setOf('。', '！', '？', '!', '?', ';', '；', '.')
         private const val MAX_IMAGE_HISTORY_TURNS = 3
         private const val MAX_IMAGE_INPUTS = 4
         private const val DRAFT_PERSIST_CHARS = 64
@@ -162,6 +175,8 @@ class VoiceAgentService : Service() {
         private const val TASK_REPORT_NOTIFICATION_ID = 9207
         private const val TASK_REPORT_CHANNEL_ID = "task_reports"
         private const val TASK_REPORT_BATCH_SIZE = 3
+        private const val TASK_REPORT_SUMMARY_SOURCE_CHARS = 12_000
+        private const val TASK_REPORT_SUMMARY_MAX_TOKENS = 384
         private const val SESSION_GREETING_TRIGGER =
             "这是 Main Agent 的内部会话事件：用户刚刚开启了一个新话题。请只向用户发送一句简短、自然的中文问候，并邀请用户提出新的话题。不要调用工具，不要提及这个内部事件。"
         private val THINKING_FEEDBACK_AUDIO = intArrayOf(
@@ -398,6 +413,7 @@ class VoiceAgentService : Service() {
                 skillRegistry = skillRegistry,
             ),
             taskCoordinator = taskCoordinator,
+            taskRepository = taskRepository,
             taskContext = {
                 MainToolRegistry.TaskToolContext(
                     conversationId = store.currentConversationId,
@@ -526,28 +542,59 @@ class VoiceAgentService : Service() {
         ) {
             speechInterruptedForUrgentReport.set(true)
         }
-        when (
-            TaskReportPolicy.route(
+        val route = TaskReportPolicy.route(
                 dormant = dormant,
                 sameConversation = sameConversation,
                 externalOutputConnected = external,
                 userSpeaking = recorder?.isUserSpeaking() == true,
                 audioReportsEnabled = audioReportsEnabled,
             )
-        ) {
+        val action = taskRepository.beginReport(batch, route.name.lowercase())
+        val hydrated: List<TaskEntity>
+        val summary: String
+        try {
+            hydrated = batch.map { task -> hydrateTaskResult(task) }
+            summary = generateTaskReportSummary(hydrated)
+            val reportText = TaskReportPolicy.composeChatReport(summary, hydrated)
+            val stored = store.addMessageToConversation(
+                conversationId = first.conversationId,
+                role = "assistant",
+                content = reportText,
+                streamState = ChatStreamState.COMPLETED,
+            )
+            taskRepository.completeReport(action.reportActionId, hydrated, "CHAT_REPORTED", summary)
+            if (first.conversationId == store.currentConversationId) {
+                EventBus.emitChatMessage(
+                    ChatMessage(
+                        role = ChatRole.BOT,
+                        text = reportText,
+                        timestamp = stored.timestamp,
+                        messageId = stored.id,
+                        streamState = ChatStreamState.COMPLETED,
+                    ),
+                )
+            }
+            EventBus.emitConversationUpdate()
+        } catch (error: Throwable) {
+            taskRepository.failReport(
+                action.reportActionId,
+                batch,
+                error.message ?: error.javaClass.simpleName,
+            )
+            throw error
+        }
+
+        when (route) {
             TaskReportPolicy.Route.DEFER -> Unit
-            TaskReportPolicy.Route.NOTIFICATION -> reportTasksByNotification(batch)
-            TaskReportPolicy.Route.ACTIVE_AUDIO -> reportTasksByAudio(batch, fromDormant = false)
-            TaskReportPolicy.Route.DORMANT_EXTERNAL_AUDIO -> reportTasksByAudio(batch, fromDormant = true)
+            TaskReportPolicy.Route.NOTIFICATION -> reportTasksByNotification(hydrated, summary)
+            TaskReportPolicy.Route.ACTIVE_AUDIO -> reportTasksByAudio(hydrated, summary, fromDormant = false)
+            TaskReportPolicy.Route.DORMANT_EXTERNAL_AUDIO -> reportTasksByAudio(hydrated, summary, fromDormant = true)
         }
     }
 
-    private suspend fun reportTasksByNotification(tasks: List<TaskEntity>) {
-        val action = taskRepository.beginReport(tasks, "notification")
+    private suspend fun reportTasksByNotification(tasks: List<TaskEntity>, summary: String) {
         val title = if (tasks.any { it.priority == TaskPriority.URGENT.name }) "紧急任务已完成" else "任务进展"
-        val content = tasks.joinToString("；") { task ->
-            task.summary.ifBlank { "${task.title}：${task.status}" }
-        }.take(240)
+        val content = summary.take(240)
         val openTasks = Intent(this, MainActivity::class.java)
             .putExtra(EXTRA_OPEN_TASKS, true)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -567,10 +614,9 @@ class VoiceAgentService : Service() {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
         getSystemService(NotificationManager::class.java).notify(TASK_REPORT_NOTIFICATION_ID, notification)
-        taskRepository.finishReport(action.reportActionId, "NOTIFIED", content)
     }
 
-    private suspend fun reportTasksByAudio(tasks: List<TaskEntity>, fromDormant: Boolean) {
+    private suspend fun reportTasksByAudio(tasks: List<TaskEntity>, summary: String, fromDormant: Boolean) {
         if (!fromDormant && recorder?.stopIfIdle() != true) return
         var wakeAfterReport = false
         turnMutex.withLock {
@@ -586,45 +632,15 @@ class VoiceAgentService : Service() {
                 speechClient = ensureSpeechClient()
             }
 
-            val action = taskRepository.beginReport(
-                tasks,
-                if (fromDormant) "dormant_external_audio" else "active_audio",
-            )
-            var finalText = ""
             var reportCompleted = false
             try {
                 speechInterruptedForUrgentReport.set(false)
-                updateNotification("正在准备任务汇报...")
                 val client = ensureSpeechClient() ?: error("MiMo 语音服务不可用")
-                val prompt = buildTaskReportPrompt(tasks)
-                val outcome = runAgentLoop(
-                    llmClient = createLlmClient(),
-                    speechClient = null,
-                    speakReplies = false,
-                    messages = listOf(
-                        CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()),
-                        CloudSpeechClient.LlmMessage("user", prompt),
-                    ),
-                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
-                    maxToolRounds = 1,
-                    allowReasoningEscalation = false,
-                    toolsEnabled = false,
-                )
-                finalText = outcome.finalText
                 updateNotification("正在汇报任务...")
                 earcons.reporting()
-                speakAssistantText(client, optimizeSpokenReply(finalText))
+                speakAssistantText(client, optimizeSpokenReply(summary))
                 tasks.mapNotNull(::taskOutputFile).forEach { playAudioFile(it) }
-                taskRepository.finishReport(action.reportActionId, "COMPLETED", finalText)
                 reportCompleted = true
-            } catch (error: Throwable) {
-                taskRepository.finishReport(
-                    action.reportActionId,
-                    "FAILED",
-                    finalText,
-                    error.message ?: error.javaClass.simpleName,
-                )
-                throw error
             } finally {
                 if (fromDormant) {
                     routeManager?.release()
@@ -643,14 +659,60 @@ class VoiceAgentService : Service() {
 
     private fun buildTaskReportPrompt(tasks: List<TaskEntity>): String = buildString {
         appendLine("这是内部异步任务完成事件。")
-        appendLine(TaskReportPolicy.styleInstructions())
         tasks.forEach { task ->
             appendLine("- 任务：${task.title}")
             appendLine("  状态：${task.status}")
             appendLine("  结果：${task.summary.ifBlank { task.error.ifBlank { "无补充信息" } }}")
-            if (task.details.isNotBlank()) appendLine("  详情：${task.details.take(600)}")
+            if (task.details.isNotBlank()) appendLine("  远端正文：${task.details.take(TASK_REPORT_SUMMARY_SOURCE_CHARS)}")
             if (task.outputPath.isNotBlank()) appendLine("  产物：${task.outputPath}")
         }
+    }
+
+    private suspend fun hydrateTaskResult(task: TaskEntity): TaskEntity {
+        if (task.origin != com.agent.voiceassistant.tasks.TaskOrigin.HUB.name || task.details.isNotBlank()) return task
+        val result = runCatching {
+            HubRuntime.submitAction(
+                actionType = "request_task_detail",
+                payload = buildJsonObject { put("taskId", task.taskId) },
+                turnId = task.sourceTurnId.ifBlank { "task-report-${task.taskId}" },
+                conversationId = task.conversationId,
+            )
+        }.onFailure { Timber.w(it, "Failed to hydrate Hub task result task=${task.taskId}") }
+            .getOrNull()
+        if (result?.ok != true) return task
+        val summary = (result.result["summary"] as? JsonPrimitive)?.content.orEmpty()
+            .ifBlank { task.summary }
+        val details = (result.result["details"] as? JsonPrimitive)?.content.orEmpty()
+        return taskRepository.updateResultContent(task.taskId, summary, details) ?: task
+    }
+
+    private suspend fun generateTaskReportSummary(tasks: List<TaskEntity>): String {
+        val fallback = tasks.joinToString("；") { task ->
+            task.summary.ifBlank { task.error.ifBlank { "${task.title}已结束" } }
+        }
+        if (!capabilityResolver.capabilities().llmAvailable) {
+            return TaskReportPolicy.normalizeSummary(fallback, "远程任务已经结束，请查看完整结果。")
+        }
+        val client = createLlmClient()
+        val candidate = try {
+            client.streamChat(
+                CloudSpeechClient.ChatRequest(
+                    messages = listOf(
+                        CloudSpeechClient.LlmMessage("system", TaskReportPolicy.summaryInstructions()),
+                        CloudSpeechClient.LlmMessage("user", buildTaskReportPrompt(tasks)),
+                    ),
+                    tools = emptyList(),
+                    thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                    maxCompletionTokens = TASK_REPORT_SUMMARY_MAX_TOKENS,
+                ),
+            ) {}.message.content.orEmpty()
+        } catch (error: Throwable) {
+            Timber.w(error, "Task report summary generation failed; using deterministic fallback")
+            fallback
+        } finally {
+            client.close()
+        }
+        return TaskReportPolicy.normalizeSummary(candidate, fallback)
     }
 
     private fun taskOutputFile(task: TaskEntity): File? {
@@ -950,6 +1012,7 @@ class VoiceAgentService : Service() {
                     initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
                     allowReasoningEscalation = true,
+                    voiceReplySummaryEnabled = speakReplies,
                     metricsTracker = metricsTracker,
                     onContextFinalized = { _, messages -> reflectionContext = messages },
                     onInitialTools = { tools -> reflectionTools = tools },
@@ -1021,6 +1084,7 @@ class VoiceAgentService : Service() {
         maxToolRounds: Int,
         allowReasoningEscalation: Boolean,
         toolsEnabled: Boolean = true,
+        voiceReplySummaryEnabled: Boolean = false,
         beforeSpeech: suspend () -> Unit = {},
         metricsTracker: TurnMetricsTracker? = null,
         onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
@@ -1028,6 +1092,12 @@ class VoiceAgentService : Service() {
     ): AgentLoop.Outcome.Completed {
         var reasoningFeedbackJob: Job? = null
         var initialToolsCaptured = false
+        val voiceReplyGate = if (voiceReplySummaryEnabled && speakReplies && speechClient != null) {
+            VoiceReplyLengthGate()
+        } else {
+            null
+        }
+        var finalizedAssistantForContext: CloudSpeechClient.LlmMessage? = null
 
         fun startReasoningFeedback(source: String) {
             if (!speakReplies) return
@@ -1079,6 +1149,8 @@ class VoiceAgentService : Service() {
                         speechClient = speechClient,
                         speakReplies = speakReplies,
                         request = request,
+                        voiceReplyGate = voiceReplyGate,
+                        onLongReplyDetected = { startReasoningFeedback("long_reply_summary") },
                         beforeSpeech = {
                             awaitReasoningFeedback()
                             beforeSpeech()
@@ -1256,27 +1328,47 @@ class VoiceAgentService : Service() {
                     message: CloudSpeechClient.LlmMessage,
                     streamedSpeech: Boolean,
                 ): Boolean {
-                    val finalText = message.content.orEmpty().trim()
-                    finishAssistantDraft(turnId, finalText)
-                    emitLog("助手: $finalText")
-                    if (!streamedSpeech) {
+                    val rawText = message.content.orEmpty().trim()
+                    val presentation = if (voiceReplyGate != null) {
+                        prepareVoiceReplyPresentation(llmClient, rawText)
+                    } else {
+                        VoiceReplyPresentation(displayText = rawText, speechText = rawText)
+                    }
+                    finalizedAssistantForContext = message.copy(content = presentation.displayText)
+                    finishAssistantDraft(turnId, presentation.displayText)
+                    emitLog("助手: ${presentation.speechText.take(MAX_LOG_PREVIEW_CHARS)}")
+                    if (!streamedSpeech || voiceReplyGate != null) {
                         awaitReasoningFeedback()
-                        beforeSpeech()
                         if (speakReplies && speechClient != null) {
-                            speakAssistantText(
-                                speechClient,
-                                optimizeSpokenReply(finalText),
-                                onAudioStarted = { metricsTracker?.markAudioStarted() },
-                            )
-                            return true
+                            try {
+                                beforeSpeech()
+                                speakAssistantText(
+                                    speechClient,
+                                    optimizeSpokenReply(presentation.speechText),
+                                    onAudioStarted = { metricsTracker?.markAudioStarted() },
+                                )
+                                return true
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Throwable) {
+                                Timber.w(error, "Final voice playback failed after response persisted")
+                                runCatching { earcons.error() }
+                            }
                         }
                     }
                     return false
                 }
             },
             eventSink = { event ->
-                metricsTracker?.onEvent(event)
-                onAgentEvent(event)
+                val presentationEvent = if (
+                    voiceReplyGate != null && event is AgentEvent.ContentDelta
+                ) {
+                    event.copy(userVisible = false)
+                } else {
+                    event
+                }
+                metricsTracker?.onEvent(presentationEvent)
+                onAgentEvent(presentationEvent)
             },
         )
         return try {
@@ -1290,7 +1382,17 @@ class VoiceAgentService : Service() {
                     fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
                     deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
                     beforeSpeech = beforeSpeech,
-                    onContextFinalized = onContextFinalized,
+                    onContextFinalized = { turnId, context ->
+                        val replacement = finalizedAssistantForContext
+                        val finalizedContext = if (
+                            replacement != null && context.lastOrNull()?.role == "assistant"
+                        ) {
+                            context.dropLast(1) + replacement
+                        } else {
+                            context
+                        }
+                        onContextFinalized(turnId, finalizedContext)
+                    },
                 ),
             )) {
                 is AgentLoop.Outcome.Completed -> outcome
@@ -1389,7 +1491,13 @@ class VoiceAgentService : Service() {
                 discardAssistantDraft(event.turnId)
                 assistantDrafts[event.turnId] = AssistantDraft()
             }
-            is AgentEvent.ContentDelta -> appendAssistantDraft(event.turnId, event.text)
+            is AgentEvent.FinalResponseRetry -> DiagLog.w(
+                "agent.final.retry",
+                "turn=${event.turnId} attempt=${event.attempt}/${event.maxRetries} reason=blank_final",
+            )
+            is AgentEvent.ContentDelta -> if (event.userVisible) {
+                appendAssistantDraft(event.turnId, event.text)
+            }
             is AgentEvent.ToolCallDetected -> suppressAssistantDraft(event.turnId)
             is AgentEvent.AgentFinished -> assistantDrafts.remove(event.turnId)
             is AgentEvent.ReasoningDelta,
@@ -1402,6 +1510,10 @@ class VoiceAgentService : Service() {
         val draft = assistantDrafts.computeIfAbsent(turnId) { AssistantDraft() }
         if (draft.suppressed) return
         draft.text.append(delta)
+        if (StructuredOutputParser.containsPotentialToolProtocol(draft.text.toString())) {
+            suppressAssistantDraft(turnId)
+            return
+        }
         if (!draft.released) {
             val first = draft.text.firstOrNull { !it.isWhitespace() } ?: return
             if (first == '{' || first == '[' || first == '<') return
@@ -1597,6 +1709,19 @@ class VoiceAgentService : Service() {
         val raw = message.content.orEmpty()
         if (!StructuredOutputParser.containsStructuredProtocol(raw)) return message
         if (StructuredOutputParser.containsToolProtocol(raw)) {
+            val bodyCalls = StructuredOutputParser.parseBodyToolCalls(raw)
+            if (bodyCalls.isNotEmpty()) {
+                return message.copy(
+                    content = "",
+                    toolCalls = bodyCalls.map { bodyCall ->
+                        CloudSpeechClient.ToolCall(
+                            id = "body_${UUID.randomUUID()}",
+                            name = bodyCall.name,
+                            arguments = bodyCall.arguments.toString(),
+                        )
+                    },
+                )
+            }
             return message.copy(
                 content = "",
                 toolCalls = listOf(
@@ -1619,12 +1744,18 @@ class VoiceAgentService : Service() {
         request: CloudSpeechClient.ChatRequest,
         beforeSpeech: suspend () -> Unit,
         onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
+        voiceReplyGate: VoiceReplyLengthGate? = null,
+        onLongReplyDetected: () -> Unit = {},
         onModelStreamDone: () -> Unit = {},
         onAudioStarted: () -> Unit = {},
     ): AgentLoop.ModelTurn = coroutineScope {
-        val allowDirectSpeech = speakReplies && speechClient != null && shouldStreamDirectSpeech(request)
+        val allowDirectSpeech = voiceReplyGate == null &&
+            speakReplies && speechClient != null && shouldStreamDirectSpeech(request)
         val extractor = StreamingSpeechExtractor()
         val segmenter = SpeechSegmenter()
+        val bodyToolGate = BodyToolCallStreamGate(
+            probeChars = if (voiceReplyGate != null) VoiceReplyLengthGate.DEFAULT_THRESHOLD else 160,
+        )
         val ttsQueue = Channel<String>(Channel.UNLIMITED)
         val startedAt = System.currentTimeMillis()
         var firstDeltaLogged = false
@@ -1690,49 +1821,88 @@ class VoiceAgentService : Service() {
             }
         }
 
+        suspend fun consumeContentDelta(text: String) {
+            if (text.isEmpty()) return
+            onStreamEvent(CloudSpeechClient.ChatStreamEvent.ContentDelta(text))
+            if (!firstDeltaLogged) {
+                firstDeltaLogged = true
+                Timber.i("Latency LLM first_content elapsed=${System.currentTimeMillis() - startedAt}ms")
+            }
+            if (allowDirectSpeech || voiceReplyGate != null) {
+                val speechDelta = extractor.feed(text)
+                if (voiceReplyGate?.observe(speechDelta) == true) {
+                    onLongReplyDetected()
+                }
+                if (!allowDirectSpeech) return
+                for (segment in segmenter.feed(speechDelta)) {
+                    if (!firstSegmentLogged) {
+                        firstSegmentLogged = true
+                        Timber.i(
+                            "Latency speech first_segment elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                                "chars=${segment.length}",
+                        )
+                    }
+                    ttsQueue.send(segment)
+                }
+            }
+        }
+
         try {
-            val completion = llmClient.streamChat(request) { event ->
+            val completion = try {
+                llmClient.streamChat(request) { event ->
                 firstModelEvent.set(true)
                 slowNetworkFeedback.cancel()
-                onStreamEvent(event)
                 when (event) {
                     is CloudSpeechClient.ChatStreamEvent.ReasoningDelta -> {
+                        onStreamEvent(event)
                         if (!reasoningStarted) {
                             reasoningStarted = true
                             Timber.i("Latency reasoning first_delta elapsed=${System.currentTimeMillis() - startedAt}ms")
                         }
                     }
                     is CloudSpeechClient.ChatStreamEvent.ContentDelta -> {
-                        if (!firstDeltaLogged) {
-                            firstDeltaLogged = true
-                            Timber.i("Latency LLM first_content elapsed=${System.currentTimeMillis() - startedAt}ms")
+                        val gated = bodyToolGate.append(event.text)
+                        if (gated.tooLarge) throw BodyToolCallTooLargeException()
+                        if (gated.protocolDetected) {
+                            onStreamEvent(
+                                CloudSpeechClient.ChatStreamEvent.ToolCallDelta(
+                                    index = -1,
+                                    id = null,
+                                    name = "body_tool_protocol",
+                                    argumentsDelta = null,
+                                ),
+                            )
                         }
-                        if (allowDirectSpeech) {
-                            val speechDelta = extractor.feed(event.text)
-                            for (segment in segmenter.feed(speechDelta)) {
-                                if (!firstSegmentLogged) {
-                                    firstSegmentLogged = true
-                                    Timber.i(
-                                        "Latency speech first_segment elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                                            "chars=${segment.length}",
-                                    )
-                                }
-                                ttsQueue.send(segment)
-                            }
-                        }
+                        consumeContentDelta(gated.text)
                     }
-                    is CloudSpeechClient.ChatStreamEvent.ToolCallDelta -> Unit
-                    is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
+                    is CloudSpeechClient.ChatStreamEvent.ToolCallDelta,
+                    is CloudSpeechClient.ChatStreamEvent.Finished -> onStreamEvent(event)
                 }
+                }
+            } catch (error: BodyToolCallTooLargeException) {
+                emitLog("已拦截超长正文工具调用，未执行写入")
+                CloudSpeechClient.ChatCompletion(
+                    message = CloudSpeechClient.LlmMessage(
+                        role = "assistant",
+                        content = "工具调用内容过长，未执行写入。请使用 exec 的 argv 复制已有文件，或用 write append 分段写入。",
+                    ),
+                    finishReason = "body_protocol_too_large",
+                )
             }
+            consumeContentDelta(bodyToolGate.finish().text)
             onModelStreamDone()
-            if (allowDirectSpeech) {
+            if (allowDirectSpeech || voiceReplyGate != null) {
                 val tail = extractor.finish()
-                for (segment in segmenter.feed(tail)) {
-                    ttsQueue.send(segment)
+                if (voiceReplyGate?.observe(tail) == true) {
+                    onLongReplyDetected()
                 }
-                segmenter.flush()?.let { segment ->
-                    ttsQueue.send(segment)
+                if (allowDirectSpeech) {
+                    for (segment in segmenter.feed(tail)) {
+                        ttsQueue.send(segment)
+                    }
+                    segmenter.flush()?.let { segment ->
+                        ttsQueue.send(segment)
+                    }
                 }
             }
             Timber.i(
@@ -1776,6 +1946,90 @@ class VoiceAgentService : Service() {
                 "displayChars=${displayText.length} speechChars=${spoken.length}",
         )
         return spoken
+    }
+
+    private data class VoiceReplyPresentation(
+        val displayText: String,
+        val speechText: String,
+    )
+
+    private suspend fun prepareVoiceReplyPresentation(
+        llmClient: LlmClient,
+        rawText: String,
+    ): VoiceReplyPresentation {
+        if (VoiceReplyLengthGate.countVisible(rawText) <= VoiceReplyLengthGate.DEFAULT_THRESHOLD) {
+            return VoiceReplyPresentation(displayText = rawText, speechText = rawText)
+        }
+
+        val candidate = try {
+            withTimeoutOrNull(VOICE_REPLY_SUMMARY_TIMEOUT_MS) {
+                llmClient.streamChat(
+                    CloudSpeechClient.ChatRequest(
+                        messages = listOf(
+                            CloudSpeechClient.LlmMessage(
+                                role = "system",
+                                content = "你是语音回复摘要器。只输出给用户听的最终摘要，最多三句话，" +
+                                    "不要输出标题、Markdown、DETAILS、工具调用、思考过程或免责声明。" +
+                                    "保留结论、已完成动作和必要的失败原因。",
+                            ),
+                            CloudSpeechClient.LlmMessage(
+                                role = "user",
+                                content = "请将以下助手原始回复提炼成最多三句话：\n<original_reply>\n" +
+                                    compactVoiceSummarySource(rawText) +
+                                    "\n</original_reply>",
+                            ),
+                        ),
+                        tools = emptyList(),
+                        thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                        maxCompletionTokens = VOICE_REPLY_SUMMARY_MAX_TOKENS,
+                    ),
+                ) {}.message.content.orEmpty().trim()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            Timber.w(error, "Voice reply summary failed; using local fallback")
+            null
+        }
+
+        val summary = candidate
+            ?.let { ReplyDetailPolicy.stripDetails(it).speakableText.trim() }
+            ?.takeIf { it.isNotBlank() && !StructuredOutputParser.containsToolProtocol(it) }
+            ?.let(::limitVoiceSentences)
+            ?.takeIf(String::isNotBlank)
+            ?: limitVoiceSentences(SpokenReplyPolicy.fallback(rawText))
+                .ifBlank { "详细内容已经整理在聊天窗口里。" }
+        val details = ReplyDetailPolicy.forDisplay(rawText).trim()
+        return VoiceReplyPresentation(
+            displayText = "$summary\n\n<DETAILS>\n$details\n</DETAILS>",
+            speechText = summary,
+        )
+    }
+
+    private fun compactVoiceSummarySource(text: String): String {
+        if (text.length <= VOICE_REPLY_SUMMARY_INPUT_CHARS) return text
+        val head = (VOICE_REPLY_SUMMARY_INPUT_CHARS * 0.75).toInt()
+        val tail = VOICE_REPLY_SUMMARY_INPUT_CHARS - head
+        return buildString {
+            append(text.take(head))
+            append("\n...[原始回复中间部分省略，仅用于摘要]...\n")
+            append(text.takeLast(tail))
+        }
+    }
+
+    private fun limitVoiceSentences(text: String): String {
+        val normalized = text.replace(Regex("\\s+"), " ").trim()
+        if (normalized.isBlank()) return ""
+        val result = StringBuilder()
+        var sentenceCount = 0
+        normalized.forEachIndexed { index, ch ->
+            result.append(ch)
+            if (ch in VOICE_SENTENCE_ENDINGS && normalized.getOrNull(index + 1) !in VOICE_SENTENCE_ENDINGS) {
+                sentenceCount++
+                if (sentenceCount >= 3) return result.toString().trim()
+            }
+        }
+        return result.toString().trim().take(MAX_VOICE_FALLBACK_CHARS)
     }
 
     private suspend fun prepareVisualTranscript(

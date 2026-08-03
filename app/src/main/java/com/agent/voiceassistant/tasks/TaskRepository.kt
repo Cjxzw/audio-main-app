@@ -7,7 +7,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
 
-private val HUB_REPORTABLE_TERMINAL_STATUSES = setOf(
+internal val HUB_REPORTABLE_TERMINAL_STATUSES = setOf(
     TaskStatus.COMPLETED.name,
     TaskStatus.FAILED.name,
     TaskStatus.INTERRUPTED.name,
@@ -77,36 +77,67 @@ class TaskRepository(context: Context) {
             "sent", "created" -> TaskStatus.QUEUED.name
             else -> TaskStatus.QUEUED.name
         }
-        val old = dao.get(fact.taskId)
         val terminal = status in HUB_REPORTABLE_TERMINAL_STATUSES
-        val reportState = nextHubReportState(old?.status, old?.reportState, status)
-        dao.upsert(
+        dao.upsertHubTask(
             TaskEntity(
                 taskId = fact.taskId,
-                idempotencyKey = old?.idempotencyKey ?: "hub:${fact.taskId}",
+                idempotencyKey = "hub:${fact.taskId}",
                 taskType = "hub_remote",
                 title = fact.title.ifBlank { "Hub 远程任务" },
                 origin = TaskOrigin.HUB.name,
                 executorId = fact.agentId,
                 executorName = fact.agentId,
-                conversationId = old?.conversationId ?: "default",
-                sourceTurnId = old?.sourceTurnId ?: "hub",
-                priority = old?.priority ?: TaskPriority.NORMAL.name,
+                conversationId = "default",
+                sourceTurnId = "hub",
+                priority = TaskPriority.NORMAL.name,
                 status = status,
                 progress = if (terminal) 100 else if (status == TaskStatus.RUNNING.name) 50 else 0,
-                inputJson = old?.inputJson ?: "{}",
+                inputJson = "{}",
                 summary = fact.summary,
                 details = fact.details,
                 error = fact.failureReason.orEmpty(),
                 remoteRevision = fact.updatedAt.hashCode().toLong(),
-                reportState = reportState,
-                reportedAt = if (reportState == TaskReportState.REPORTED.name) old?.reportedAt else null,
-                createdAt = old?.createdAt ?: now,
-                startedAt = old?.startedAt ?: if (status == TaskStatus.RUNNING.name) now else null,
-                completedAt = if (terminal) old?.completedAt ?: now else null,
+                reportState = TaskReportState.NONE.name,
+                createdAt = now,
+                startedAt = if (status == TaskStatus.RUNNING.name) now else null,
+                completedAt = if (terminal) now else null,
                 updatedAt = now,
             ),
         )
+    }
+
+    suspend fun registerHubDispatch(
+        taskId: String,
+        title: String,
+        agentId: String,
+        conversationId: String,
+        sourceTurnId: String,
+        priority: TaskPriority,
+    ) {
+        if (taskId.isBlank() || taskId == "unknown") return
+        val now = System.currentTimeMillis()
+        dao.bindHubDispatch(
+            TaskEntity(
+                taskId = taskId,
+                idempotencyKey = "hub:$taskId",
+                taskType = "hub_remote",
+                title = title,
+                origin = TaskOrigin.HUB.name,
+                executorId = agentId,
+                executorName = agentId,
+                conversationId = conversationId,
+                sourceTurnId = sourceTurnId,
+                priority = priority.name,
+                status = TaskStatus.QUEUED.name,
+                createdAt = now,
+                updatedAt = now,
+            ),
+        )
+    }
+
+    suspend fun updateResultContent(taskId: String, summary: String, details: String): TaskEntity? {
+        dao.updateResultContent(taskId, summary, details, System.currentTimeMillis())
+        return dao.get(taskId)
     }
 
     suspend fun markRunning(task: TaskEntity) {
@@ -162,6 +193,8 @@ class TaskRepository(context: Context) {
 
     suspend fun interruptOrphanedRunning(): Int = dao.interruptRunning(System.currentTimeMillis())
 
+    suspend fun recoverInterruptedReports(): Int = dao.recoverReporting(System.currentTimeMillis())
+
     suspend fun pruneHistory(retentionMs: Long = 30L * 24L * 60L * 60L * 1_000L): Int =
         dao.pruneHistory(System.currentTimeMillis() - retentionMs)
 
@@ -181,7 +214,11 @@ class TaskRepository(context: Context) {
         return action
     }
 
-    suspend fun finishReport(actionId: String, state: String, summaryText: String = "", error: String = "") {
-        dao.finishReportAction(actionId, state, summaryText, error, System.currentTimeMillis())
+    suspend fun completeReport(actionId: String, tasks: List<TaskEntity>, state: String, summaryText: String) {
+        dao.completeReport(actionId, tasks.map(TaskEntity::taskId), state, summaryText, System.currentTimeMillis())
+    }
+
+    suspend fun failReport(actionId: String, tasks: List<TaskEntity>, error: String) {
+        dao.failReport(actionId, tasks.map(TaskEntity::taskId), error, System.currentTimeMillis())
     }
 }

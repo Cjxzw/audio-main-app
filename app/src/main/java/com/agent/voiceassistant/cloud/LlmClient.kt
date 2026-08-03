@@ -171,7 +171,9 @@ class OpenAiCompatibleLlmClient(
     ): CloudSpeechClient.ChatCompletion = coroutineScope {
         val accumulator = ChatStreamAccumulator()
         val call = newJsonCall(buildChatPayload(request)).also {
-            it.timeout().timeout(config.timeoutSeconds, TimeUnit.SECONDS)
+            // The read timeout remains an idle-stream limit. A continuously streaming reply
+            // gets a longer bounded budget so it is not cancelled at the old 60-second mark.
+            it.timeout().timeout(STREAM_HARD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         }
         val receivedEvent = AtomicBoolean(false)
         val firstEventTimedOut = AtomicBoolean(false)
@@ -299,6 +301,7 @@ class OpenAiCompatibleLlmClient(
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         const val FIRST_EVENT_TIMEOUT_MS = 15_000L
+        const val STREAM_HARD_TIMEOUT_SECONDS = 120L
         const val MAX_NETWORK_ATTEMPTS = 2
     }
 }

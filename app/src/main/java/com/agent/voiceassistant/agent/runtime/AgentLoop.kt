@@ -107,6 +107,7 @@ class AgentLoop(
         try {
             suspend fun requestModel(
                 tools: List<CloudSpeechClient.ToolDefinition>,
+                maxCompletionTokens: Int? = null,
             ): Pair<ModelTurn, CloudSpeechClient.LlmMessage> {
                 modelCall += 1
                 eventSink(AgentEvent.MessageStarted(turnId, modelCall))
@@ -114,7 +115,7 @@ class AgentLoop(
                     messages = workingMessages,
                     tools = tools,
                     thinkingMode = thinkingMode,
-                    maxCompletionTokens = if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
+                    maxCompletionTokens = maxCompletionTokens ?: if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
                         config.deepMaxCompletionTokens
                     } else {
                         config.fastMaxCompletionTokens
@@ -141,9 +142,49 @@ class AgentLoop(
                 assistant: CloudSpeechClient.LlmMessage,
                 allowFormatRepair: Boolean = true,
                 emitFinishedOnSuccess: Boolean = true,
+                emptyFinalRetriesRemaining: Int = MAX_EMPTY_FINAL_RETRIES,
+                retryMaxCompletionTokens: Int? = null,
             ): Outcome.Completed {
                 val finalText = assistant.content.orEmpty().trim()
-                if (finalText.isBlank()) error("模型未返回最终正文")
+                if (finalText.isBlank()) {
+                    if (emptyFinalRetriesRemaining > 0) {
+                        val attempt = MAX_EMPTY_FINAL_RETRIES - emptyFinalRetriesRemaining + 1
+                        eventSink(
+                            AgentEvent.FinalResponseRetry(
+                                turnId = turnId,
+                                attempt = attempt,
+                                maxRetries = MAX_EMPTY_FINAL_RETRIES,
+                            ),
+                        )
+                        workingMessages += CloudSpeechClient.LlmMessage(
+                            role = "system",
+                            content = buildEmptyFinalRetryInstruction(),
+                        )
+                        val (retryStreamed, retryAssistant) = requestModel(
+                            tools = emptyList(),
+                            maxCompletionTokens = retryMaxCompletionTokens,
+                        )
+                        return completeAssistant(
+                            streamed = retryStreamed,
+                            assistant = retryAssistant,
+                            allowFormatRepair = allowFormatRepair,
+                            emitFinishedOnSuccess = emitFinishedOnSuccess,
+                            emptyFinalRetriesRemaining = emptyFinalRetriesRemaining - 1,
+                            retryMaxCompletionTokens = retryMaxCompletionTokens,
+                        )
+                    }
+                    val fallback = emptyFinalFallback()
+                    return completeAssistant(
+                        streamed = ModelTurn(
+                            completion = CloudSpeechClient.ChatCompletion(fallback, "empty_final_guard"),
+                            streamedSpeech = false,
+                        ),
+                        assistant = fallback,
+                        allowFormatRepair = false,
+                        emitFinishedOnSuccess = emitFinishedOnSuccess,
+                        emptyFinalRetriesRemaining = 0,
+                    )
+                }
                 val invalidFinal = assistant.toolCalls.isNotEmpty() ||
                     StructuredOutputParser.containsToolProtocol(finalText)
                 if (invalidFinal) {
@@ -160,6 +201,7 @@ class AgentLoop(
                             assistant = repairedAssistant,
                             allowFormatRepair = false,
                             emitFinishedOnSuccess = true,
+                            retryMaxCompletionTokens = retryMaxCompletionTokens,
                         )
                     }
                     val fallback = invalidFinalFallback()
@@ -195,11 +237,16 @@ class AgentLoop(
                 repeat(MAX_FINAL_PROTOCOL_ATTEMPTS) { attempt ->
                     val (streamed, assistant) = requestModel(
                         tools = emptyList(),
+                        maxCompletionTokens = FINAL_SUMMARY_MAX_COMPLETION_TOKENS,
                     )
                     val invalid = assistant.toolCalls.isNotEmpty() ||
                         StructuredOutputParser.containsToolProtocol(assistant.content.orEmpty())
                     if (!invalid) {
-                        return completeAssistant(streamed, assistant)
+                        return completeAssistant(
+                            streamed = streamed,
+                            assistant = assistant,
+                            retryMaxCompletionTokens = FINAL_SUMMARY_MAX_COMPLETION_TOKENS,
+                        )
                     }
                     workingMessages += CloudSpeechClient.LlmMessage(
                         role = "system",
@@ -441,6 +488,8 @@ class AgentLoop(
     private companion object {
         private const val MAX_CONSECUTIVE_TOOL_FAILURE_ROUNDS = 3
         private const val MAX_FINAL_PROTOCOL_ATTEMPTS = 2
+        private const val MAX_EMPTY_FINAL_RETRIES = 2
+        private const val FINAL_SUMMARY_MAX_COMPLETION_TOKENS = 256
         private const val DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD = 3
 
         private fun buildFinalFormatRepairInstruction() = buildString {
@@ -450,6 +499,9 @@ class AgentLoop(
             append("再把不需要播报的 Markdown 详情放入 <DETAILS>...</DETAILS>。")
             append("不要在正文中输出 tool_call、function、parameter 等伪工具标签。")
         }
+
+        private fun buildEmptyFinalRetryInstruction() =
+            "上一条模型响应没有可用的最终正文。请继续完成当前请求，直接输出给用户的自然语言结论；不要返回空内容，也不要解释这条重试指令。"
 
         private fun buildToolCallRepairInstruction(reasons: List<String>) = buildString {
             append("上一批工具调用已被系统拒绝，原因：")
@@ -462,6 +514,11 @@ class AgentLoop(
         private fun invalidFinalFallback() = CloudSpeechClient.LlmMessage(
             role = "assistant",
             content = "当前回复包含未受支持的工具调用格式，相关内容已被拦截。请稍后让我重试。",
+        )
+
+        private fun emptyFinalFallback() = CloudSpeechClient.LlmMessage(
+            role = "assistant",
+            content = "这次没有生成可用回复，请再试一次。",
         )
     }
 }

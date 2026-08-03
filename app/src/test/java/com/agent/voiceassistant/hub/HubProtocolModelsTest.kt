@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.hub
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -78,6 +79,25 @@ class HubProtocolModelsTest {
         assertEquals("req_1", result.requestId)
         assertEquals("target_offline", result.errorCode)
         assertEquals("目标执行 Agent 当前不在线。", result.errorMessage)
+    }
+
+    @Test
+    fun `successful action result accepts null error and result`() {
+        val message = buildJsonObject {
+            put("type", "action.result")
+            put("requestId", "req_ok")
+            put("ok", true)
+            put("result", JsonNull)
+            put("error", JsonNull)
+        }
+
+        val result = HubActionResult.from(message, json)
+
+        assertTrue(result.ok)
+        assertEquals("req_ok", result.requestId)
+        assertTrue(result.result.isEmpty())
+        assertEquals("", result.errorCode)
+        assertEquals("", result.errorMessage)
     }
 
     @Test

@@ -30,19 +30,12 @@ internal class VirtualPathResolver(
 
     fun normalize(path: String): String {
         val normalized = path.trim().replace('\\', '/')
-        val looksLikeVirtualPath = normalized.startsWith("/source") ||
-            normalized.startsWith("/logs") ||
-            normalized.startsWith("/workspace") ||
-            normalized.startsWith("/skills")
-        require(looksLikeVirtualPath || File(path).isAbsolute) { "必须使用绝对虚拟路径或已知物理路径" }
-        require(!normalized.split('/').contains("..")) { "路径不能包含 .." }
-        val absolute = normalized.replace(Regex("/+"), "/").removeSuffix("/").ifEmpty { "/" }
-
-        val physical = File(absolute).canonicalFile.toPath()
-        mounts.firstOrNull { physical.startsWith(it.physicalRoot.toPath()) }?.let { mount ->
-            val relative = mount.physicalRoot.toPath().relativize(physical).toString().replace('\\', '/')
-            return if (relative.isBlank()) mount.virtualRoot else "${mount.virtualRoot}/$relative"
+        val looksLikeVirtualPath = listOf("/source", "/logs", "/workspace", "/skills")
+            .any { root -> normalized == root || normalized.startsWith("$root/") }
+        require(looksLikeVirtualPath) {
+            "必须使用以 /source、/logs、/workspace 或 /skills 开头的绝对虚拟路径"
         }
-        return absolute
+        require(!normalized.split('/').contains("..")) { "路径不能包含 .." }
+        return normalized.replace(Regex("/+"), "/").removeSuffix("/").ifEmpty { "/" }
     }
 }

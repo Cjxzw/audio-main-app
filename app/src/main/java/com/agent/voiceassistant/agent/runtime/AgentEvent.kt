@@ -36,9 +36,17 @@ sealed interface AgentEvent {
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
+    data class FinalResponseRetry(
+        override val turnId: String,
+        val attempt: Int,
+        val maxRetries: Int,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
     data class ContentDelta(
         override val turnId: String,
         val text: String,
+        val userVisible: Boolean = true,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 

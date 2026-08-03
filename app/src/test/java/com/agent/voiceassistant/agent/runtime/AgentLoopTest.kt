@@ -31,6 +31,44 @@ class AgentLoopTest {
     }
 
     @Test
+    fun `retries blank final response twice without failing the turn`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(),
+                    message(content = "   "),
+                    message(content = "重试后完成"),
+                ),
+            ),
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("重试后完成", true), outcome)
+        assertEquals(3, runtime.requests.size)
+        assertEquals(2, events.filterIsInstance<AgentEvent.FinalResponseRetry>().size)
+        assertTrue(events.none { it is AgentEvent.AgentFailed })
+    }
+
+    @Test
+    fun `exhausted blank final retries still complete with a safe fallback`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(listOf(message(), message(), message())),
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(config())
+
+        assertEquals(
+            AgentLoop.Outcome.Completed("这次没有生成可用回复，请再试一次。", true),
+            outcome,
+        )
+        assertEquals(3, runtime.requests.size)
+        assertTrue(events.none { it is AgentEvent.AgentFailed })
+    }
+
+    @Test
     fun `feeds tool result back to model`() = runBlocking {
         val call = CloudSpeechClient.ToolCall("call-1", "read", "{\"path\":\"/source/a.kt\"}")
         val runtime = FakeRuntime(
@@ -367,6 +405,7 @@ class AgentLoopTest {
         assertEquals(AgentLoop.Outcome.Completed("连续三次读取失败，我先停止重试", true), outcome)
         assertEquals(4, runtime.requests.size)
         assertTrue(runtime.requests.last().tools.isEmpty())
+        assertEquals(256, runtime.requests.last().maxCompletionTokens)
     }
 
     @Test

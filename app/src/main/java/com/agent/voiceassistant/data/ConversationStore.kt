@@ -144,6 +144,42 @@ class ConversationStore(context: Context) {
         return message
     }
 
+    fun addMessageToConversation(
+        conversationId: String,
+        role: String,
+        content: String,
+        timestamp: Long = System.currentTimeMillis(),
+        presentation: ChatPresentation = ChatPresentation.STANDARD,
+        streamState: ChatStreamState? = null,
+    ): StoredMessage {
+        val normalizedRole = when (role) {
+            "assistant", "bot" -> "assistant"
+            "system", "tool" -> role
+            else -> "user"
+        }
+        val message = StoredMessage(
+            id = UUID.randomUUID().toString(),
+            role = normalizedRole,
+            content = content,
+            timestamp = timestamp,
+            presentation = presentation.name,
+            streamState = streamState?.name,
+        )
+        synchronized(lock) {
+            val session = state.sessions.firstOrNull { it.id == conversationId }
+                ?: ConversationSession(
+                    id = conversationId,
+                    title = defaultConversationTitle(timestamp),
+                    createdAt = timestamp,
+                    updatedAt = timestamp,
+                ).also(state.sessions::add)
+            session.messages.add(message)
+            session.updatedAt = timestamp
+            persistLocked()
+        }
+        return message
+    }
+
     fun setLlmContent(messageId: String, content: String) = synchronized(lock) {
         val session = currentSessionLocked()
         val index = session.messages.indexOfFirst { it.id == messageId }

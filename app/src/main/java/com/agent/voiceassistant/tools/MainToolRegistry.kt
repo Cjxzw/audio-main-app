@@ -6,6 +6,7 @@ import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.tasks.AsyncTaskCoordinator
 import com.agent.voiceassistant.tasks.SongGenerationExecutor
 import com.agent.voiceassistant.tasks.TaskPriority
+import com.agent.voiceassistant.tasks.TaskRepository
 import com.agent.voiceassistant.tasks.TaskSubmission
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -20,6 +21,7 @@ import kotlinx.serialization.json.putJsonObject
 class MainToolRegistry(
     private val executor: LocalToolExecutor,
     private val taskCoordinator: AsyncTaskCoordinator? = null,
+    private val taskRepository: TaskRepository? = null,
     private val taskContext: () -> TaskToolContext = { TaskToolContext("default", "") },
 ) {
     data class TaskToolContext(
@@ -196,6 +198,17 @@ class MainToolRegistry(
         val taskId = result.result["taskId"]?.let { (it as? JsonPrimitive)?.content }
             ?: result.result["task_id"]?.let { (it as? JsonPrimitive)?.content }
             ?: "unknown"
+        taskRepository?.registerHubDispatch(
+            taskId = taskId,
+            title = title!!,
+            agentId = target!!,
+            conversationId = context.conversationId,
+            sourceTurnId = context.sourceTurnId,
+            priority = when ((payload.text("urgency") ?: "normal").lowercase()) {
+                "urgent" -> TaskPriority.URGENT
+                else -> TaskPriority.NORMAL
+            },
+        )
         return LocalToolExecutor.ToolResult(
             TOOL_HUB_DISPATCH_TASK,
             "已交给枢卫执行 · ${taskId.takeLast(12)}",
@@ -333,7 +346,10 @@ class MainToolRegistry(
                 ?: (payload["paths"] as? JsonArray)?.size?.let { "$it 个项目" }
             TOOL_WRITE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
             TOOL_WORKSPACE_DELETE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
-            TOOL_EXEC -> payload.text("command")?.lineSequence()?.firstOrNull()
+            TOOL_EXEC -> (payload["argv"] as? JsonArray)
+                ?.firstOrNull()
+                ?.let { it as? JsonPrimitive }
+                ?.content
             TOOL_HTTP_REQUEST -> payload.text("url")
             TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
             TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
@@ -622,16 +638,16 @@ class MainToolRegistry(
 
     private fun writeFile() = tool(
         name = TOOL_WRITE,
-        description = "在 /workspace 中创建、覆盖或追加 UTF-8 文本文件。不得写入源码、日志或 Skill 目录。",
+        description = "在 /workspace 中创建、覆盖、追加或按行补丁 UTF-8 文本文件。不得写入源码、日志或 Skill 目录；单次 content 最多 8 KiB。",
         required = listOf("path", "content"),
     ) {
         putJsonObject("path") {
             put("type", "string")
-            put("description", "必须位于 /workspace 的绝对虚拟路径")
+            put("description", "必须位于 /workspace 的绝对虚拟路径；patch 前先 read 获取文件 sha256")
         }
         putJsonObject("content") {
             put("type", "string")
-            put("description", "需要写入的完整文本")
+            put("description", "写入文本；单次最多 8 KiB。大文本请拆分为 append，多数已有文件复制请用 exec 的 cp argv")
         }
         putJsonObject("mode") {
             put("type", "string")
@@ -639,7 +655,22 @@ class MainToolRegistry(
                 add(JsonPrimitive("overwrite"))
                 add(JsonPrimitive("append"))
                 add(JsonPrimitive("create"))
+                add(JsonPrimitive("patch"))
             })
+        }
+        putJsonObject("start_line") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("description", "仅 patch：要替换的起始行（含）")
+        }
+        putJsonObject("end_line") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("description", "仅 patch：要替换的结束行（含）")
+        }
+        putJsonObject("expected_sha256") {
+            put("type", "string")
+            put("description", "可选；patch 前读取到的文件 sha256，不一致时拒绝修改")
         }
     }
 
@@ -656,12 +687,13 @@ class MainToolRegistry(
 
     private fun execCommand() = tool(
         name = TOOL_EXEC,
-        description = "在 App 自身 UID 沙箱中执行一次性 shell 命令。通过 cwd 选择 /source、/logs、/workspace 或 /skills 虚拟工作目录；适合日志诊断、文本处理、网络探测和短脚本，不得启动驻留或交互进程。删除工作区内容必须改用 workspace_delete。",
-        required = listOf("command"),
+        description = "在 App 自身 UID 沙箱中执行一次性程序。使用 cwd 和 argv；所有文件路径必须为 /source、/logs、/workspace 或 /skills 下的绝对虚拟路径，运行时会统一解析。无 shell、无环境变量、无管道语法；删除工作区内容必须改用 workspace_delete。",
+        required = listOf("argv"),
     ) {
-        putJsonObject("command") {
-            put("type", "string")
-            put("description", "传给系统 sh -lc 的命令；可使用 SOURCE_ROOT、LOGS_ROOT、WORKSPACE_ROOT、SKILLS_ROOT 环境变量")
+        putJsonObject("argv") {
+            put("type", "array")
+            put("description", "程序和参数数组。例如 [\"cp\", \"/source/README.md\", \"/workspace/README.md\"]。不要传 shell command 字符串。")
+            put("items", buildJsonObject { put("type", "string") })
         }
         putJsonObject("timeout_seconds") {
             put("type", "integer")
@@ -670,7 +702,7 @@ class MainToolRegistry(
         }
         putJsonObject("cwd") {
             put("type", "string")
-            put("description", "虚拟工作目录，默认 /workspace。不要在 shell 命令中直接使用 /source 等虚拟绝对路径")
+            put("description", "虚拟工作目录，默认 /workspace；只能是 /source、/logs、/workspace 或 /skills 下的绝对虚拟路径")
         }
     }
 

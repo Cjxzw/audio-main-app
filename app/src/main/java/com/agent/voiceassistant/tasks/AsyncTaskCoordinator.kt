@@ -27,6 +27,8 @@ class AsyncTaskCoordinator(
     suspend fun recover() {
         val pruned = repository.pruneHistory()
         if (pruned > 0) Timber.i("AsyncTasks: pruned $pruned expired task records")
+        val reports = repository.recoverInterruptedReports()
+        if (reports > 0) Timber.w("AsyncTasks: restored $reports interrupted task reports")
         val interrupted = repository.interruptOrphanedRunning()
         if (interrupted > 0) Timber.w("AsyncTasks: marked $interrupted orphaned running tasks interrupted")
         repository.unfinished()

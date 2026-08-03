@@ -19,6 +19,7 @@ import java.io.IOException
 import java.io.InterruptedIOException
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -44,9 +45,15 @@ class AndroidExecutionEnv(
         val totalLines: Int,
         val truncated: Boolean,
         val filterSummary: String? = null,
+        val sha256: String? = null,
     )
 
-    data class WriteResult(val path: String, val bytesWritten: Int, val mode: String)
+    data class WriteResult(
+        val path: String,
+        val bytesWritten: Int,
+        val mode: String,
+        val sha256: String,
+    )
 
     data class ExecResult(
         val command: String,
@@ -146,53 +153,78 @@ class AndroidExecutionEnv(
             } else {
                 null
             },
+            sha256 = sha256(text.toByteArray()),
         )
     }
 
-    fun write(path: String, content: String, mode: String = "overwrite"): WriteResult {
+    fun write(
+        path: String,
+        content: String,
+        mode: String = "overwrite",
+        startLine: Int? = null,
+        endLine: Int? = null,
+        expectedSha256: String? = null,
+    ): WriteResult {
         require(content.toByteArray().size <= MAX_WRITE_BYTES) { "单次写入不能超过 $MAX_WRITE_BYTES 字节" }
         val file = pathResolver.resolve(path, write = true)
         file.parentFile?.mkdirs()
-        when (mode.lowercase()) {
-            "overwrite" -> file.writeText(content, Charsets.UTF_8)
-            "append" -> file.appendText(content, Charsets.UTF_8)
+        val normalizedMode = mode.lowercase()
+        require(normalizedMode != "patch" || file.exists()) { "patch 目标文件不存在：$path" }
+        val current = if (file.exists()) file.readText(Charsets.UTF_8) else ""
+        expectedSha256?.trim()?.takeIf { it.isNotEmpty() }?.let { expected ->
+            require(sha256(current.toByteArray()) == expected.lowercase()) {
+                "文件已变化：$path；请重新读取后再修改"
+            }
+        }
+        val updated = when (normalizedMode) {
+            "overwrite" -> content
+            "append" -> current + content
             "create" -> {
                 require(file.createNewFile()) { "文件已存在：$path" }
-                file.writeText(content, Charsets.UTF_8)
+                content
             }
+            "patch" -> TextPatchApplier.apply(current, content, startLine, endLine)
             else -> error("不支持的写入模式：$mode")
         }
-        return WriteResult(pathResolver.normalize(path), content.toByteArray().size, mode.lowercase())
+        if (normalizedMode != "create") writeTextAtomically(file, updated)
+        else file.writeText(updated, Charsets.UTF_8)
+        return WriteResult(
+            path = pathResolver.normalize(path),
+            bytesWritten = content.toByteArray().size,
+            mode = normalizedMode,
+            sha256 = sha256(updated.toByteArray()),
+        )
     }
 
     fun trashWorkspacePath(path: String, conversationId: String? = null): WorkspaceTrashRepository.TrashEntry =
         workspaceTrash.moveAgentPathToTrash(path, conversationId = conversationId)
 
     suspend fun exec(
-        command: String,
+        argv: List<String>,
         timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
         cwd: String = "/workspace",
     ): ExecResult {
-        require(command.isNotBlank()) { "command 不能为空" }
-        require(command.length <= MAX_COMMAND_CHARS) { "command 过长" }
-        require(!WorkspaceDeletePolicy.attemptsDirectDeletion(command)) {
+        require(argv.isNotEmpty()) { "argv 不能为空" }
+        require(argv.size <= MAX_EXEC_ARGV_ITEMS) { "argv 项目过多" }
+        require(argv.none { it.length > MAX_EXEC_ARG_CHARS }) { "argv 参数过长" }
+        val displayCommand = argv.joinToString(" ") { argument ->
+            if (argument.any(Char::isWhitespace)) "\"${argument.replace("\"", "\\\"")}" else argument
+        }
+        require(!WorkspaceDeletePolicy.attemptsDirectDeletion(argv)) {
             "exec 不允许直接删除文件；请使用 workspace_delete，以便将 Agent 删除的内容移入回收站"
+        }
+        require(!WorkspaceDeletePolicy.attemptsShellExecution(argv)) {
+            "exec 不允许启动 shell 或多命令解释器；请使用 argv 调用单个程序"
         }
         val timeout = timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS)
         val normalizedCwd = pathResolver.normalize(cwd)
         val physicalCwd = pathResolver.resolve(normalizedCwd, write = false)
         require(physicalCwd.isDirectory) { "cwd 不是目录：$cwd" }
+        val resolvedArgv = argv.map(::resolveExecArgument)
         return withContext(Dispatchers.IO) {
-            val shell = if (File("/system/bin/sh").exists()) "/system/bin/sh" else "/bin/sh"
-            val process = ProcessBuilder(shell, "-lc", command)
+            val process = ProcessBuilder(resolvedArgv)
                 .directory(physicalCwd)
                 .redirectErrorStream(true)
-                .apply {
-                    environment()["SOURCE_ROOT"] = sourceRoot.absolutePath
-                    environment()["LOGS_ROOT"] = logsRoot.absolutePath
-                    environment()["WORKSPACE_ROOT"] = workspaceRoot.absolutePath
-                    environment()["SKILLS_ROOT"] = skillsRoot.absolutePath
-                }
                 .start()
             try {
                 coroutineScope {
@@ -204,7 +236,7 @@ class AndroidExecutionEnv(
                     if (!completed) process.destroyForcibly()
                     val captured = output.await()
                     ExecResult(
-                        command = command,
+                        command = displayCommand,
                         cwd = normalizedCwd,
                         exitCode = if (completed) process.exitValue() else null,
                         output = captured.first,
@@ -217,6 +249,25 @@ class AndroidExecutionEnv(
             }
         }
     }
+
+    private fun writeTextAtomically(file: File, content: String) {
+        val temporary = File(file.parentFile, ".${file.name}.${UUID.randomUUID()}.tmp")
+        try {
+            temporary.writeText(content, Charsets.UTF_8)
+            require(temporary.renameTo(file)) { "无法原子替换文件：${file.name}" }
+        } finally {
+            if (temporary.exists()) temporary.delete()
+        }
+    }
+
+    private fun resolveExecArgument(argument: String): String {
+        if (!argument.startsWith('/')) return argument
+        return pathResolver.resolve(argument, write = false).absolutePath
+    }
+
+    private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { byte -> "%02x".format(byte) }
 
     suspend fun httpRequest(
         method: String,
@@ -421,10 +472,11 @@ class AndroidExecutionEnv(
         private const val MAX_READ_LINES = 1_000
         private const val MAX_READ_FILE_BYTES = 2L * 1024 * 1024
         private const val MAX_READ_OUTPUT_CHARS = 40_000
-        private const val MAX_WRITE_BYTES = 512 * 1024
+        private const val MAX_WRITE_BYTES = 8 * 1024
         private const val DEFAULT_EXEC_TIMEOUT_SECONDS = 30
         private const val MAX_EXEC_TIMEOUT_SECONDS = 120
-        private const val MAX_COMMAND_CHARS = 8_000
+        private const val MAX_EXEC_ARGV_ITEMS = 64
+        private const val MAX_EXEC_ARG_CHARS = 4_000
         private const val MAX_EXEC_OUTPUT_CHARS = 40_000
         private const val MAX_HTTP_BODY_BYTES = 512 * 1024
         private const val MAX_HTTP_ATTEMPTS = 2

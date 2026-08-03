@@ -11,7 +11,7 @@ class VirtualPathResolverTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `maps known physical source path back to virtual source path`() {
+    fun `resolves a virtual source path`() {
         val source = temporaryFolder.newFolder("source")
         val target = source.resolve("app/build.gradle.kts").apply {
             parentFile?.mkdirs()
@@ -19,17 +19,21 @@ class VirtualPathResolverTest {
         }
         val resolver = resolver(source)
 
-        assertEquals("/source/app/build.gradle.kts", resolver.normalize(target.absolutePath))
-        assertEquals(target.canonicalFile, resolver.resolve(target.absolutePath, write = false))
+        assertEquals("/source/app/build.gradle.kts", resolver.normalize("/source/app/build.gradle.kts"))
+        assertEquals(target.canonicalFile, resolver.resolve("/source/app/build.gradle.kts", write = false))
     }
 
     @Test
-    fun `does not permit unknown physical paths`() {
-        val resolver = resolver(temporaryFolder.newFolder("source"))
+    fun `does not permit physical paths`() {
+        val source = temporaryFolder.newFolder("source")
+        val resolver = resolver(source)
         val outside = temporaryFolder.newFile("outside.txt")
 
-        assertThrows(IllegalStateException::class.java) {
+        assertThrows(IllegalArgumentException::class.java) {
             resolver.resolve(outside.absolutePath, write = false)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            resolver.resolve(source.absolutePath, write = false)
         }
     }
 
@@ -39,7 +43,7 @@ class VirtualPathResolverTest {
         val resolver = resolver(source)
 
         assertThrows(IllegalArgumentException::class.java) {
-            resolver.resolve("${source.absolutePath}/../outside.txt", write = false)
+            resolver.resolve("/source/../outside.txt", write = false)
         }
     }
 

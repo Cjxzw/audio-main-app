@@ -1,6 +1,8 @@
 package com.agent.voiceassistant.agent
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -15,6 +17,15 @@ data class AgentAction(
     val actionType: String,
     val payload: JsonObject,
     val rawJson: String,
+)
+
+data class BodyToolCall(
+    val name: String,
+    val arguments: JsonObject,
+)
+
+internal class BodyToolCallTooLargeException : IllegalStateException(
+    "正文伪工具调用超过保护上限，已停止继续接收",
 )
 
 object StructuredOutputParser {
@@ -51,13 +62,59 @@ object StructuredOutputParser {
         replyPattern.containsMatchIn(raw) || containsToolProtocol(raw)
 
     fun containsToolProtocol(raw: String): Boolean {
-        val visible = SpokenReplyPolicy.withoutFencedDetails(raw)
+        val visible = executableBody(raw)
         if (looseToolXmlPattern.containsMatchIn(visible)) return true
         val stripped = stripCodeFence(visible).trim()
         if (!(stripped.startsWith('{') || stripped.startsWith('['))) return false
         return actionTypeJsonPattern.containsMatchIn(stripped) ||
             namedFunctionJsonPattern.containsMatchIn(stripped) ||
             toolPayloadJsonPattern.containsMatchIn(stripped)
+    }
+
+    /**
+     * Detects an incomplete body protocol while text is still streaming. Code fences and
+     * DETAILS are deliberately excluded so displayed examples never become executable.
+     */
+    fun containsPotentialToolProtocol(raw: String): Boolean {
+        val visible = executableBody(raw)
+        if (looseToolXmlPattern.containsMatchIn(visible)) return true
+        if (namedFunctionJsonPattern.containsMatchIn(visible) || toolPayloadJsonPattern.containsMatchIn(visible)) {
+            return true
+        }
+        val stripped = stripCodeFence(visible).trim()
+        return stripped.startsWith("{\"name\"") ||
+            stripped.startsWith("{\"tool_calls\"") ||
+            stripped.startsWith("{\"tool_call\"")
+    }
+
+    /**
+     * Compatibility parser for complete tool requests incorrectly emitted in assistant text.
+     * The returned calls still go through the normal tool name, JSON and policy checks.
+     */
+    fun parseBodyToolCalls(raw: String): List<BodyToolCall> {
+        val visible = executableBody(raw).trim()
+        if (visible.isEmpty()) return emptyList()
+        val calls = mutableListOf<BodyToolCall>()
+
+        pseudoToolCallPattern.findAll(visible).forEach { match ->
+            val body = match.groupValues[1].trim()
+            calls += parseJsonToolCalls(body)
+            parsePseudoToolCall(body)?.let { action ->
+                calls += BodyToolCall(action.actionType, action.payload)
+            }
+        }
+
+        if (calls.isEmpty()) {
+            parseJsonToolCalls(visible).forEach(calls::add)
+            if (calls.isEmpty() && pseudoFunctionPattern.matches(visible)) {
+                parsePseudoToolCall(visible)?.let { action ->
+                    calls += BodyToolCall(action.actionType, action.payload)
+                }
+            }
+        }
+        return calls
+            .filter { it.name.matches(Regex("[A-Za-z0-9_-]{1,128}")) }
+            .distinctBy { "${it.name}:${it.arguments}" }
     }
 
     fun parse(raw: String): AgentOutput {
@@ -140,7 +197,7 @@ object StructuredOutputParser {
             pseudoParameterPattern.findAll(function.groupValues[2]).forEach { parameter ->
                 val name = parameter.groupValues[1].trim()
                 val value = decodeXml(parameter.groupValues[2].trim())
-                put(name, scalarJsonValue(value))
+                put(name, jsonValue(value))
             }
         }
         return AgentAction(
@@ -150,12 +207,55 @@ object StructuredOutputParser {
         )
     }
 
+    private fun parseJsonToolCalls(raw: String): List<BodyToolCall> {
+        val element = runCatching { json.parseToJsonElement(stripCodeFence(raw).trim()) }.getOrNull()
+            ?: return emptyList()
+        return parseJsonToolElement(element)
+    }
+
+    private fun parseJsonToolElement(element: JsonElement): List<BodyToolCall> = when (element) {
+        is JsonArray -> element.flatMap(::parseJsonToolElement)
+        is JsonObject -> {
+            val direct = element.toBodyToolCall()
+            when {
+                direct != null -> listOf(direct)
+                element["tool_calls"] is JsonArray -> parseJsonToolElement(requireNotNull(element["tool_calls"]))
+                element["tool_call"] != null -> parseJsonToolElement(requireNotNull(element["tool_call"]))
+                element["function"] != null -> parseJsonToolElement(requireNotNull(element["function"]))
+                else -> emptyList()
+            }
+        }
+        else -> emptyList()
+    }
+
+    private fun JsonObject.toBodyToolCall(): BodyToolCall? {
+        val name = stringValue("name") ?: return null
+        val rawArguments = this["arguments"] ?: this["parameters"] ?: return null
+        val arguments = when (rawArguments) {
+            is JsonObject -> rawArguments
+            is JsonPrimitive -> runCatching {
+                json.parseToJsonElement(rawArguments.content) as? JsonObject
+            }.getOrNull()
+            else -> null
+        } ?: return null
+        return BodyToolCall(name, arguments)
+    }
+
+    private fun executableBody(raw: String): String =
+        ReplyDetailPolicy.stripDetails(SpokenReplyPolicy.withoutFencedDetails(raw)).speakableText
+
     private fun scalarJsonValue(value: String): JsonPrimitive = when {
         value.equals("true", ignoreCase = true) -> JsonPrimitive(true)
         value.equals("false", ignoreCase = true) -> JsonPrimitive(false)
         value.toLongOrNull() != null -> JsonPrimitive(value.toLong())
         value.toDoubleOrNull() != null -> JsonPrimitive(value.toDouble())
         else -> JsonPrimitive(value)
+    }
+
+    private fun jsonValue(value: String): JsonElement = when {
+        value.startsWith("{") || value.startsWith("[") ->
+            runCatching { json.parseToJsonElement(value) }.getOrElse { scalarJsonValue(value) }
+        else -> scalarJsonValue(value)
     }
 
     private fun decodeXml(value: String): String = value
@@ -179,5 +279,64 @@ object StructuredOutputParser {
     private fun looksLikeJsonOnly(text: String): Boolean {
         val stripped = stripCodeFence(text)
         return stripped.startsWith("{") && stripped.endsWith("}")
+    }
+}
+
+internal class BodyToolCallStreamGate(
+    private val probeChars: Int = DEFAULT_BODY_PROTOCOL_PROBE_CHARS,
+) {
+    data class Update(
+        val text: String = "",
+        val protocolDetected: Boolean = false,
+        val tooLarge: Boolean = false,
+    )
+
+    private val observed = StringBuilder()
+    private val pending = StringBuilder()
+    private var released = false
+    private var blocked = false
+    private var observedLength = 0
+
+    fun append(delta: String): Update {
+        if (delta.isEmpty()) return Update()
+        if (blocked) {
+            observedLength += delta.length
+            return Update(tooLarge = observedLength > MAX_BODY_PROTOCOL_CHARS)
+        }
+        observedLength += delta.length
+        observed.append(delta)
+        pending.append(delta)
+        if (StructuredOutputParser.containsPotentialToolProtocol(observed.toString())) {
+            blocked = true
+            pending.clear()
+            return Update(
+                protocolDetected = true,
+                tooLarge = observedLength > MAX_BODY_PROTOCOL_CHARS,
+            )
+        }
+        if (!released) {
+            val first = observed.firstOrNull { !it.isWhitespace() } ?: return Update()
+            if (first == '{' || first == '[' || first == '<' || observed.length < probeChars) return Update()
+            released = true
+        }
+        if (observed.length > MAX_OBSERVED_CHARS) {
+            observed.delete(0, observed.length - MAX_OBSERVED_CHARS)
+        }
+        val text = pending.toString()
+        pending.clear()
+        return Update(text = text)
+    }
+
+    fun finish(): Update {
+        if (blocked) return Update()
+        val text = pending.toString()
+        pending.clear()
+        return Update(text = text)
+    }
+
+    companion object {
+        private const val DEFAULT_BODY_PROTOCOL_PROBE_CHARS = 160
+        private const val MAX_BODY_PROTOCOL_CHARS = 16 * 1024
+        private const val MAX_OBSERVED_CHARS = 32 * 1024
     }
 }

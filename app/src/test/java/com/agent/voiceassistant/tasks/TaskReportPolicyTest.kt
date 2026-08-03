@@ -6,13 +6,34 @@ import org.junit.Test
 
 class TaskReportPolicyTest {
     @Test
-    fun `report style keeps audio concise and moves technical detail to display block`() {
-        val instructions = TaskReportPolicy.styleInstructions()
+    fun `summary style keeps audio concise and leaves details to the system`() {
+        val instructions = TaskReportPolicy.summaryInstructions()
 
         assertTrue(instructions.contains("不超过三句"))
         assertTrue(instructions.contains("代码函数名"))
-        assertTrue(instructions.contains("结果”仍必须压缩成一句话"))
-        assertTrue(instructions.contains("<DETAILS>...</DETAILS>"))
+        assertTrue(instructions.contains("只输出摘要"))
+        assertTrue(instructions.contains("不要输出 DETAILS 标签"))
+    }
+
+    @Test
+    fun `system appends exact remote body in canonical details block`() {
+        val task = task(details = "完成了三项修改。\n```json\n{\"ok\":true}\n```")
+
+        assertEquals(
+            "任务已经完成。\n\n<DETAILS>\n完成了三项修改。\n```json\n{\"ok\":true}\n```\n</DETAILS>",
+            TaskReportPolicy.composeChatReport("任务已经完成。", listOf(task)),
+        )
+    }
+
+    @Test
+    fun `summary strips model details and is capped at three sentences`() {
+        assertEquals(
+            "第一句。第二句！第三句？",
+            TaskReportPolicy.normalizeSummary(
+                "第一句。第二句！第三句？第四句。<DETAILS>不应保留</DETAILS>",
+                "备用总结。",
+            ),
+        )
     }
 
     @Test
@@ -72,4 +93,21 @@ class TaskReportPolicyTest {
             ),
         )
     }
+
+    private fun task(details: String) = TaskEntity(
+        taskId = "task-1",
+        idempotencyKey = "hub:task-1",
+        taskType = "hub_remote",
+        title = "远程任务",
+        origin = TaskOrigin.HUB.name,
+        executorId = "agent-1",
+        executorName = "agent-1",
+        conversationId = "conversation-1",
+        sourceTurnId = "turn-1",
+        status = TaskStatus.COMPLETED.name,
+        summary = "已完成",
+        details = details,
+        createdAt = 1L,
+        updatedAt = 2L,
+    )
 }

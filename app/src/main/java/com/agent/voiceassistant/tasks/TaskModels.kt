@@ -8,7 +8,7 @@ import androidx.room.PrimaryKey
 enum class TaskOrigin { LOCAL, HUB }
 enum class TaskPriority { NORMAL, URGENT }
 enum class TaskStatus { CREATED, QUEUED, RUNNING, COMPLETED, FAILED, INTERRUPTED, CANCELLED, BLOCKED }
-enum class TaskReportState { PENDING, REPORTED, NONE }
+enum class TaskReportState { PENDING, REPORTING, REPORTED, NONE }
 
 @Entity(
     tableName = "tasks",

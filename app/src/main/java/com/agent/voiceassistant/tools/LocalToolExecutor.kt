@@ -333,6 +333,7 @@ class LocalToolExecutor(
             appendLine("${if (result.kind == "directory") "目录" else "文件"}：${result.path}")
             result.filterSummary?.let { appendLine("日志筛选：$it") }
             appendLine("范围：${result.startLine}-${result.endLine}/${result.totalLines}")
+            result.sha256?.let { appendLine("文件 sha256：$it") }
             append(result.content)
             if (result.truncated) append("\n[输出已截断，可调整 offset/limit 或 tail_lines 继续读取]")
         },
@@ -346,13 +347,20 @@ class LocalToolExecutor(
             ?: return invalidArguments("write", "缺少 content 字段")
         val env = executionEnv ?: return unavailable("write")
         return runCatching {
-            env.write(path, content, payload.string("mode") ?: "overwrite")
+            env.write(
+                path = path,
+                content = content,
+                mode = payload.string("mode") ?: "overwrite",
+                startLine = payload.int("start_line"),
+                endLine = payload.int("end_line"),
+                expectedSha256 = payload.string("expected_sha256"),
+            )
         }.fold(
             onSuccess = { result ->
                 ToolResult(
                     actionType = "write",
                     displayText = "写入 ${result.path}",
-                    contextText = "写入成功：${result.path}，${result.bytesWritten} 字节，模式 ${result.mode}。",
+                    contextText = "写入成功：${result.path}，${result.bytesWritten} 字节，模式 ${result.mode}，sha256=${result.sha256}。",
                     shouldAskLlm = true,
                 )
             },
@@ -377,13 +385,12 @@ class LocalToolExecutor(
     }
 
     private suspend fun execCommand(payload: JsonObject): ToolResult {
-        val command = (payload["command"] as? JsonPrimitive)?.contentOrNull?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: return invalidArguments("exec", "缺少 command 字段")
+        val argv = payload.stringList("argv")
+        if (argv.isEmpty()) return invalidArguments("exec", "缺少 argv 字段；exec 不接受 shell command 字符串")
         val env = executionEnv ?: return unavailable("exec")
         return runCatching {
             env.exec(
-                command = command,
+                argv = argv,
                 timeoutSeconds = payload.int("timeout_seconds") ?: 30,
                 cwd = payload.string("cwd") ?: "/workspace",
             )
@@ -528,6 +535,9 @@ class LocalToolExecutor(
         val registry = skillRegistry ?: return unavailable("skill.register")
         val sourcePath = payload.string("source_path")
             ?: return invalidArguments("skill.register", "缺少 source_path")
+        if (sourcePath != "/workspace" && !sourcePath.startsWith("/workspace/")) {
+            return invalidArguments("skill.register", "source_path 必须是 /workspace 下的虚拟路径")
+        }
         val name = payload.string("name")
             ?: return invalidArguments("skill.register", "缺少 name")
         val description = payload.string("description")
