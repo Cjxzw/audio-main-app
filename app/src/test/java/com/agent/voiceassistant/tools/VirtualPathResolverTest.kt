@@ -51,6 +51,5 @@ class VirtualPathResolverTest {
         sourceRoot = source,
         logsRoot = temporaryFolder.newFolder(),
         workspaceRoot = temporaryFolder.newFolder(),
-        skillsRoot = temporaryFolder.newFolder(),
     )
 }

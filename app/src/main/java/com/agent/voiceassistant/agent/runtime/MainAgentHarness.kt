@@ -9,12 +9,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.channels.Channel
 import java.util.ArrayDeque
 
 class MainAgentHarness {
     enum class State {
         IDLE,
         RUNNING,
+        WAITING_NETWORK,
+        WAITING_RETRY,
+        WAITING_RECOVERY,
         CANCELLING,
         FAILED,
     }
@@ -29,17 +33,34 @@ class MainAgentHarness {
     private val steeringQueue = ArrayDeque<QueuedInput>()
     private val followUpQueue = ArrayDeque<QueuedInput>()
     private val _state = MutableStateFlow(State.IDLE)
+    private val retryInputs = Channel<QueuedInput>(Channel.UNLIMITED)
 
     @Volatile
     private var activeTurn: Deferred<AgentLoop.Outcome>? = null
 
     val state: StateFlow<State> = _state.asStateFlow()
 
-    suspend fun run(loop: AgentLoop, config: AgentLoop.Config): AgentLoop.Outcome =
+    suspend fun awaitRetry(networkTimeout: Boolean): QueuedInput {
+        _state.value = if (networkTimeout) State.WAITING_NETWORK else State.WAITING_RECOVERY
+        return retryInputs.receive().also { _state.value = State.RUNNING }
+    }
+
+    fun resume(text: String): Boolean {
+        if (_state.value !in setOf(State.WAITING_NETWORK, State.WAITING_RETRY, State.WAITING_RECOVERY)) return false
+        _state.value = State.RUNNING
+        retryInputs.trySend(QueuedInput(text))
+        return true
+    }
+
+    suspend fun run(
+        loop: AgentLoop,
+        config: AgentLoop.Config,
+        turnId: String? = null,
+    ): AgentLoop.Outcome =
         turnMutex.withLock {
             coroutineScope {
                 _state.value = State.RUNNING
-                val turn = async { loop.run(config) }
+                val turn = async { if (turnId == null) loop.run(config) else loop.run(config, turnId) }
                 activeTurn = turn
                 try {
                     turn.await().also { _state.value = State.IDLE }

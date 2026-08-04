@@ -42,7 +42,7 @@ class SkillEditorActivity : AppCompatActivity() {
         skillId = intent.getStringExtra(EXTRA_SKILL_ID).orEmpty()
         if (!creating && skillId.isBlank()) return fail("缺少 Skill ID")
         val env = AndroidExecutionEnv(this)
-        skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest)
+        skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest, env.systemSkillsRoot, env.disabledSystemSkillsManifest)
         adapter = SkillFileAdapter(::openFile)
         binding.skillFilesList.layoutManager = LinearLayoutManager(this)
         binding.skillFilesList.adapter = adapter

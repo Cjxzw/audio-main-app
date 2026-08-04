@@ -35,13 +35,21 @@ data class TurnMetrics(
     val failedToolCallCount: Int = 0,
     val blockedToolCallCount: Int = 0,
     val usedHubDispatch: Boolean = false,
+    val automaticReasoningEscalated: Boolean = false,
+    val activeBudgetBlocked: Boolean = false,
+    val activeTaskDurationMs: Long = 0,
     val tools: List<ToolCallMetric> = emptyList(),
 ) {
-    fun reflectionTriggers(): List<String> = buildList {
-        if (toolCallCount >= 5) add("工具调用数 >= 5")
-        if (toolRoundCount >= 3) add("工具轮次 >= 3")
-        if (totalDurationMs >= 20_000) add("总耗时 >= 20 秒")
-        if (toolWallDurationMs >= 10_000) add("工具耗时 >= 10 秒")
+    fun reflectionTriggers(heavyTaskIntent: Boolean = false): List<String> = buildList {
+        if (activeBudgetBlocked) add("有效任务预算已触发")
+        if (heavyTaskIntent && !usedHubDispatch) add("重型任务未委派")
+        if (automaticReasoningEscalated && !usedHubDispatch && toolRoundCount >= 2) {
+            add("复杂任务升级后仍扩展本地工具")
+        }
+        if (toolCallCount >= 5 && !usedHubDispatch) add("未委派且工具调用数 >= 5")
+        if (toolRoundCount >= 3 && !usedHubDispatch) add("未委派且工具轮次 >= 3")
+        if (failedToolCallCount >= 3) add("工具连续或累计失败较多")
+        if (blockedToolCallCount > 0) add("存在被策略阻止的工具调用")
     }
 }
 

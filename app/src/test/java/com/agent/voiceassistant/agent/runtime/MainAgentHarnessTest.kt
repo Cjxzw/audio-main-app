@@ -5,6 +5,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.delay
+import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -51,6 +53,34 @@ class MainAgentHarnessTest {
         yield()
         assertEquals(MainAgentHarness.State.IDLE, harness.state.value)
         assertFalse(harness.abort())
+    }
+
+    @Test
+    fun `timeout keeps same turn open until user resumes it`() = runBlocking {
+        val harness = MainAgentHarness()
+        var attempts = 0
+        val runtime = object : NoopRuntime() {
+            override suspend fun modelTurn(
+                request: CloudSpeechClient.ChatRequest,
+                beforeSpeech: suspend () -> Unit,
+                onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
+            ): AgentLoop.ModelTurn {
+                if (attempts++ == 0) throw NetworkTimeoutException("test")
+                assertTrue(request.messages.any { it.role == "user" && it.content == "继续重试" })
+                return super.modelTurn(request, beforeSpeech, onStreamEvent)
+            }
+
+            override suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String {
+                assertTrue(networkTimeout)
+                return harness.awaitRetry(networkTimeout).text
+            }
+        }
+        val running = async { harness.run(AgentLoop(runtime), config()) }
+        while (harness.state.value != MainAgentHarness.State.WAITING_NETWORK) delay(1)
+
+        assertTrue(harness.resume("继续重试"))
+        assertEquals(AgentLoop.Outcome.Completed("ok", true), running.await())
+        assertEquals(MainAgentHarness.State.IDLE, harness.state.value)
     }
 
     private fun config() = AgentLoop.Config(

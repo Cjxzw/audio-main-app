@@ -19,6 +19,7 @@ class DeviceContextProvider(
     private val capabilities: AppCapabilityResolver,
     private val providers: LlmProviderRepository,
     private val speechPreferences: SpeechPreferences,
+    private val locationContext: () -> String = { "位置缓存：暂无" },
 ) {
     private val appContext = context.applicationContext
     private val systemProperties = readSystemProperties()
@@ -39,6 +40,7 @@ class DeviceContextProvider(
             appendLine("语音输入输出可用：${yesNo(capability.speechAvailable)}")
             appendLine("麦克风权限：${permission(Manifest.permission.RECORD_AUDIO)}")
             appendLine("位置权限：${if (permissionGranted(Manifest.permission.ACCESS_COARSE_LOCATION) || permissionGranted(Manifest.permission.ACCESS_FINE_LOCATION)) "已授权" else "未授权"}")
+            appendLine(locationContext())
             appendLine("说明：设备元信息只用于理解运行环境和兼容性；实际权限与能力以本回合提供的工具为准。")
             append("</device_context>")
         }

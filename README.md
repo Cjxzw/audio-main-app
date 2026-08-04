@@ -16,19 +16,21 @@
 - 聊天模型与 MiMo 语音链路已解耦：只配置 MiMo Key 即可使用全部能力，也可让聊天请求改走专属 OpenAI 兼容供应商。
 - 自定义供应商支持多配置、连接测试和按回合热切换；API Key 使用 Android Keystore 加密，不写入普通配置或模型上下文。
 - 使用 MiMo 云端流式 TTS 按句播放回复。
-- 支持终止型 `voice_reply` 个性化播报：预设音色可流式整段播报和唱歌，VoiceDesign 可按自然语言临时设计音色。
+- 高级个性化播报通过内置“高级 TTS 导演”系统 Skill 按回合开放；普通回复继续使用自动 TTS。
 - 支持终止型 `agent_sleep` 语义休眠：用户明确表示结束交互时直接复用完整休眠流程，不再等待静默超时。
 - MiMo Key 使用 Android Keystore 加密保存；`sk` Key 自动选择按量付费地址，`tp` Key 自动选择 Token Plan 地址。
 - 没有 MiMo Key但配置了专属 LLM 时，可使用纯文本交流；设置中可关闭文字输入回合的语音播报。
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
-- 工具阶段与最终回复使用独立预算；达到上限或连续失败后仍会保留一次无工具总结。
-- 最终正文为空时在 AgentLoop 内部最多重试两次；重试只写入诊断日志，不把内部错误展示到聊天气泡或通知。
+- 原生工具表固定为记忆、休眠、Hub 委派、深度思考、`skill_use` 和快速网络检索；本地执行能力由系统 Skill 渐进披露，避免破坏请求前缀和工具 Schema 的 KV 缓存。
+- 空正文、伪工具协议和工具故障不会生成本地兜底答复；AgentLoop 必须取得有效正文并完成必要摘要后才结束。网络超时进入等待重试状态，保留相同 `turnId` 和当前回合上下文。
+- 工具型任务从模型首个有效事件开始累计 30 秒有效执行时间，模型请求的首事件等待不计入；超限后停止新增本地工具，但仍允许总结或 Hub 委派。
+- 未完成回合在关键边界写入最小原子检查点，进程重启后继续原会话和 `turnId`；正常完成即删除。路由反思只在异常条件下后台执行。
 - 聊天气泡将 `<DETAILS>...</DETAILS>` 与正文分开渲染，带分隔线和展开/折叠控件；最近三轮默认展开，更早详情自动折叠。
 - AgentLoop 已从语音 Service 抽离；Harness 提供串行回合、取消、`steer`/`followUp` 队列和统一事件。
-- 支持记忆、定位、天气、网络搜索、文件读写、Shell 和通用 HTTP 工具。
+- 支持记忆、后台位置上下文、快速网络搜索，以及通过“本地执行”系统 Skill 按回合开放的文件、命令、HTTP 和代码图谱工具。
 - APK 自动携带不含密钥的源码快照，Agent 可读取源码与轮转日志进行交叉诊断。
-- 支持 Agent Skills 渐进加载：上下文只注入 Skill 名称、描述和路径，匹配任务后再读取全文。
+- 支持 Agent Skills 渐进加载：常驻原生 `skill_use` 负责按中文名称加载主文件和文本附件；系统 Skill 按回合驻留，普通 Skill 默认按会话和版本驻留。
 - 会话与本地记忆持久化；支持历史会话切换、重命名、删除和继续聊天。
 - 新建会话前自动提炼稳定偏好、反复话题和用户明确要求记录的信息，并在新会话中加载长期记忆。
 - 每个用户回合默认关闭深度思考；模型或用户可为当前回合升级一次，下一回合自动恢复关闭。
@@ -145,7 +147,7 @@ app/src/main/java/com/agent/voiceassistant/
 
 ## 当前限制
 
-- Hub 工具尚未接入新工具注册表，当前 `CONNECTED` Profile 只预留结构。
+- Hub 委派工具保持固定 Schema；离线时执行会返回当前不可用，不会改变工具表。
 - 自定义聊天供应商只影响 LLM；当前 ASR、标准 TTS 和个性化 TTS 仍依赖用户配置的 MiMo Key。
 - 主动汇报相关早期模型尚未接入当前 AgentLoop。
 - 语音打断和完整用户状态机尚未实现。
@@ -164,24 +166,25 @@ app/src/main/java/com/agent/voiceassistant/
 
 ## Agent 执行环境
 
-模型看到四个稳定虚拟根：
+本地执行 Skill 激活后，模型看到三个稳定虚拟根：
 
 ```text
 /source      随 APK 构建的只读源码快照
 /logs        最多四份、每份 512 KiB 的轮转日志
 /workspace   Agent 可读写工作区
-/skills      已安装的 Skill
 ```
+
+Skill 目录不属于通用虚拟文件系统；`read`、`write` 和 `exec` 均不能进入。Skill 内容只能通过 `skill_use`、`skill_create` 和 `skill_edit` 访问。
 
 核心工具：
 
 - `read(path, offset?, limit?, tail_lines?)`，文件读取、目录列表和日志尾读共用一个入口
 - `write(path, content, mode?)`，只允许写 `/workspace`
-- `exec(command, cwd?, timeout_seconds?)`，`cwd` 使用虚拟目录，默认 30 秒、最大 120 秒
+- `exec(argv, cwd?, timeout_seconds?)`，`cwd` 使用虚拟目录，默认 30 秒、最大 120 秒
 - `http_request(method, url, body?, credential_profile?)`
 - `agent_sleep()`，仅用于用户明确要求助手离开或休眠的终止型操作
 
-`exec` 默认工作目录是 `/workspace` 对应的物理目录，也可直接把 `cwd` 设为 `/source`、`/logs` 或 `/skills`。兼容环境变量 `SOURCE_ROOT`、`LOGS_ROOT`、`WORKSPACE_ROOT`、`SKILLS_ROOT` 仍然保留。命令有超时和输出上限，不支持交互式或长期驻留任务。
+`exec` 默认工作目录是 `/workspace` 对应的物理目录，也可把 `cwd` 设为 `/source` 或 `/logs`。命令参数禁止用 `..` 离开授权目录；命令有超时和输出上限，不支持交互式或长期驻留任务。
 
 凭据 profile 只把名称和可公开的基础地址注入上下文。指定 profile 后，`http_request` 可使用 `/api/...` 相对路径；认证 Header 在本地拼接，不会返回模型。
 

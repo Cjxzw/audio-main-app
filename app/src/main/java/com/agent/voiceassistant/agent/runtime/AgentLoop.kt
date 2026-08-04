@@ -3,6 +3,8 @@ package com.agent.voiceassistant.agent.runtime
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
+import com.agent.voiceassistant.cloud.NetworkTimeoutException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CoroutineStart
@@ -13,6 +15,8 @@ class AgentLoop(
     private val runtime: Runtime,
     private val eventSink: (AgentEvent) -> Unit = {},
 ) {
+    enum class CheckpointPhase { RUNNING, WAITING_NETWORK, WAITING_RECOVERY }
+
     data class Config(
         val messages: List<CloudSpeechClient.LlmMessage>,
         val initialThinkingMode: CloudSpeechClient.ThinkingMode,
@@ -21,8 +25,23 @@ class AgentLoop(
         val deepMaxCompletionTokens: Int,
         val allowReasoningEscalation: Boolean,
         val automaticReasoningToolThreshold: Int = DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD,
+        val activeToolBudgetMs: Long = DEFAULT_ACTIVE_TOOL_BUDGET_MS,
+        val monotonicNowMs: () -> Long = { System.nanoTime() / 1_000_000L },
+        val initialBusinessToolCallCount: Int = 0,
+        val initialActiveElapsedMs: Long = 0,
+        val initialActiveBudgetStarted: Boolean = false,
         val beforeSpeech: suspend () -> Unit = {},
         val onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
+        val onCheckpoint: (
+            turnId: String,
+            messages: List<CloudSpeechClient.LlmMessage>,
+            thinkingMode: CloudSpeechClient.ThinkingMode,
+            businessToolCallCount: Int,
+            activeElapsedMs: Long,
+            activeBudgetStarted: Boolean,
+            phase: CheckpointPhase,
+        ) -> Unit = { _, _, _, _, _, _, _ -> },
+        val onTurnCompleted: (String) -> Unit = {},
     )
 
     data class ModelTurn(
@@ -50,6 +69,9 @@ class AgentLoop(
 
     interface Runtime {
         fun toolDefinitions(allowReasoningEscalation: Boolean): List<CloudSpeechClient.ToolDefinition>
+        fun isToolAllowed(call: CloudSpeechClient.ToolCall, nativeToolNames: Set<String>): Boolean =
+            call.name in nativeToolNames
+        suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String = ""
 
         suspend fun modelTurn(
             request: CloudSpeechClient.ChatRequest,
@@ -72,6 +94,7 @@ class AgentLoop(
         fun reasoningEscalationResult(call: CloudSpeechClient.ToolCall): ToolExecution
         fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
             !isReasoningEscalation(call)
+        fun isDelegation(call: CloudSpeechClient.ToolCall): Boolean = false
         suspend fun onAutomaticReasoningEscalation(
             toolCallCount: Int,
             triggerCalls: List<CloudSpeechClient.ToolCall>,
@@ -92,6 +115,7 @@ class AgentLoop(
         require(config.automaticReasoningToolThreshold > 0) {
             "automaticReasoningToolThreshold must be positive"
         }
+        require(config.activeToolBudgetMs > 0) { "activeToolBudgetMs must be positive" }
         val workingMessages = config.messages.toMutableList()
         val completedToolCallIds = mutableSetOf<String>()
         var previousToolBatchSignature: String? = null
@@ -100,38 +124,105 @@ class AgentLoop(
         var consecutiveToolFailureRounds = 0
         var thinkingMode = config.initialThinkingMode
         var reasoningEscalated = thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED
-        var businessToolCallCount = 0
+        var businessToolCallCount = config.initialBusinessToolCallCount
+        var activeElapsedMs = config.initialActiveElapsedMs
+        var activeSinceMs: Long? = null
+        var activeBudgetStarted = config.initialActiveBudgetStarted
+        var activeBudgetBlocked = false
+        var automaticDelegationPromptInjected = false
+
+        fun pauseActiveBudget() {
+            val started = activeSinceMs ?: return
+            activeElapsedMs += (config.monotonicNowMs() - started).coerceAtLeast(0L)
+            activeSinceMs = null
+        }
+
+        fun resumeActiveBudget() {
+            if (activeSinceMs != null) return
+            activeSinceMs = config.monotonicNowMs()
+            if (!activeBudgetStarted) {
+                activeBudgetStarted = true
+                eventSink(AgentEvent.ActiveBudgetStarted(turnId))
+            }
+        }
+
+        fun currentActiveElapsedMs(): Long = activeElapsedMs +
+            (activeSinceMs?.let { (config.monotonicNowMs() - it).coerceAtLeast(0L) } ?: 0L)
+
+        fun checkpoint(phase: CheckpointPhase) {
+            config.onCheckpoint(
+                turnId,
+                workingMessages.toList(),
+                thinkingMode,
+                businessToolCallCount,
+                currentActiveElapsedMs(),
+                activeBudgetStarted,
+                phase,
+            )
+        }
 
         eventSink(AgentEvent.AgentStarted(turnId))
         eventSink(AgentEvent.TurnStarted(turnId, thinkingMode))
+        checkpoint(CheckpointPhase.RUNNING)
         try {
             suspend fun requestModel(
                 tools: List<CloudSpeechClient.ToolDefinition>,
                 maxCompletionTokens: Int? = null,
             ): Pair<ModelTurn, CloudSpeechClient.LlmMessage> {
-                modelCall += 1
-                eventSink(AgentEvent.MessageStarted(turnId, modelCall))
-                val request = CloudSpeechClient.ChatRequest(
-                    messages = workingMessages,
-                    tools = tools,
-                    thinkingMode = thinkingMode,
-                    maxCompletionTokens = maxCompletionTokens ?: if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
-                        config.deepMaxCompletionTokens
-                    } else {
-                        config.fastMaxCompletionTokens
-                    },
-                )
-                val streamed = runtime.modelTurn(request, config.beforeSpeech) { streamEvent ->
-                    when (streamEvent) {
-                        is CloudSpeechClient.ChatStreamEvent.ContentDelta ->
-                            eventSink(AgentEvent.ContentDelta(turnId, streamEvent.text))
-                        is CloudSpeechClient.ChatStreamEvent.ReasoningDelta ->
-                            eventSink(AgentEvent.ReasoningDelta(turnId, streamEvent.text))
-                        is CloudSpeechClient.ChatStreamEvent.ToolCallDelta ->
-                            eventSink(AgentEvent.ToolCallDetected(turnId, streamEvent.name.orEmpty()))
-                        is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
+                var streamedResult: ModelTurn? = null
+                while (streamedResult == null) {
+                    pauseActiveBudget()
+                    modelCall += 1
+                    eventSink(AgentEvent.MessageStarted(turnId, modelCall))
+                    val request = CloudSpeechClient.ChatRequest(
+                        messages = workingMessages.toList(),
+                        tools = tools,
+                        thinkingMode = thinkingMode,
+                        maxCompletionTokens = maxCompletionTokens ?: if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
+                            config.deepMaxCompletionTokens
+                        } else {
+                            config.fastMaxCompletionTokens
+                        },
+                    )
+                    try {
+                        streamedResult = runtime.modelTurn(request, config.beforeSpeech) { streamEvent ->
+                            when (streamEvent) {
+                                is CloudSpeechClient.ChatStreamEvent.ContentDelta -> {
+                                    resumeActiveBudget()
+                                    eventSink(AgentEvent.ContentDelta(turnId, streamEvent.text))
+                                }
+                                is CloudSpeechClient.ChatStreamEvent.ReasoningDelta -> {
+                                    resumeActiveBudget()
+                                    eventSink(AgentEvent.ReasoningDelta(turnId, streamEvent.text))
+                                }
+                                is CloudSpeechClient.ChatStreamEvent.ToolCallDelta -> {
+                                    resumeActiveBudget()
+                                    eventSink(AgentEvent.ToolCallDetected(turnId, streamEvent.name.orEmpty()))
+                                }
+                                is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
+                            }
+                        }
+                        if (activeSinceMs == null) resumeActiveBudget()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Throwable) {
+                        checkpoint(
+                            if (error is NetworkTimeoutException) {
+                                CheckpointPhase.WAITING_NETWORK
+                            } else {
+                                CheckpointPhase.WAITING_RECOVERY
+                            },
+                        )
+                        val retryInput = runtime.awaitRecovery(
+                            error.message ?: error.javaClass.simpleName,
+                            error is NetworkTimeoutException,
+                        )
+                        if (retryInput.isNotBlank()) {
+                            workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+                        }
                     }
                 }
+                val streamed = requireNotNull(streamedResult)
                 playedSpeech = playedSpeech || streamed.streamedSpeech
                 val assistant = runtime.normalizeAssistant(streamed.completion.message)
                 return streamed to assistant
@@ -161,7 +252,7 @@ class AgentLoop(
                             content = buildEmptyFinalRetryInstruction(),
                         )
                         val (retryStreamed, retryAssistant) = requestModel(
-                            tools = emptyList(),
+                            tools = runtime.toolDefinitions(config.allowReasoningEscalation),
                             maxCompletionTokens = retryMaxCompletionTokens,
                         )
                         return completeAssistant(
@@ -173,17 +264,14 @@ class AgentLoop(
                             retryMaxCompletionTokens = retryMaxCompletionTokens,
                         )
                     }
-                    val fallback = emptyFinalFallback()
-                    return completeAssistant(
-                        streamed = ModelTurn(
-                            completion = CloudSpeechClient.ChatCompletion(fallback, "empty_final_guard"),
-                            streamedSpeech = false,
-                        ),
-                        assistant = fallback,
-                        allowFormatRepair = false,
-                        emitFinishedOnSuccess = emitFinishedOnSuccess,
-                        emptyFinalRetriesRemaining = 0,
+                    val retryInput = runtime.awaitRecovery("模型连续返回空正文", networkTimeout = false)
+                    if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+                    workingMessages += CloudSpeechClient.LlmMessage("system", buildEmptyFinalRetryInstruction())
+                    val (retryStreamed, retryAssistant) = requestModel(
+                        runtime.toolDefinitions(config.allowReasoningEscalation),
+                        retryMaxCompletionTokens,
                     )
+                    return completeAssistant(retryStreamed, retryAssistant, allowFormatRepair, emitFinishedOnSuccess, 0, retryMaxCompletionTokens)
                 }
                 val invalidFinal = assistant.toolCalls.isNotEmpty() ||
                     StructuredOutputParser.containsToolProtocol(finalText)
@@ -194,7 +282,7 @@ class AgentLoop(
                             content = buildFinalFormatRepairInstruction(),
                         )
                         val (repairedStreamed, repairedAssistant) = requestModel(
-                            tools = emptyList(),
+                            tools = runtime.toolDefinitions(config.allowReasoningEscalation),
                         )
                         return completeAssistant(
                             streamed = repairedStreamed,
@@ -204,21 +292,31 @@ class AgentLoop(
                             retryMaxCompletionTokens = retryMaxCompletionTokens,
                         )
                     }
-                    val fallback = invalidFinalFallback()
-                    return completeAssistant(
-                        streamed = ModelTurn(
-                            completion = CloudSpeechClient.ChatCompletion(fallback, "format_guard"),
-                            streamedSpeech = false,
-                        ),
-                        assistant = fallback,
-                        allowFormatRepair = false,
-                    )
+                    val retryInput = runtime.awaitRecovery("模型连续返回非正文协议", networkTimeout = false)
+                    if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+                    workingMessages += CloudSpeechClient.LlmMessage("system", buildFinalFormatRepairInstruction())
+                    val (retryStreamed, retryAssistant) = requestModel(runtime.toolDefinitions(config.allowReasoningEscalation))
+                    return completeAssistant(retryStreamed, retryAssistant, allowFormatRepair = false)
                 }
                 if (emitFinishedOnSuccess) {
                     eventSink(AgentEvent.MessageFinished(turnId, assistant))
                 }
-                playedSpeech = runtime.finishAssistant(turnId, assistant, streamed.streamedSpeech) || playedSpeech
+                while (true) {
+                    try {
+                        playedSpeech = runtime.finishAssistant(turnId, assistant, streamed.streamedSpeech) || playedSpeech
+                        break
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Throwable) {
+                        val retryInput = runtime.awaitRecovery(
+                            error.message ?: error.javaClass.simpleName,
+                            error is NetworkTimeoutException,
+                        )
+                        if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+                    }
+                }
                 config.onContextFinalized(turnId, workingMessages + assistant)
+                config.onTurnCompleted(turnId)
                 eventSink(AgentEvent.TurnFinished(turnId, finalText))
                 eventSink(AgentEvent.AgentFinished(turnId))
                 return Outcome.Completed(finalText, playedSpeech)
@@ -236,7 +334,7 @@ class AgentLoop(
                 )
                 repeat(MAX_FINAL_PROTOCOL_ATTEMPTS) { attempt ->
                     val (streamed, assistant) = requestModel(
-                        tools = emptyList(),
+                        tools = runtime.toolDefinitions(config.allowReasoningEscalation),
                         maxCompletionTokens = FINAL_SUMMARY_MAX_COMPLETION_TOKENS,
                     )
                     val invalid = assistant.toolCalls.isNotEmpty() ||
@@ -259,20 +357,13 @@ class AgentLoop(
                     )
                 }
 
-                val fallback = invalidFinalFallback()
-                return completeAssistant(
-                    streamed = ModelTurn(
-                        completion = CloudSpeechClient.ChatCompletion(fallback, "protocol_guard"),
-                        streamedSpeech = false,
-                    ),
-                    assistant = fallback,
-                )
+                val retryInput = runtime.awaitRecovery("模型尚未给出可用总结正文", networkTimeout = false)
+                if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+                return forceFinalSummary("用户已要求继续，必须形成总结或委派任务")
             }
 
             repeat(config.maxToolRounds) { toolRound ->
-                val tools = runtime.toolDefinitions(
-                    config.allowReasoningEscalation && !reasoningEscalated && toolRound == 0,
-                )
+                val tools = runtime.toolDefinitions(config.allowReasoningEscalation)
                 val (streamed, assistant) = requestModel(tools)
 
                 val allowedToolNames = tools.mapTo(mutableSetOf()) { it.name }
@@ -310,14 +401,8 @@ class AgentLoop(
                 }
 
                 val escalationCalls = assistant.toolCalls.filter(runtime::isReasoningEscalation)
-                if (escalationCalls.size > 1) {
-                    error("一个用户回合只能申请一次深度思考")
-                }
-                val escalation = escalationCalls.singleOrNull()
-                if (escalation != null) {
-                    if (!config.allowReasoningEscalation || reasoningEscalated || toolRound != 0) {
-                        error("本回合深度思考升级请求无效")
-                    }
+                val escalation = escalationCalls.firstOrNull()
+                if (escalation != null && config.allowReasoningEscalation && !reasoningEscalated) {
                     reasoningEscalated = true
                     thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED
                     eventSink(AgentEvent.ThinkingModeChanged(turnId, thinkingMode))
@@ -339,10 +424,21 @@ class AgentLoop(
                         consecutiveToolFailureRounds += 1
                         return@repeat
                     }
-                    val terminal = runtime.executeTerminalPresentation(terminalCalls.single())
+                    val terminalCall = terminalCalls.single()
+                    eventSink(AgentEvent.ToolStarted(turnId, terminalCall, runtime.toolDisplayName(terminalCall.name)))
+                    val terminal = runtime.executeTerminalPresentation(terminalCall)
+                    eventSink(
+                        AgentEvent.ToolFinished(
+                            turnId = turnId,
+                            call = terminalCall,
+                            result = terminal.result.message,
+                            success = terminal.result.succeeded,
+                        ),
+                    )
                     if (terminal.result.succeeded && !terminal.finalText.isNullOrBlank()) {
                         playedSpeech = playedSpeech || terminal.playedSpeech
                         config.onContextFinalized(turnId, workingMessages + terminal.result.message)
+                        config.onTurnCompleted(turnId)
                         eventSink(AgentEvent.TurnFinished(turnId, terminal.finalText))
                         eventSink(AgentEvent.AgentFinished(turnId))
                         return Outcome.Completed(terminal.finalText, playedSpeech)
@@ -353,6 +449,7 @@ class AgentLoop(
                 }
 
                 workingMessages += assistant
+                checkpoint(CheckpointPhase.RUNNING)
                 val batchSignature = assistant.toolCalls.joinToString("|") { call ->
                     "${call.name}:${call.arguments.trim()}"
                 }
@@ -365,13 +462,17 @@ class AgentLoop(
                 )
 
                 val pendingTools = assistant.toolCalls.map { call ->
+                    val overActiveBudget = activeBudgetStarted &&
+                        currentActiveElapsedMs() >= config.activeToolBudgetMs &&
+                        !runtime.isDelegation(call)
                     val blockedReason = when {
-                        call.name !in allowedToolNames ->
+                        !runtime.isToolAllowed(call, allowedToolNames) ->
                             "工具未在本轮注册，调用未执行。请改用本轮提供的工具或直接回答。"
                         !completedToolCallIds.add(call.id) ->
                             "重复的 tool_call_id，调用未再次执行。请基于已有结果继续。"
                         repeatedBatch ->
                             "检测到连续重复工具调用，调用已停止。请改变参数或直接总结已有结果。"
+                        overActiveBudget -> ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE
                         else -> null
                     }
                     PendingTool(call, blockedReason)
@@ -406,12 +507,19 @@ class AgentLoop(
                 suspend fun execute(pending: PendingTool): ToolExecution {
                     val call = pending.call
                     eventSink(AgentEvent.ToolStarted(turnId, call, runtime.toolDisplayName(call.name)))
-                    val execution = when {
-                        pending.blockedReason != null ->
-                            ToolExecution(runtime.blockedTool(call, pending.blockedReason), succeeded = false)
-                        runtime.isReasoningEscalation(call) ->
-                            runtime.reasoningEscalationResult(call)
-                        else -> runtime.executeTool(call)
+                    val activeBeforeExecution = currentActiveElapsedMs()
+                    val execution = try {
+                        when {
+                            pending.blockedReason != null ->
+                                ToolExecution(runtime.blockedTool(call, pending.blockedReason), succeeded = false)
+                            runtime.isReasoningEscalation(call) ->
+                                runtime.reasoningEscalationResult(call)
+                            else -> runtime.executeTool(call)
+                        }
+                    } catch (error: NetworkTimeoutException) {
+                        pauseActiveBudget()
+                        activeElapsedMs = activeBeforeExecution
+                        throw error
                     }
                     eventSink(
                         AgentEvent.ToolFinished(
@@ -463,6 +571,35 @@ class AgentLoop(
                 for ((_, execution) in executions) {
                     workingMessages += execution.message
                 }
+                if (automaticallyEscalated && !automaticDelegationPromptInjected) {
+                    automaticDelegationPromptInjected = true
+                    workingMessages += CloudSpeechClient.LlmMessage(
+                        role = "system",
+                        content = AUTOMATIC_REASONING_DELEGATION_PROMPT,
+                    )
+                }
+                val budgetBlockedThisRound = pendingTools.any { pending ->
+                    pending.blockedReason == ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE
+                }
+                if (budgetBlockedThisRound) {
+                    if (!activeBudgetBlocked) {
+                        activeBudgetBlocked = true
+                        eventSink(
+                            AgentEvent.ActiveToolBudgetExceeded(
+                                turnId = turnId,
+                                activeElapsedMs = currentActiveElapsedMs(),
+                                blockedCalls = pendingTools
+                                    .filter { it.blockedReason == ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE }
+                                    .map { it.call },
+                            ),
+                        )
+                    }
+                    workingMessages += CloudSpeechClient.LlmMessage(
+                        role = "system",
+                        content = ACTIVE_TOOL_BUDGET_PROMPT,
+                    )
+                }
+                checkpoint(CheckpointPhase.RUNNING)
                 consecutiveToolFailureRounds = when {
                     executions.any { (_, execution) -> execution.succeeded } -> 0
                     executions.any { (_, execution) -> !execution.succeeded } ->
@@ -475,13 +612,36 @@ class AgentLoop(
             }
             return forceFinalSummary("已达到 ${config.maxToolRounds} 轮工具调用上限")
         } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            pauseActiveBudget()
+            checkpoint(
+                if (error is NetworkTimeoutException) {
+                    CheckpointPhase.WAITING_NETWORK
+                } else {
+                    CheckpointPhase.WAITING_RECOVERY
+                },
+            )
             eventSink(
                 AgentEvent.AgentFailed(
                     turnId = turnId,
                     error = error.message ?: error.javaClass.simpleName,
                 ),
             )
-            throw error
+            val retryInput = runtime.awaitRecovery(
+                error.message ?: error.javaClass.simpleName,
+                error is NetworkTimeoutException,
+            )
+            if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+            return run(
+                config.copy(
+                    messages = workingMessages.toList(),
+                    initialThinkingMode = thinkingMode,
+                    initialBusinessToolCallCount = businessToolCallCount,
+                    initialActiveElapsedMs = currentActiveElapsedMs(),
+                    initialActiveBudgetStarted = activeBudgetStarted,
+                ),
+                turnId,
+            )
         }
     }
 
@@ -491,6 +651,15 @@ class AgentLoop(
         private const val MAX_EMPTY_FINAL_RETRIES = 2
         private const val FINAL_SUMMARY_MAX_COMPLETION_TOKENS = 256
         private const val DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD = 3
+        private const val DEFAULT_ACTIVE_TOOL_BUDGET_MS = 30_000L
+        private const val ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE =
+            "当前回合的有效任务耗时已超过 30 秒，本地工具调用未执行。请立即总结已有结果，或调用 hub_dispatch_task 委派任务。"
+        private val AUTOMATIC_REASONING_DELEGATION_PROMPT = """
+            目前因连续工具调用，系统已将当前任务判定为复杂任务，并自动开启深度思考模式。在继续之前，必须重新评估执行路径：如果仅依据现有上下文和已经返回的工具结果，就能快速形成可靠答复，可以继续在本地完成；如果仍需新增检索、多轮工具调用、长时间处理、编码或其他专门能力，或者对本地完成质量没有充分把握，应优先调用 hub_dispatch_task，将任务委派给路由表中最适合的执行器。不要因为已经开始本地执行，就继续堆叠工具调用。
+        """.trimIndent()
+        private val ACTIVE_TOOL_BUDGET_PROMPT = """
+            当前回合的有效任务耗时已超过 30 秒，系统不再允许继续扩展本地工具调用。请依据已有结果立即形成简洁总结；如果任务仍未完成，应调用 hub_dispatch_task，将任务委派给路由表中最适合的执行器。除任务委派外，不得再发起新的工具调用。Hub 没有合适执行器时，请根据已有结果总结并说明限制。
+        """.trimIndent()
 
         private fun buildFinalFormatRepairInstruction() = buildString {
             append("上一条正文包含疑似伪工具调用协议，已被系统拦截。")
@@ -511,14 +680,5 @@ class AgentLoop(
             append("不要复述或继续刚才的非法工具调用。")
         }
 
-        private fun invalidFinalFallback() = CloudSpeechClient.LlmMessage(
-            role = "assistant",
-            content = "当前回复包含未受支持的工具调用格式，相关内容已被拦截。请稍后让我重试。",
-        )
-
-        private fun emptyFinalFallback() = CloudSpeechClient.LlmMessage(
-            role = "assistant",
-            content = "这次没有生成可用回复，请再试一次。",
-        )
     }
 }

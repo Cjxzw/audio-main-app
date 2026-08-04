@@ -37,6 +37,9 @@ class TurnMetricsTracker(
     private var lastToolFinishedElapsed: Long? = null
     private var parallelBatchCount = 0
     private var currentParallelCallIds = emptySet<String>()
+    private var automaticReasoningEscalated = false
+    private var activeBudgetBlocked = false
+    private var activeTaskDurationMs = 0L
     private val startedTools = mutableMapOf<String, StartedTool>()
     private val toolMetrics = mutableListOf<ToolCallMetric>()
     private val toolIntervals = mutableListOf<Interval>()
@@ -75,6 +78,11 @@ class TurnMetricsTracker(
                         startedTools[call.id] = started.copy(parallel = true)
                     }
                 }
+            }
+            is AgentEvent.AutomaticThinkingEscalated -> automaticReasoningEscalated = true
+            is AgentEvent.ActiveToolBudgetExceeded -> {
+                activeBudgetBlocked = true
+                activeTaskDurationMs = maxOf(activeTaskDurationMs, event.activeElapsedMs)
             }
             is AgentEvent.ToolStarted -> if (event.call.name != MainToolRegistry.TOOL_REQUEST_DEEP_REASONING) {
                 startedTools[event.call.id] = StartedTool(
@@ -148,6 +156,9 @@ class TurnMetricsTracker(
             failedToolCallCount = toolMetrics.count { !it.success && !it.blocked },
             blockedToolCallCount = toolMetrics.count(ToolCallMetric::blocked),
             usedHubDispatch = toolMetrics.any { it.name == MainToolRegistry.TOOL_HUB_DISPATCH_TASK },
+            automaticReasoningEscalated = automaticReasoningEscalated,
+            activeBudgetBlocked = activeBudgetBlocked,
+            activeTaskDurationMs = activeTaskDurationMs,
             tools = toolMetrics.toList(),
         )
     }

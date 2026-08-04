@@ -125,6 +125,7 @@ class HubClient(context: Context) {
         payload: JsonObject,
         turnId: String,
         conversationId: String,
+        idempotencyKey: String? = null,
     ): HubActionResult {
         check(_state.value == HubConnectionState.CONNECTED) { "枢卫 Hub 未连接" }
         val settings = currentSettings ?: configRepository.load()
@@ -141,7 +142,7 @@ class HubClient(context: Context) {
                 put("conversationId", conversationId)
                 put("actionType", actionType)
                 put("factsVersion", factsVersion)
-                put("idempotencyKey", requestId)
+                put("idempotencyKey", idempotencyKey ?: requestId)
                 put("payload", payload)
             })
         }

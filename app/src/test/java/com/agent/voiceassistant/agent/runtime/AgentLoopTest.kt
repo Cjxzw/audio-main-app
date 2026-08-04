@@ -52,19 +52,21 @@ class AgentLoopTest {
     }
 
     @Test
-    fun `exhausted blank final retries still complete with a safe fallback`() = runBlocking {
+    fun `exhausted blank final retries wait and require model正文`() = runBlocking {
         val runtime = FakeRuntime(
-            responses = ArrayDeque(listOf(message(), message(), message())),
+            responses = ArrayDeque(listOf(message(), message(), message(), message(content = "继续后完成"))),
+            recoveryInputs = ArrayDeque(listOf("请继续")),
         )
         val events = mutableListOf<AgentEvent>()
 
         val outcome = AgentLoop(runtime, events::add).run(config())
 
         assertEquals(
-            AgentLoop.Outcome.Completed("这次没有生成可用回复，请再试一次。", true),
+            AgentLoop.Outcome.Completed("继续后完成", true),
             outcome,
         )
-        assertEquals(3, runtime.requests.size)
+        assertEquals(4, runtime.requests.size)
+        assertEquals(1, runtime.recoveryWaits)
         assertTrue(events.none { it is AgentEvent.AgentFailed })
     }
 
@@ -307,6 +309,45 @@ class AgentLoopTest {
         assertTrue(runtime.modelEscalations.isEmpty())
         assertEquals(3, runtime.automaticEscalations.single().first)
         assertTrue(events.any { it is AgentEvent.AutomaticThinkingEscalated && it.toolCallCount == 3 })
+        assertTrue(
+            runtime.requests.last().messages.any {
+                it.role == "system" && it.content.orEmpty().contains("系统已将当前任务判定为复杂任务")
+            },
+        )
+    }
+
+    @Test
+    fun `active budget blocks new local tools but still allows delegation`() = runBlocking {
+        var now = 0L
+        val first = CloudSpeechClient.ToolCall("read-1", "read", "{}")
+        val blocked = CloudSpeechClient.ToolCall("search-1", "web_search", "{\"query\":\"继续调研\"}")
+        val delegated = CloudSpeechClient.ToolCall("hub-1", "hub_dispatch_task", "{}")
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(toolCalls = listOf(first)),
+                    message(toolCalls = listOf(blocked)),
+                    message(toolCalls = listOf(delegated)),
+                    message(content = "已经委派"),
+                ),
+            ),
+            onToolExecuted = { if (it.id == first.id) now = 31_000L },
+        )
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(
+            config(maxToolRounds = 4, monotonicNowMs = { now }),
+        )
+
+        assertEquals(AgentLoop.Outcome.Completed("已经委派", true), outcome)
+        assertEquals(listOf("read-1", "hub-1"), runtime.executedCalls)
+        assertEquals(listOf("search-1"), runtime.blockedCalls)
+        assertTrue(events.any { it is AgentEvent.ActiveToolBudgetExceeded })
+        assertTrue(
+            runtime.requests[2].messages.any {
+                it.role == "system" && it.content.orEmpty().contains("不再允许继续扩展本地工具调用")
+            },
+        )
     }
 
     @Test
@@ -379,7 +420,7 @@ class AgentLoopTest {
 
         assertEquals(AgentLoop.Outcome.Completed("已经读取日志，这是当前结论", true), outcome)
         assertEquals(2, runtime.requests.size)
-        assertTrue(runtime.requests.last().tools.isEmpty())
+        assertTrue(runtime.requests.last().tools.isNotEmpty())
         assertTrue(runtime.requests.last().messages.last().content.orEmpty().contains("工具阶段已经结束"))
     }
 
@@ -404,7 +445,7 @@ class AgentLoopTest {
 
         assertEquals(AgentLoop.Outcome.Completed("连续三次读取失败，我先停止重试", true), outcome)
         assertEquals(4, runtime.requests.size)
-        assertTrue(runtime.requests.last().tools.isEmpty())
+        assertTrue(runtime.requests.last().tools.isNotEmpty())
         assertEquals(256, runtime.requests.last().maxCompletionTokens)
     }
 
@@ -437,7 +478,7 @@ class AgentLoopTest {
             outcome,
         )
         assertEquals(5, runtime.requests.size)
-        assertTrue(runtime.requests.takeLast(2).all { it.tools.isEmpty() })
+        assertTrue(runtime.requests.takeLast(2).all { it.tools.isNotEmpty() })
         assertTrue(
             events.filterIsInstance<AgentEvent.MessageFinished>()
                 .none { it.message.content == invalidXml },
@@ -491,7 +532,8 @@ class AgentLoopTest {
 
         assertEquals(AgentLoop.Outcome.Completed("唱给你听", true), outcome)
         assertEquals(listOf("voice-1"), runtime.terminalCalls)
-        assertTrue(events.none { it is AgentEvent.ToolStarted })
+        assertTrue(events.any { it is AgentEvent.ToolStarted && it.call.id == "voice-1" })
+        assertTrue(events.any { it is AgentEvent.ToolFinished && it.call.id == "voice-1" })
         assertEquals(1, runtime.requests.size)
     }
 
@@ -519,6 +561,7 @@ class AgentLoopTest {
     private fun config(
         maxToolRounds: Int = 2,
         onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
+        monotonicNowMs: () -> Long = { System.nanoTime() / 1_000_000L },
     ) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
         initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
@@ -527,6 +570,7 @@ class AgentLoopTest {
         deepMaxCompletionTokens = 4_096,
         allowReasoningEscalation = true,
         onContextFinalized = onContextFinalized,
+        monotonicNowMs = monotonicNowMs,
     )
 
     private fun message(
@@ -544,6 +588,8 @@ class AgentLoopTest {
         private val parallelToolNames: Set<String> = emptySet(),
         private val toolDelayMs: Long = 0,
         private val terminalToolNames: Set<String> = emptySet(),
+        private val recoveryInputs: ArrayDeque<String> = ArrayDeque(),
+        private val onToolExecuted: (CloudSpeechClient.ToolCall) -> Unit = {},
     ) : AgentLoop.Runtime {
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
@@ -551,6 +597,7 @@ class AgentLoopTest {
         val automaticEscalations = mutableListOf<Pair<Int, List<String>>>()
         val modelEscalations = mutableListOf<String>()
         val terminalCalls = mutableListOf<String>()
+        var recoveryWaits = 0
         private val activeTools = AtomicInteger(0)
         val maxActiveTools = AtomicInteger(0)
 
@@ -559,12 +606,18 @@ class AgentLoopTest {
                 add("read")
                 add("web_search")
                 add("code_graph_search")
+                add("hub_dispatch_task")
                 addAll(terminalToolNames)
                 if (allowReasoningEscalation) add("request_deep_reasoning")
             }
             return names.map { name ->
                 CloudSpeechClient.ToolDefinition(name, name, buildJsonObject {})
             }
+        }
+
+        override suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String {
+            recoveryWaits++
+            return recoveryInputs.removeFirst()
         }
 
         override suspend fun modelTurn(
@@ -613,6 +666,8 @@ class AgentLoopTest {
         override fun isReasoningEscalation(call: CloudSpeechClient.ToolCall) =
             call.name == "request_deep_reasoning"
 
+        override fun isDelegation(call: CloudSpeechClient.ToolCall) = call.name == "hub_dispatch_task"
+
         override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
             Json.parseToJsonElement(call.arguments).jsonObject.getValue("reason").jsonPrimitive.content
 
@@ -644,6 +699,7 @@ class AgentLoopTest {
 
         override suspend fun executeTool(call: CloudSpeechClient.ToolCall): AgentLoop.ToolExecution {
             executedCalls += call.id
+            onToolExecuted(call)
             val active = activeTools.incrementAndGet()
             maxActiveTools.updateAndGet { current -> maxOf(current, active) }
             if (toolDelayMs > 0) delay(toolDelayMs)

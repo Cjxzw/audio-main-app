@@ -157,9 +157,7 @@ class MainActivity : AppCompatActivity() {
         )
         val pageAdapter = MainPageAdapter(mainPages)
         binding.pagePager.adapter = pageAdapter
-        // Use ViewPager2's paging slop so short horizontal drags in the chat do not switch pages.
-        (binding.pagePager.getChildAt(0) as? RecyclerView)
-            ?.setScrollingTouchSlop(RecyclerView.TOUCH_SLOP_PAGING)
+        binding.pagePager.isUserInputEnabled = false
         pageTabsMediator = TabLayoutMediator(binding.pageTabs, binding.pagePager) { tab, position ->
             tab.setText(pageAdapter.pages[position].titleRes)
         }.also(TabLayoutMediator::attach)

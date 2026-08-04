@@ -38,7 +38,7 @@ class ContextAssetsActivity : AppCompatActivity() {
         store = ConversationStore(this)
         ruleStore = RuleStore(this)
         val env = AndroidExecutionEnv(this)
-        skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest)
+        skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest, env.systemSkillsRoot, env.disabledSystemSkillsManifest)
         adapter = ContextAssetAdapter(::toggle, ::edit, ::confirmDelete)
         binding.contextAssetsList.layoutManager = LinearLayoutManager(this)
         binding.contextAssetsList.adapter = adapter
@@ -72,7 +72,7 @@ class ContextAssetsActivity : AppCompatActivity() {
     private fun reload() {
         val items = when (tab) {
             Tab.SKILLS -> skills.listAll().map { skill ->
-                ContextAssetItem(skill.id, skill.name, skill.enabled, ContextAssetItem.Kind.SKILL)
+                ContextAssetItem(skill.id, skill.name, skill.enabled, ContextAssetItem.Kind.SKILL, skill.system)
             }
             Tab.MEMORIES -> store.memories().map { memory ->
                 ContextAssetItem(
@@ -110,6 +110,7 @@ class ContextAssetsActivity : AppCompatActivity() {
     }
 
     private fun edit(item: ContextAssetItem) {
+        if (item.system) return
         when (item.kind) {
             ContextAssetItem.Kind.SKILL -> startActivity(SkillEditorActivity.intent(this, item.id))
             ContextAssetItem.Kind.MEMORY -> startActivity(TextEditorActivity.memoryIntent(this, item.id))
@@ -118,6 +119,7 @@ class ContextAssetsActivity : AppCompatActivity() {
     }
 
     private fun confirmDelete(item: ContextAssetItem) {
+        if (item.system) return
         MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
             .setTitle(R.string.context_asset_delete_confirm_title)
             .setMessage(getString(R.string.context_asset_delete_confirm_message, item.title))
@@ -142,6 +144,7 @@ private data class ContextAssetItem(
     val title: String,
     val enabled: Boolean,
     val kind: Kind,
+    val system: Boolean = false,
 ) {
     enum class Kind { SKILL, MEMORY, RULE }
 }
@@ -177,6 +180,8 @@ private class ContextAssetAdapter(
             toggle.visibility = View.VISIBLE
             toggle.isChecked = item.enabled
             title.text = item.title
+            edit.visibility = if (item.system) View.GONE else View.VISIBLE
+            delete.visibility = if (item.system) View.GONE else View.VISIBLE
             toggle.setOnCheckedChangeListener { _, checked -> onToggle(item, checked) }
             edit.setOnClickListener { onEdit(item) }
             delete.setOnClickListener { onDelete(item) }
