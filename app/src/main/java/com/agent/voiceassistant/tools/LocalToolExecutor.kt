@@ -582,23 +582,37 @@ class LocalToolExecutor(
         val registry = skillRegistry ?: return unavailable("skill.use")
         val name = payload.string("skill_name") ?: return invalidArguments("skill.use", "缺少 skill_name")
         val resource = payload.string("resource_name")
+        if (resource.equals("SKILL.md", ignoreCase = true)) {
+            return ToolResult(
+                actionType = "skill.use",
+                displayText = "Skill 核心说明已加载",
+                contextText = "SKILL.md 已在首次加载时完整提供，无需再次加载。请直接遵循已加载内容继续当前任务。",
+                shouldAskLlm = true,
+            )
+        }
         return runCatching { registry.use(name, resource) }.fold(
             onSuccess = { loaded ->
+                val attachments = loaded.resources.filter { it.relativePath != "SKILL.md" }
                 ToolResult(
                     actionType = "skill.use",
                     displayText = "使用 Skill：${loaded.skill.name}",
                     contextText = buildString {
                         appendLine("Skill：${loaded.skill.name}")
                         appendLine("skill_id=${loaded.skill.id} version=${loaded.skill.version} residency=${loaded.skill.residency}")
-                        appendLine("已加载：${loaded.resourceName}")
+                        if (resource == null && attachments.isEmpty()) {
+                            appendLine("状态：该 Skill 为单文件 Skill，已全部加载。")
+                        } else {
+                            appendLine("已加载：${loaded.resourceName}")
+                        }
                         appendLine("<skill_content>")
                         appendLine(loaded.content)
                         appendLine("</skill_content>")
-                        if (resource == null) {
-                            appendLine("附属文件列表（内容未加载）：")
-                            loaded.resources.filter { it.relativePath != "SKILL.md" }.forEach { file ->
+                        if (resource == null && attachments.isNotEmpty()) {
+                            appendLine("该 Skill 还有以下附属文档，内容尚未加载：")
+                            attachments.forEach { file ->
                                 appendLine("- ${file.relativePath} (${file.size} bytes, text=${file.editable}, sha256=${file.sha256})")
                             }
+                            appendLine("仅当当前任务确实需要某份附属文档时，才再次调用 skill_use，并同时传入 skill_name 与 resource_name；resource_name 必须完整匹配上方列出的相对路径。不得把任务参数、JSON、/source、/logs 或 /workspace 路径放入 resource_name。")
                         }
                     }.trim(),
                     shouldAskLlm = true,

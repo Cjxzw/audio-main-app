@@ -40,6 +40,8 @@ class MainAgentHarness {
 
     val state: StateFlow<State> = _state.asStateFlow()
 
+    fun isWaiting(): Boolean = _state.value in setOf(State.WAITING_NETWORK, State.WAITING_RETRY, State.WAITING_RECOVERY)
+
     suspend fun awaitRetry(networkTimeout: Boolean): QueuedInput {
         _state.value = if (networkTimeout) State.WAITING_NETWORK else State.WAITING_RECOVERY
         return retryInputs.receive().also { _state.value = State.RUNNING }

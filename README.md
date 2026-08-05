@@ -4,6 +4,14 @@
 
 当前版本已跑通语音闭环、持久会话、本地工具、原生函数调用和本地异步任务汇报。Hub 远程工具和任务事实同步仍在继续完善。
 
+## 共享 Debug 签名
+
+Debug 构建固定使用 `app/keystore/hanwo-debug.keystore`，用于不同开发机器之间直接覆盖安装同一包名的 Debug APK。该 keystore 仅用于开发，口令采用 Android Debug Keystore 的公开默认值，不得用于 Release 或生产分发。
+
+证书 SHA-256：`e0de11b47635db203eed37363d89a7d77422fb425d3a6b16bb813d0fd712e180`
+
+任何能读取仓库的人都可以签署同证书的 Debug APK，因此 Debug 包及其调试接口不能视为可信生产边界。
+
 ## 许可证
 
 本项目依据 [PolyForm Noncommercial License 1.0.0](LICENSE) 提供，仅允许非商业用途。商业使用需要获得作者另行书面授权；第三方组件继续适用其各自的许可证。

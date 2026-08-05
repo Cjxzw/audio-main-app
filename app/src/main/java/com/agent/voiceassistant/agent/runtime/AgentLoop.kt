@@ -161,6 +161,17 @@ class AgentLoop(
             )
         }
 
+        suspend fun finishLocalFailure(text: String): Outcome.Completed {
+            val assistant = CloudSpeechClient.LlmMessage(role = "assistant", content = text)
+            eventSink(AgentEvent.MessageFinished(turnId, assistant))
+            runCatching { playedSpeech = runtime.finishAssistant(turnId, assistant, streamedSpeech = false) || playedSpeech }
+            config.onContextFinalized(turnId, workingMessages + assistant)
+            config.onTurnCompleted(turnId)
+            eventSink(AgentEvent.TurnFinished(turnId, text))
+            eventSink(AgentEvent.AgentFinished(turnId))
+            return Outcome.Completed(text, playedSpeech)
+        }
+
         eventSink(AgentEvent.AgentStarted(turnId))
         eventSink(AgentEvent.TurnStarted(turnId, thinkingMode))
         checkpoint(CheckpointPhase.RUNNING)
@@ -264,14 +275,7 @@ class AgentLoop(
                             retryMaxCompletionTokens = retryMaxCompletionTokens,
                         )
                     }
-                    val retryInput = runtime.awaitRecovery("模型连续返回空正文", networkTimeout = false)
-                    if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
-                    workingMessages += CloudSpeechClient.LlmMessage("system", buildEmptyFinalRetryInstruction())
-                    val (retryStreamed, retryAssistant) = requestModel(
-                        runtime.toolDefinitions(config.allowReasoningEscalation),
-                        retryMaxCompletionTokens,
-                    )
-                    return completeAssistant(retryStreamed, retryAssistant, allowFormatRepair, emitFinishedOnSuccess, 0, retryMaxCompletionTokens)
+                    return finishLocalFailure("这次没有生成可用回复，请再试一次。")
                 }
                 val invalidFinal = assistant.toolCalls.isNotEmpty() ||
                     StructuredOutputParser.containsToolProtocol(finalText)
@@ -357,9 +361,7 @@ class AgentLoop(
                     )
                 }
 
-                val retryInput = runtime.awaitRecovery("模型尚未给出可用总结正文", networkTimeout = false)
-                if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
-                return forceFinalSummary("用户已要求继续，必须形成总结或委派任务")
+                return finishLocalFailure("本回合未完成：模型未能生成可用总结。请重新发送请求。")
             }
 
             repeat(config.maxToolRounds) { toolRound ->
@@ -627,21 +629,7 @@ class AgentLoop(
                     error = error.message ?: error.javaClass.simpleName,
                 ),
             )
-            val retryInput = runtime.awaitRecovery(
-                error.message ?: error.javaClass.simpleName,
-                error is NetworkTimeoutException,
-            )
-            if (retryInput.isNotBlank()) workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
-            return run(
-                config.copy(
-                    messages = workingMessages.toList(),
-                    initialThinkingMode = thinkingMode,
-                    initialBusinessToolCallCount = businessToolCallCount,
-                    initialActiveElapsedMs = currentActiveElapsedMs(),
-                    initialActiveBudgetStarted = activeBudgetStarted,
-                ),
-                turnId,
-            )
+            return finishLocalFailure("本回合未完成：${error.message ?: error.javaClass.simpleName}。请重新发送请求。")
         }
     }
 

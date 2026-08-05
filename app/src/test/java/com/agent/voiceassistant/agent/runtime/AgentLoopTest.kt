@@ -52,21 +52,20 @@ class AgentLoopTest {
     }
 
     @Test
-    fun `exhausted blank final retries wait and require model正文`() = runBlocking {
+    fun `exhausted blank final retries finish with local failure`() = runBlocking {
         val runtime = FakeRuntime(
-            responses = ArrayDeque(listOf(message(), message(), message(), message(content = "继续后完成"))),
-            recoveryInputs = ArrayDeque(listOf("请继续")),
+            responses = ArrayDeque(listOf(message(), message(), message())),
         )
         val events = mutableListOf<AgentEvent>()
 
         val outcome = AgentLoop(runtime, events::add).run(config())
 
         assertEquals(
-            AgentLoop.Outcome.Completed("继续后完成", true),
+            AgentLoop.Outcome.Completed("这次没有生成可用回复，请再试一次。", true),
             outcome,
         )
-        assertEquals(4, runtime.requests.size)
-        assertEquals(1, runtime.recoveryWaits)
+        assertEquals(3, runtime.requests.size)
+        assertEquals(0, runtime.recoveryWaits)
         assertTrue(events.none { it is AgentEvent.AgentFailed })
     }
 

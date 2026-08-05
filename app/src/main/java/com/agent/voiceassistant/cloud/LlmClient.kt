@@ -179,7 +179,7 @@ class OpenAiCompatibleLlmClient(
         val firstEventTimedOut = AtomicBoolean(false)
         val cancellation = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
         val watchdog = launch(Dispatchers.IO) {
-            delay(FIRST_EVENT_TIMEOUT_MS)
+            delay(firstEventTimeoutMs(request))
             if (!receivedEvent.get()) {
                 firstEventTimedOut.set(true)
                 call.cancel()
@@ -303,5 +303,16 @@ class OpenAiCompatibleLlmClient(
         const val FIRST_EVENT_TIMEOUT_MS = 15_000L
         const val STREAM_HARD_TIMEOUT_SECONDS = 120L
         const val MAX_NETWORK_ATTEMPTS = 2
+
+        fun firstEventTimeoutMs(request: CloudSpeechClient.ChatRequest): Long {
+            val promptChars = request.messages.sumOf { message ->
+                message.content.orEmpty().length + message.reasoningContent.orEmpty().length
+            }
+            return when {
+                promptChars >= 50_000 -> 45_000L
+                promptChars >= 20_000 -> 30_000L
+                else -> FIRST_EVENT_TIMEOUT_MS
+            }
+        }
     }
 }

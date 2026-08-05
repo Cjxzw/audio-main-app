@@ -19,7 +19,9 @@ class LLMConfigTest {
         assertTrue(prompt.contains("<DETAILS>...</DETAILS>"))
         assertTrue(prompt.contains("<device_context>"))
         assertTrue(prompt.contains("<multimodal_transcript>"))
-        assertTrue(prompt.contains("skill_use"))
+        assertTrue(prompt.contains("hub_dispatch_task"))
+        assertTrue(prompt.contains("subagent"))
+        assertTrue(prompt.contains("Skill 索引"))
         assertTrue(prompt.contains("Skill 目录不属于通用文件系统"))
         assertFalse(prompt.contains("本回合引导词"))
     }

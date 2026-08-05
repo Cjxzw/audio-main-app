@@ -9,6 +9,7 @@ import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
+import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
 import com.agent.voiceassistant.ui.ChatRole.BOT
 import com.agent.voiceassistant.ui.ChatRole.SYSTEM
@@ -17,7 +18,9 @@ import io.noties.markwon.Markwon
 import io.noties.markwon.ext.tables.TablePlugin
 import kotlin.math.roundToInt
 
-class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
+class ChatAdapter(
+    private val onWorkspaceFileOpen: (String) -> Unit = {},
+) : RecyclerView.Adapter<ChatAdapter.VH>() {
 
     private val messages = mutableListOf<ChatMessage>()
     private val maxMessages = 500
@@ -73,11 +76,16 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             .usePlugin(TablePlugin.create(parent.context.applicationContext))
             .build()
             .also { markwon = it }
-        return VH(v, markdownRenderer) { position, expanded ->
-            val message = messages.getOrNull(position) ?: return@VH
-            detailOverrides[detailKey(message, position)] = expanded
-            notifyItemChanged(position, PAYLOAD_TEXT)
-        }
+        return VH(
+            v,
+            markdownRenderer,
+            onDetailsToggle = { position, expanded ->
+                val message = messages.getOrNull(position) ?: return@VH
+                detailOverrides[detailKey(message, position)] = expanded
+                notifyItemChanged(position, PAYLOAD_TEXT)
+            },
+            onWorkspaceFileOpen = onWorkspaceFileOpen,
+        )
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) =
@@ -97,6 +105,7 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         view: View,
         private val markwon: Markwon,
         private val onDetailsToggle: (Int, Boolean) -> Unit,
+        private val onWorkspaceFileOpen: (String) -> Unit,
     ) : RecyclerView.ViewHolder(view) {
         private val llBubble = view.findViewById<LinearLayout>(R.id.llBubble)
         private val tvRole = view.findViewById<TextView>(R.id.tvRole)
@@ -188,11 +197,19 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                 val extraction = ReplyDetailPolicy.extract(msg.text)
                 tvText.visibility = if (extraction.speakableText.isBlank()) View.GONE else View.VISIBLE
                 if (extraction.speakableText.isNotBlank()) {
-                    markwon.setMarkdown(tvText, extraction.speakableText)
+                    if (msg.streamState == ChatStreamState.STREAMING) {
+                        tvText.text = extraction.speakableText
+                    } else {
+                        markwon.setMarkdown(tvText, extraction.speakableText)
+                    }
                 } else {
                     tvText.text = ""
                 }
-                bindDetails(extraction, requestedDetailsExpanded)
+                if (msg.streamState == ChatStreamState.STREAMING) {
+                    llDetails.visibility = View.GONE
+                } else {
+                    bindDetails(extraction, requestedDetailsExpanded)
+                }
             } else {
                 tvText.visibility = View.VISIBLE
                 tvText.text = msg.text
@@ -210,7 +227,17 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             }
             llDetails.visibility = View.VISIBLE
             tvDetails.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
-            markwon.setMarkdown(tvDetails, extraction.detailsText)
+            val dumpedPath = LongDetailsPolicy.dumpedPath(extraction.detailsText)
+            if (dumpedPath == null) {
+                tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, 0, 0)
+                tvDetails.setOnClickListener(null)
+                markwon.setMarkdown(tvDetails, extraction.detailsText)
+            } else {
+                tvDetails.text = extraction.detailsText.replace("`", "")
+                tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_file_24, 0, 0, 0)
+                tvDetails.compoundDrawablePadding = (8 * itemView.resources.displayMetrics.density).roundToInt()
+                tvDetails.setOnClickListener { onWorkspaceFileOpen(dumpedPath.removePrefix("/workspace/")) }
+            }
             detailsExpanded = requestedExpanded
             llDetailsHeader.setOnClickListener {
                 detailsExpanded = !detailsExpanded

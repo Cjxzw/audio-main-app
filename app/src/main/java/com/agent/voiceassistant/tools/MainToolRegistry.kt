@@ -230,7 +230,7 @@ class MainToolRegistry(
 
     private fun hubDispatchTask() = tool(
         name = TOOL_HUB_DISPATCH_TASK,
-        description = "这是 Main 的核心能力，请积极使用。对于调研、编码、长耗时、多步骤或需要专门能力的任务，应优先通过枢卫 Hub 委派。根据 Hub 路由表中的能力、类型和说明，将任务交给最适合的在线执行器；必须使用真实 target_agent_id，不得选择 Main 自身或编造 Agent。",
+        description = "创建一个 subagent 任务并通过枢卫 Hub 交给外部执行代理。这是 Main 的核心能力：调研、编码、长耗时、多步骤或需要专门能力的任务应优先委派给 subagent。根据 Hub 路由表中的能力、类型和说明选择最合适的在线执行器；必须使用真实 target_agent_id，不得选择 Main 自身或编造 Agent。",
         required = listOf("target_agent_id", "title", "summary", "instructions", "expected_output"),
     ) {
         putJsonObject("target_agent_id") { put("type", "string") }
@@ -420,14 +420,10 @@ class MainToolRegistry(
 
     private fun skillUse() = tool(
         name = TOOL_SKILL_USE,
-        description = "加载并使用一个已启用 Skill。首次只传 skill_name，会加载完整 SKILL.md 和附件列表；需要文本附件时再次调用并传入完整 resource_name。支持中文 Skill 名称。",
+        description = "按名称加载一个已启用 Skill 的核心说明，并遵循加载结果完成当前任务。支持中文 Skill 名称。",
         required = listOf("skill_name"),
     ) {
         putJsonObject("skill_name") { put("type", "string") }
-        putJsonObject("resource_name") {
-            put("type", "string")
-            put("description", "仅用于第二次及后续调用：填写首次结果所列的 Skill 内部 UTF-8 文本附件完整相对路径。不得填写 /source、/logs、/workspace 或用户任务文件")
-        }
     }
 
     private fun skillRegister() = tool(
