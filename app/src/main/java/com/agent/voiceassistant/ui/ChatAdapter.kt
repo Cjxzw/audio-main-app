@@ -227,7 +227,7 @@ class ChatAdapter(
             llReasoning.visibility = View.VISIBLE
             tvReasoning.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             tvReasoning.maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.40f).roundToInt()
-            tvReasoning.movementMethod = ScrollingMovementMethod.getInstance()
+            configureScrollableTextView(tvReasoning)
             if (msg.streamState == ChatStreamState.STREAMING) {
                 tvReasoning.text = reasoning
             } else {
@@ -287,7 +287,7 @@ class ChatAdapter(
             llDetails.visibility = View.VISIBLE
             tvDetails.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             tvDetails.maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.40f).roundToInt()
-            tvDetails.movementMethod = ScrollingMovementMethod.getInstance()
+            configureScrollableTextView(tvDetails)
             val dumpedPath = LongDetailsPolicy.dumpedPath(extraction.detailsText)
             if (dumpedPath == null) {
                 tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, 0, 0)
@@ -315,6 +315,25 @@ class ChatAdapter(
             ivDetailsToggle.contentDescription = itemView.context.getString(
                 if (expanded) R.string.chat_details_collapse else R.string.chat_details_expand,
             )
+        }
+
+        private fun configureScrollableTextView(textView: TextView) {
+            textView.movementMethod = ScrollingMovementMethod.getInstance()
+            textView.isFocusable = true
+            textView.isClickable = true
+            textView.isVerticalScrollBarEnabled = true
+            textView.setOnTouchListener { view, event ->
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN,
+                    android.view.MotionEvent.ACTION_MOVE,
+                    -> view.parent?.requestDisallowInterceptTouchEvent(true)
+
+                    android.view.MotionEvent.ACTION_UP,
+                    android.view.MotionEvent.ACTION_CANCEL,
+                    -> view.parent?.requestDisallowInterceptTouchEvent(false)
+                }
+                false
+            }
         }
 
         private fun stabilizeReplyFocus(change: () -> Unit) {
