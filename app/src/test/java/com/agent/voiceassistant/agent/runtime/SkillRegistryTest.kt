@@ -152,4 +152,60 @@ class SkillRegistryTest {
         assertTrue(registry.coreBody(skill.id).contains("适用场景"))
         assertTrue(modified.readText().contains(skill.id))
     }
+
+    @Test
+    fun `system skill is turn resident immutable and can only be disabled`() {
+        val runtime = Files.createTempDirectory("system-skill").toFile()
+        val systemRoot = runtime.resolve("system-skills").apply { mkdirs() }
+        systemRoot.resolve("local-execution").apply { mkdirs() }.resolve("SKILL.md").writeText(
+            "---\nname: 本地执行\ndescription: local tools\n---\nHidden protocol",
+        )
+        val disabled = runtime.resolve("system-disabled")
+        val registry = SkillRegistry(
+            runtime.resolve("skills"), runtime.resolve("disabled"), runtime.resolve("deleted"),
+            runtime.resolve("modified"), systemRoot, disabled,
+        )
+
+        val skill = registry.list().single()
+        assertTrue(skill.system)
+        assertEquals(SkillRegistry.Residency.TURN, skill.residency)
+        assertThrows(IllegalArgumentException::class.java) { registry.delete(skill.id) }
+        assertThrows(IllegalArgumentException::class.java) {
+            registry.updateMetadata(skill.id, "改名", "description")
+        }
+        registry.setEnabled(skill.id, false)
+        assertTrue(registry.list().isEmpty())
+        assertTrue(disabled.readText().contains(skill.id))
+    }
+
+    @Test
+    fun `names are globally unique after unicode and whitespace normalization`() {
+        val runtime = Files.createTempDirectory("skill-name").toFile()
+        val registry = SkillRegistry(runtime.resolve("skills"))
+        registry.create("案件  复盘", "first")
+
+        assertThrows(IllegalArgumentException::class.java) {
+            registry.create("案件 复盘", "duplicate")
+        }
+    }
+
+    @Test
+    fun `skill use loads one text resource and edit checks sha`() {
+        val runtime = Files.createTempDirectory("skill-use").toFile()
+        val registry = SkillRegistry(runtime.resolve("skills"))
+        val skill = registry.create("资料整理", "整理资料", "# 流程")
+        val core = registry.use("资料整理")
+
+        assertEquals("SKILL.md", core.resourceName)
+        assertEquals(SkillRegistry.Residency.CONVERSATION, core.skill.residency)
+        val updated = registry.edit(
+            skillName = "资料整理",
+            operation = "replace_text",
+            resourceName = "SKILL.md",
+            expectedSha256 = core.resources.single().sha256,
+            oldText = "# 流程",
+            newText = "# 新流程",
+        )
+        assertTrue(registry.coreBody(updated.id).contains("新流程"))
+    }
 }

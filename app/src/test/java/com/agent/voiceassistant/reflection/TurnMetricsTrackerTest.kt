@@ -63,11 +63,14 @@ class TurnMetricsTrackerTest {
     }
 
     @Test
-    fun `reflection triggers use four independent thresholds`() {
-        assertEquals(listOf("工具调用数 >= 5"), metrics(toolCallCount = 5).reflectionTriggers())
-        assertEquals(listOf("工具轮次 >= 3"), metrics(toolRoundCount = 3).reflectionTriggers())
-        assertEquals(listOf("总耗时 >= 20 秒"), metrics(totalDurationMs = 20_000).reflectionTriggers())
-        assertEquals(listOf("工具耗时 >= 10 秒"), metrics(toolWallDurationMs = 10_000).reflectionTriggers())
+    fun `reflection triggers focus on routing anomalies`() {
+        assertEquals(listOf("未委派且工具调用数 >= 5"), metrics(toolCallCount = 5).reflectionTriggers())
+        assertEquals(listOf("未委派且工具轮次 >= 3"), metrics(toolRoundCount = 3).reflectionTriggers())
+        assertEquals(listOf("重型任务未委派"), metrics().reflectionTriggers(heavyTaskIntent = true))
+        assertEquals(
+            listOf("有效任务预算已触发"),
+            metrics(activeBudgetBlocked = true).reflectionTriggers(),
+        )
         assertTrue(metrics().reflectionTriggers().isEmpty())
     }
 
@@ -107,7 +110,7 @@ class TurnMetricsTrackerTest {
         assertEquals(1, metrics.toolRoundCount)
         assertEquals(1, metrics.blockedToolCallCount)
         assertEquals(0, metrics.failedToolCallCount)
-        assertEquals(listOf("工具耗时 >= 10 秒"), metrics.reflectionTriggers())
+        assertEquals(listOf("存在被策略阻止的工具调用"), metrics.reflectionTriggers())
     }
 
     @Test
@@ -129,6 +132,7 @@ class TurnMetricsTrackerTest {
         toolRoundCount: Int = 0,
         totalDurationMs: Long = 0,
         toolWallDurationMs: Long = 0,
+        activeBudgetBlocked: Boolean = false,
     ) = TurnMetrics(
         turnId = "turn",
         startedAt = 0,
@@ -136,5 +140,6 @@ class TurnMetricsTrackerTest {
         toolCallCount = toolCallCount,
         toolRoundCount = toolRoundCount,
         toolWallDurationMs = toolWallDurationMs,
+        activeBudgetBlocked = activeBudgetBlocked,
     )
 }

@@ -13,38 +13,37 @@ class ToolHistoryPolicyTest {
 
     @Test
     fun `warns in current turn when result will be truncated in later turns`() {
-        val content = "x".repeat(5_000)
+        val content = "x".repeat(15_000)
 
         val prepared = ToolHistoryPolicy.prepareForCurrentTurn(content)
 
-        assertTrue(prepared.contains("已超过 3000 字"))
-        assertTrue(prepared.contains("只会保留本条结果的开头 3000 字"))
+        assertTrue(prepared.contains("已超过 10000 字"))
+        assertTrue(prepared.contains("头部和尾部共 10000 字"))
         assertTrue(prepared.endsWith(content))
     }
 
     @Test
-    fun `truncates current turn results at twelve thousand characters with an explicit marker`() {
-        val content = "HEAD" + "x".repeat(13_000) + "TAIL"
+    fun `truncates current turn results at twenty two thousand characters preserving both ends`() {
+        val content = "HEAD" + "x".repeat(23_000) + "TAIL"
 
         val prepared = ToolHistoryPolicy.prepareForCurrentTurn(content)
 
-        assertTrue(prepared.contains("已超过 12000 字"))
-        assertTrue(prepared.contains("采用保留开头的方式"))
-        assertTrue(prepared.contains(content.take(ToolHistoryPolicy.MAX_CURRENT_TURN_RESULT_CHARS)))
-        assertTrue(!prepared.contains("TAIL"))
+        assertTrue(prepared.contains("已超过 22000 字"))
+        assertTrue(prepared.contains("已省略中间"))
+        assertTrue(prepared.contains("HEAD"))
+        assertTrue(prepared.contains("TAIL"))
     }
 
     @Test
-    fun `compacts long results to exactly the history limit while preserving only the start`() {
-        val content = "HEAD" + "x".repeat(5_000) + "TAIL"
+    fun `compacts long results to exactly the history limit while preserving both ends`() {
+        val content = "HEAD" + "x".repeat(12_000) + "TAIL"
 
         val compact = ToolHistoryPolicy.compact(content, "turn-1", "call-1")
 
         assertEquals(ToolHistoryPolicy.MAX_PERSISTED_RESULT_CHARS, compact.length)
         assertTrue(compact.startsWith("HEAD"))
-        assertTrue(!compact.contains("TAIL"))
-        assertTrue(compact.contains("后续回合历史在此处截断"))
-        assertTrue(compact.contains("保留开头"))
+        assertTrue(compact.contains("TAIL"))
+        assertTrue(compact.contains("后续回合历史已省略中间内容"))
     }
 
     @Test
