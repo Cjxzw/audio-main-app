@@ -40,7 +40,7 @@ provider set [--id ID] --name NAME --base-url URL --model MODEL
 provider activate ID
 provider delete ID --confirm
 conversation list
-conversation new
+conversation new # 走正式 VoiceAgentService 路径，异步返回请求已接收
 conversation clear --confirm
 agent wake
 agent sleep

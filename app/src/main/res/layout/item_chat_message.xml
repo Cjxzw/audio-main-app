@@ -16,6 +16,53 @@
         android:textColor="@color/gray_500"
         android:paddingHorizontal="12dp" />
 
+    <LinearLayout
+        android:id="@+id/llReasoning"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:background="@drawable/bubble_details"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/llReasoningHeader"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/chat_reasoning_label"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/ivReasoningToggle"
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:layout_marginStart="4dp"
+                android:contentDescription="@string/chat_reasoning_expand"
+                android:src="@drawable/ic_chevron_down_24" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvReasoning"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="12dp"
+            android:paddingBottom="10dp"
+            android:scrollbars="vertical"
+            android:textColor="@color/text_secondary"
+            android:textIsSelectable="true"
+            android:textSize="13sp" />
+    </LinearLayout>
+
     <TextView
         android:id="@+id/tvText"
         android:layout_width="wrap_content"
@@ -76,6 +123,7 @@
             android:layout_height="wrap_content"
             android:paddingHorizontal="12dp"
             android:paddingBottom="10dp"
+            android:scrollbars="vertical"
             android:textColor="@color/text_primary"
             android:textIsSelectable="true"
             android:textSize="14sp" />
@@ -117,6 +165,7 @@
         android:layout_height="wrap_content"
         android:textSize="11sp"
         android:textColor="@color/gray_400"
+        android:maxLines="2"
         android:paddingHorizontal="12dp"
         android:layout_marginTop="2dp" />
 

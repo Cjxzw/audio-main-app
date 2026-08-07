@@ -32,6 +32,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import timber.log.Timber
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
@@ -43,6 +44,11 @@ class CloudSpeechClient(
     enum class ThinkingMode(val wireValue: String) {
         DISABLED("disabled"),
         ENABLED("enabled"),
+    }
+
+    enum class ResponseFormat {
+        TEXT,
+        JSON_OBJECT,
     }
 
     data class ToolDefinition(
@@ -65,6 +71,18 @@ class CloudSpeechClient(
         val toolCallId: String? = null,
         val attachmentPaths: List<String> = emptyList(),
         val imageInputs: List<ImageInput> = emptyList(),
+        val responseMetadata: ResponseMetadata? = null,
+    )
+
+    data class ResponseMetadata(
+        val modelId: String? = null,
+        val promptTokens: Long? = null,
+        val completionTokens: Long? = null,
+        val reasoningTokens: Long? = null,
+        val contextWindowTokens: Long? = null,
+        val promptTokensEstimated: Boolean = false,
+        val finishReason: String? = null,
+        val streamComplete: Boolean = true,
     )
 
     data class ImageInput(
@@ -77,12 +95,39 @@ class CloudSpeechClient(
         val tools: List<ToolDefinition>,
         val thinkingMode: ThinkingMode,
         val maxCompletionTokens: Int,
+        val responseFormat: ResponseFormat = ResponseFormat.TEXT,
+        val transportAttemptLimit: Int = 2,
+        val requestId: String = UUID.randomUUID().toString(),
     )
 
     data class ChatCompletion(
         val message: LlmMessage,
         val finishReason: String?,
+        val modelId: String? = null,
+        val usage: ChatUsage? = null,
+        val streamDiagnostics: StreamDiagnostics = StreamDiagnostics(),
     )
+
+    data class ChatUsage(
+        val promptTokens: Long? = null,
+        val completionTokens: Long? = null,
+        val totalTokens: Long? = null,
+        val reasoningTokens: Long? = null,
+        val estimated: Boolean = false,
+    )
+
+    data class StreamDiagnostics(
+        val protocolObserved: Boolean = false,
+        val receivedFinishEvent: Boolean = false,
+        val receivedDoneMarker: Boolean = false,
+        val reachedEof: Boolean = false,
+        val malformedEventCount: Int = 0,
+        /** A locally detected transport interruption after at least one valid stream event. */
+        val interruptionReason: String? = null,
+    ) {
+        val hasNormalEnd: Boolean
+            get() = !protocolObserved || receivedFinishEvent || receivedDoneMarker
+    }
 
     sealed interface ChatStreamEvent {
         data class ContentDelta(val text: String) : ChatStreamEvent
@@ -594,6 +639,9 @@ internal open class NetworkTimeoutException(
 internal class FirstEventTimeoutException(cause: Throwable) :
     NetworkTimeoutException("LLM first event", cause)
 
+internal class StreamIdleTimeoutException(cause: Throwable) :
+    NetworkTimeoutException("LLM stream idle", cause)
+
 private class FirstAudioTimeoutException(cause: Throwable) :
     NetworkTimeoutException("TTS first audio", cause)
 
@@ -608,10 +656,12 @@ internal class ChatStreamAccumulator {
     private val reasoning = StringBuilder()
     private val toolCalls = sortedMapOf<Int, PendingToolCall>()
     private var finishReason: String? = null
+    private var usage: CloudSpeechClient.ChatUsage? = null
 
     fun accept(element: JsonElement): List<CloudSpeechClient.ChatStreamEvent> {
         if (element !is JsonObject) return emptyList()
         val events = mutableListOf<CloudSpeechClient.ChatStreamEvent>()
+        parseUsage(element)?.let { usage = it }
         val choices = element["choices"] as? JsonArray ?: return events
         for (choiceElement in choices) {
             val choice = choiceElement as? JsonObject ?: continue
@@ -678,8 +728,26 @@ internal class ChatStreamAccumulator {
                 toolCalls = completedCalls,
             ),
             finishReason = finishReason,
+            usage = usage,
+            streamDiagnostics = CloudSpeechClient.StreamDiagnostics(
+                receivedFinishEvent = finishReason != null,
+            ),
         )
     }
+
+    private fun parseUsage(element: JsonObject): CloudSpeechClient.ChatUsage? {
+        val usageObject = element["usage"] as? JsonObject ?: return null
+        val completionDetails = usageObject["completion_tokens_details"] as? JsonObject
+        return CloudSpeechClient.ChatUsage(
+            promptTokens = usageObject.longValue("prompt_tokens"),
+            completionTokens = usageObject.longValue("completion_tokens"),
+            totalTokens = usageObject.longValue("total_tokens"),
+            reasoningTokens = completionDetails?.longValue("reasoning_tokens"),
+        )
+    }
+
+    private fun JsonObject.longValue(key: String): Long? =
+        (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
 
     private fun JsonObject.textValue(key: String): String? =
         (this[key] as? JsonPrimitive)?.contentOrNull

@@ -14,6 +14,8 @@ import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 class WorkspaceRepository(context: Context) {
@@ -208,6 +210,28 @@ class WorkspaceRepository(context: Context) {
         return target.lastModified()
     }
 
+    fun dumpLongMarkdown(content: String, timestamp: Long = System.currentTimeMillis()): Entry = synchronized(DUMP_LOCK) {
+        val stem = "长文本转储${SimpleDateFormat("MMddHHmm", Locale.CHINA).format(Date(timestamp))}"
+        var target = File(root, "$stem.md")
+        var suffix = 2
+        while (target.exists()) {
+            target = File(root, "${stem}_$suffix.md")
+            suffix += 1
+        }
+        val temporary = File(root, ".${target.name}.pending")
+        try {
+            temporary.writeText(content, Charsets.UTF_8)
+            try {
+                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temporary.toPath(), target.toPath())
+            }
+        } finally {
+            temporary.delete()
+        }
+        entry(target)
+    }
+
     fun deletePermanently(relativePath: String) {
         val target = resolve(relativePath)
         require(target != root) { "不能删除工作区根目录" }
@@ -263,6 +287,7 @@ class WorkspaceRepository(context: Context) {
     private data class Metadata(val name: String?, val size: Long?, val mimeType: String?)
 
     companion object {
+        private val DUMP_LOCK = Any()
         private const val MAX_IMPORT_BYTES = 50L * 1_024 * 1_024
         private const val MAX_PREVIEW_BYTES = 2L * 1_024 * 1_024
         private const val MAX_EDIT_BYTES = 2L * 1_024 * 1_024

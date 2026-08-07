@@ -14,6 +14,78 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class AgentLoopTest {
     @Test
+    fun `broken stream continues partial content once`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(),
+            completions = ArrayDeque(
+                listOf(
+                    CloudSpeechClient.ChatCompletion(
+                        message = message(content = "第一部分。"),
+                        finishReason = null,
+                        modelId = "mimo-v2.5-pro",
+                        streamDiagnostics = CloudSpeechClient.StreamDiagnostics(protocolObserved = true),
+                    ),
+                    CloudSpeechClient.ChatCompletion(
+                        message = message(content = "第二部分。"),
+                        finishReason = "stop",
+                        modelId = "mimo-v2.5-pro",
+                        streamDiagnostics = CloudSpeechClient.StreamDiagnostics(
+                            protocolObserved = true,
+                            receivedFinishEvent = true,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("第一部分。第二部分。", true), outcome)
+        assertEquals(2, runtime.requests.size)
+        assertEquals(CloudSpeechClient.ThinkingMode.DISABLED, runtime.requests.last().thinkingMode)
+        assertTrue(runtime.requests.last().messages.any { it.role == "assistant" && it.content == "第一部分。" })
+    }
+
+    @Test
+    fun `reasoning only streamed response retries once with thinking disabled`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(),
+            completions = ArrayDeque(
+                listOf(
+                    CloudSpeechClient.ChatCompletion(
+                        message = CloudSpeechClient.LlmMessage(
+                            role = "assistant",
+                            reasoningContent = "尚未形成正文",
+                        ),
+                        finishReason = "stop",
+                        modelId = "mimo-v2.5-pro",
+                        streamDiagnostics = CloudSpeechClient.StreamDiagnostics(
+                            protocolObserved = true,
+                            receivedFinishEvent = true,
+                        ),
+                    ),
+                    CloudSpeechClient.ChatCompletion(
+                        message = message(content = "完整回答"),
+                        finishReason = "stop",
+                        modelId = "mimo-v2.5-pro",
+                        streamDiagnostics = CloudSpeechClient.StreamDiagnostics(
+                            protocolObserved = true,
+                            receivedFinishEvent = true,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("完整回答", true), outcome)
+        assertEquals(2, runtime.requests.size)
+        assertEquals(CloudSpeechClient.ThinkingMode.DISABLED, runtime.requests.last().thinkingMode)
+        assertTrue(runtime.requests.last().messages.last().content.orEmpty().contains("只产生了思考"))
+    }
+
+    @Test
     fun `returns final assistant text and emits lifecycle events`() = runBlocking {
         val runtime = FakeRuntime(
             responses = ArrayDeque(
@@ -57,14 +129,19 @@ class AgentLoopTest {
             responses = ArrayDeque(listOf(message(), message(), message())),
         )
         val events = mutableListOf<AgentEvent>()
+        var completedTurnId: String? = null
 
-        val outcome = AgentLoop(runtime, events::add).run(config())
+        val outcome = AgentLoop(runtime, events::add).run(
+            config(onTurnCompleted = { completedTurnId = it }),
+            turnId = "blank-turn",
+        )
 
         assertEquals(
             AgentLoop.Outcome.Completed("这次没有生成可用回复，请再试一次。", true),
             outcome,
         )
         assertEquals(3, runtime.requests.size)
+        assertEquals("blank-turn", completedTurnId)
         assertTrue(events.none { it is AgentEvent.AgentFailed })
     }
 
@@ -519,6 +596,7 @@ class AgentLoopTest {
     private fun config(
         maxToolRounds: Int = 2,
         onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
+        onTurnCompleted: (String) -> Unit = {},
     ) = AgentLoop.Config(
         messages = listOf(CloudSpeechClient.LlmMessage("user", "开始")),
         initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
@@ -527,6 +605,7 @@ class AgentLoopTest {
         deepMaxCompletionTokens = 4_096,
         allowReasoningEscalation = true,
         onContextFinalized = onContextFinalized,
+        onTurnCompleted = onTurnCompleted,
     )
 
     private fun message(
@@ -540,6 +619,7 @@ class AgentLoopTest {
 
     private class FakeRuntime(
         private val responses: ArrayDeque<CloudSpeechClient.LlmMessage>,
+        private val completions: ArrayDeque<CloudSpeechClient.ChatCompletion>? = null,
         private val failedCallIds: Set<String> = emptySet(),
         private val parallelToolNames: Set<String> = emptySet(),
         private val toolDelayMs: Long = 0,
@@ -573,7 +653,11 @@ class AgentLoopTest {
             onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
         ): AgentLoop.ModelTurn {
             requests += request
-            val message = responses.removeFirst()
+            val completion = completions?.removeFirstOrNull()
+            val message = completion?.message ?: responses.removeFirst()
+            message.reasoningContent?.let {
+                onStreamEvent(CloudSpeechClient.ChatStreamEvent.ReasoningDelta(it))
+            }
             message.content?.let { onStreamEvent(CloudSpeechClient.ChatStreamEvent.ContentDelta(it)) }
             message.toolCalls.forEachIndexed { index, call ->
                 onStreamEvent(
@@ -586,7 +670,7 @@ class AgentLoopTest {
                 )
             }
             return AgentLoop.ModelTurn(
-                CloudSpeechClient.ChatCompletion(message, "stop"),
+                completion ?: CloudSpeechClient.ChatCompletion(message, "stop"),
                 streamedSpeech = message.content != null,
             )
         }

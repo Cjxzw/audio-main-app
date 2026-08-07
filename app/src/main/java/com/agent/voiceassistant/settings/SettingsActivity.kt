@@ -24,7 +24,6 @@ import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
 import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.hub.HubSettings
 import com.agent.voiceassistant.hub.HubConnectionState
-import com.agent.voiceassistant.reflection.ReflectionActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 
@@ -107,15 +106,6 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 setIcon(R.drawable.ic_folder_24)
                 setOnPreferenceClickListener {
                     startActivity(Intent(requireContext(), WorkspaceActivity::class.java))
-                    true
-                }
-            })
-            addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_reflections)
-                summary = getString(R.string.settings_reflections_summary)
-                setIcon(R.drawable.ic_brain_24)
-                setOnPreferenceClickListener {
-                    startActivity(Intent(requireContext(), ReflectionActivity::class.java))
                     true
                 }
             })

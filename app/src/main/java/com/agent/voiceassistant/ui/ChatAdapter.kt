@@ -6,9 +6,11 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ImageView
 import android.widget.TextView
+import android.text.method.ScrollingMovementMethod
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
+import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
 import com.agent.voiceassistant.ui.ChatRole.BOT
 import com.agent.voiceassistant.ui.ChatRole.SYSTEM
@@ -17,17 +19,21 @@ import io.noties.markwon.Markwon
 import io.noties.markwon.ext.tables.TablePlugin
 import kotlin.math.roundToInt
 
-class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
+class ChatAdapter(
+    private val onWorkspaceFileOpen: (String) -> Unit = {},
+) : RecyclerView.Adapter<ChatAdapter.VH>() {
 
     private val messages = mutableListOf<ChatMessage>()
     private val maxMessages = 500
     private val detailOverrides = mutableMapOf<String, Boolean>()
+    private val reasoningOverrides = mutableMapOf<String, Boolean>()
     private var markwon: Markwon? = null
 
     fun setMessages(items: List<ChatMessage>) {
         messages.clear()
         messages.addAll(items.takeLast(maxMessages))
         detailOverrides.keys.retainAll(messages.mapIndexed { index, msg -> detailKey(msg, index) }.toSet())
+        reasoningOverrides.keys.retainAll(messages.mapIndexed { index, msg -> detailKey(msg, index) }.toSet())
         notifyDataSetChanged()
     }
 
@@ -73,21 +79,33 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             .usePlugin(TablePlugin.create(parent.context.applicationContext))
             .build()
             .also { markwon = it }
-        return VH(v, markdownRenderer) { position, expanded ->
-            val message = messages.getOrNull(position) ?: return@VH
-            detailOverrides[detailKey(message, position)] = expanded
-            notifyItemChanged(position, PAYLOAD_TEXT)
-        }
+        return VH(
+            v,
+            markdownRenderer,
+            onDetailsToggle = { position, expanded ->
+                val message = messages.getOrNull(position) ?: return@VH
+                detailOverrides[detailKey(message, position)] = expanded
+            },
+            onReasoningToggle = { position, expanded ->
+                val message = messages.getOrNull(position) ?: return@VH
+                reasoningOverrides[detailKey(message, position)] = expanded
+            },
+            onWorkspaceFileOpen = onWorkspaceFileOpen,
+        )
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) =
-        holder.bind(messages[position], isDetailsExpanded(position))
+        holder.bind(messages[position], isDetailsExpanded(position), isReasoningExpanded(position))
 
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
         if (payloads.contains(PAYLOAD_TEXT)) {
-            holder.bindStreamingText(messages[position], isDetailsExpanded(position))
+            holder.bindStreamingText(
+                messages[position],
+                isDetailsExpanded(position),
+                isReasoningExpanded(position),
+            )
         } else {
-            holder.bind(messages[position], isDetailsExpanded(position))
+            holder.bind(messages[position], isDetailsExpanded(position), isReasoningExpanded(position))
         }
     }
 
@@ -97,11 +115,17 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         view: View,
         private val markwon: Markwon,
         private val onDetailsToggle: (Int, Boolean) -> Unit,
+        private val onReasoningToggle: (Int, Boolean) -> Unit,
+        private val onWorkspaceFileOpen: (String) -> Unit,
     ) : RecyclerView.ViewHolder(view) {
         private val llBubble = view.findViewById<LinearLayout>(R.id.llBubble)
         private val tvRole = view.findViewById<TextView>(R.id.tvRole)
         private val tvText = view.findViewById<TextView>(R.id.tvText)
         private val tvTime = view.findViewById<TextView>(R.id.tvTime)
+        private val llReasoning = view.findViewById<LinearLayout>(R.id.llReasoning)
+        private val llReasoningHeader = view.findViewById<LinearLayout>(R.id.llReasoningHeader)
+        private val tvReasoning = view.findViewById<TextView>(R.id.tvReasoning)
+        private val ivReasoningToggle = view.findViewById<ImageView>(R.id.ivReasoningToggle)
         private val llToolStatus = view.findViewById<LinearLayout>(R.id.llToolStatus)
         private val tvToolSummary = view.findViewById<TextView>(R.id.tvToolSummary)
         private val tvToolState = view.findViewById<TextView>(R.id.tvToolState)
@@ -110,14 +134,16 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         private val tvDetails = view.findViewById<TextView>(R.id.tvDetails)
         private val ivDetailsToggle = view.findViewById<ImageView>(R.id.ivDetailsToggle)
         private var detailsExpanded = false
+        private var reasoningExpanded = false
 
-        fun bind(msg: ChatMessage, detailsExpanded: Boolean) {
+        fun bind(msg: ChatMessage, detailsExpanded: Boolean, reasoningExpanded: Boolean) {
             val ctx = itemView.context
             val isToolStatus = !msg.toolCallId.isNullOrBlank()
             tvRole.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             tvTime.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             tvText.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             llDetails.visibility = View.GONE
+            llReasoning.visibility = View.GONE
             llToolStatus.visibility = if (isToolStatus) View.VISIBLE else View.GONE
             if (isToolStatus) {
                 llBubble.gravity = android.view.Gravity.START
@@ -138,6 +164,9 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             val vertical = (10 * density).roundToInt()
             tvText.setPadding(horizontal, vertical, horizontal, vertical)
             tvText.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            tvTime.maxWidth = tvText.maxWidth
+            tvTime.maxLines = 2
+            tvTime.ellipsize = null
             when (msg.role) {
                 USER -> {
                     llBubble.gravity = android.view.Gravity.END
@@ -170,17 +199,56 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                 }
             }
             bindText(msg, detailsExpanded)
-            tvTime.text = msg.timeStr
+            bindReasoning(msg, reasoningExpanded)
+            tvTime.text = msg.metadataStr
         }
 
-        fun bindStreamingText(msg: ChatMessage, detailsExpanded: Boolean) {
+        fun bindStreamingText(
+            msg: ChatMessage,
+            detailsExpanded: Boolean,
+            reasoningExpanded: Boolean,
+        ) {
             bindText(msg, detailsExpanded)
+            bindReasoning(msg, reasoningExpanded)
             tvRole.text = when (msg.streamState) {
                 ChatStreamState.STREAMING -> itemView.context.getString(R.string.chat_role_bot_streaming)
                 ChatStreamState.INTERRUPTED -> itemView.context.getString(R.string.chat_role_bot_interrupted)
                 else -> itemView.context.getString(R.string.chat_role_bot)
             }
-            tvTime.text = msg.timeStr
+            tvTime.text = msg.metadataStr
+        }
+
+        private fun bindReasoning(msg: ChatMessage, requestedExpanded: Boolean) {
+            val reasoning = msg.reasoningText.orEmpty().trim()
+            if (msg.role != BOT || reasoning.isBlank()) {
+                llReasoning.visibility = View.GONE
+                return
+            }
+            llReasoning.visibility = View.VISIBLE
+            tvReasoning.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            tvReasoning.maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.40f).roundToInt()
+            tvReasoning.movementMethod = ScrollingMovementMethod.getInstance()
+            if (msg.streamState == ChatStreamState.STREAMING) {
+                tvReasoning.text = reasoning
+            } else {
+                markwon.setMarkdown(tvReasoning, reasoning)
+            }
+            reasoningExpanded = requestedExpanded
+            llReasoningHeader.setOnClickListener {
+                reasoningExpanded = !reasoningExpanded
+                stabilizeReplyFocus { setReasoningExpanded(reasoningExpanded) }
+                val position = bindingAdapterPosition
+                if (position != RecyclerView.NO_POSITION) onReasoningToggle(position, reasoningExpanded)
+            }
+            setReasoningExpanded(reasoningExpanded)
+        }
+
+        private fun setReasoningExpanded(expanded: Boolean) {
+            tvReasoning.visibility = if (expanded) View.VISIBLE else View.GONE
+            ivReasoningToggle.rotation = if (expanded) 180f else 0f
+            ivReasoningToggle.contentDescription = itemView.context.getString(
+                if (expanded) R.string.chat_reasoning_collapse else R.string.chat_reasoning_expand,
+            )
         }
 
         private fun bindText(msg: ChatMessage, requestedDetailsExpanded: Boolean) {
@@ -188,11 +256,19 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
                 val extraction = ReplyDetailPolicy.extract(msg.text)
                 tvText.visibility = if (extraction.speakableText.isBlank()) View.GONE else View.VISIBLE
                 if (extraction.speakableText.isNotBlank()) {
-                    markwon.setMarkdown(tvText, extraction.speakableText)
+                    if (msg.streamState == ChatStreamState.STREAMING) {
+                        tvText.text = extraction.speakableText
+                    } else {
+                        markwon.setMarkdown(tvText, extraction.speakableText)
+                    }
                 } else {
                     tvText.text = ""
                 }
-                bindDetails(extraction, requestedDetailsExpanded)
+                if (msg.streamState == ChatStreamState.STREAMING) {
+                    llDetails.visibility = View.GONE
+                } else {
+                    bindDetails(extraction, requestedDetailsExpanded)
+                }
             } else {
                 tvText.visibility = View.VISIBLE
                 tvText.text = msg.text
@@ -210,11 +286,23 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             }
             llDetails.visibility = View.VISIBLE
             tvDetails.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
-            markwon.setMarkdown(tvDetails, extraction.detailsText)
+            tvDetails.maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.40f).roundToInt()
+            tvDetails.movementMethod = ScrollingMovementMethod.getInstance()
+            val dumpedPath = LongDetailsPolicy.dumpedPath(extraction.detailsText)
+            if (dumpedPath == null) {
+                tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, 0, 0)
+                tvDetails.setOnClickListener(null)
+                markwon.setMarkdown(tvDetails, extraction.detailsText)
+            } else {
+                tvDetails.text = extraction.detailsText.replace("`", "")
+                tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_file_24, 0, 0, 0)
+                tvDetails.compoundDrawablePadding = (8 * itemView.resources.displayMetrics.density).roundToInt()
+                tvDetails.setOnClickListener { onWorkspaceFileOpen(dumpedPath.removePrefix("/workspace/")) }
+            }
             detailsExpanded = requestedExpanded
             llDetailsHeader.setOnClickListener {
                 detailsExpanded = !detailsExpanded
-                setDetailsExpanded(detailsExpanded)
+                stabilizeReplyFocus { setDetailsExpanded(detailsExpanded) }
                 val position = bindingAdapterPosition
                 if (position != RecyclerView.NO_POSITION) onDetailsToggle(position, detailsExpanded)
             }
@@ -227,6 +315,16 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
             ivDetailsToggle.contentDescription = itemView.context.getString(
                 if (expanded) R.string.chat_details_collapse else R.string.chat_details_expand,
             )
+        }
+
+        private fun stabilizeReplyFocus(change: () -> Unit) {
+            val recycler = itemView.parent as? RecyclerView
+            val before = IntArray(2).also(tvText::getLocationOnScreen)[1]
+            change()
+            itemView.post {
+                val after = IntArray(2).also(tvText::getLocationOnScreen)[1]
+                recycler?.scrollBy(0, after - before)
+            }
         }
 
         private fun inferToolStatus(text: String): ToolDisplayStatus = when {
@@ -244,6 +342,12 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         val message = messages[position]
         return detailOverrides[detailKey(message, position)]
             ?: ChatDetailsExpansionPolicy.defaultExpanded(messages, position)
+    }
+
+    private fun isReasoningExpanded(position: Int): Boolean {
+        val message = messages[position]
+        return reasoningOverrides[detailKey(message, position)]
+            ?: (message.streamState == ChatStreamState.STREAMING && message.text.isBlank())
     }
 
     private fun detailKey(message: ChatMessage, position: Int): String =

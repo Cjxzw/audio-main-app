@@ -45,6 +45,11 @@ object HubRuntime {
         return facts.agents.filter { it.canDispatchFrom(clientId) }
     }
     suspend fun refreshFacts(timeoutMs: Long = 1_500L) = client.refreshFacts(timeoutMs)
-    suspend fun submitAction(actionType: String, payload: JsonObject, turnId: String, conversationId: String): HubActionResult =
-        client.submitAction(actionType, payload, turnId, conversationId)
+    suspend fun submitAction(
+        actionType: String,
+        payload: JsonObject,
+        turnId: String,
+        conversationId: String,
+        idempotencyKey: String? = null,
+    ): HubActionResult = client.submitAction(actionType, payload, turnId, conversationId, idempotencyKey)
 }

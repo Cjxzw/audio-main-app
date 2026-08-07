@@ -49,6 +49,15 @@ android {
     namespace = "com.agent.voiceassistant"
     compileSdk = 34
 
+    signingConfigs {
+        create("sharedDebug") {
+            storeFile = rootProject.file("app/keystore/hanwo-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.agent.voiceassistant"
         minSdk = 26
@@ -69,6 +78,12 @@ android {
         debug {
             isMinifyEnabled = false
             isDebuggable = true
+            signingConfig = signingConfigs.getByName("sharedDebug")
+            buildConfigField(
+                "String",
+                "DEBUG_SIGNING_CERT_SHA256",
+                "\"e0de11b47635db203eed37363d89a7d77422fb425d3a6b16bb813d0fd712e180\"",
+            )
         }
         release {
             isMinifyEnabled = true

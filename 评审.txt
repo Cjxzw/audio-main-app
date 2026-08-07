@@ -1,0 +1,273 @@
+**评审背景**
+
+当前目标是彻底去除“伪装语音通话”的实现，改为标准音频/音乐应用架构，同时保留：
+
+- 蓝牙眼镜、耳机、手表媒体键激活
+- 后台保活和后台运行
+- 蓝牙麦克风收音
+- ASR、LLM、TTS 完整对话
+- 明确的唤醒、收音完成、等待、异常、休眠反馈
+- 无操作时预休眠和自动休眠
+
+Android 官方支持“播放音频 + 麦克风录音”的媒体应用模型。K 歌软件就是典型案例，不需要 `ConnectionService` 或电话身份。
+
+**当前问题**
+
+1. 架构迁移没有完成
+
+项目虽然已经加入 `MediaLibraryService/MediaSession`，但旧 Telecom 路径仍然存在。当前实际链路是：
+
+```text
+媒体键
+→ MediaLibraryService
+→ VoiceAgentService
+→ 注册 PhoneAccount
+→ TelecomManager.placeCall(tel:0000)
+→ 建立自管理通话
+→ 启动蓝牙录音
+```
+
+因此系统表面上把 App 视作音乐应用，底层音频生命周期却仍受 Telecom 控制。
+
+2. Telecom 会擅自改变 Agent 状态
+
+实机日志多次出现：
+
+```text
+telecom.connection.remote_disconnect
+api.sleep
+agent.sleep.done
+```
+
+眼镜、蓝牙栈或系统结束 Telecom 会话时，Agent 会自动休眠，即使用户没有发送暂停指令。这会造成“以为正在听，实际上已经休眠”。
+
+3. 媒体键唤醒后偶发无法完成收音
+
+日志确认媒体键已经成功触发，蓝牙 SCO 和 `AudioRecord` 也已启动，但部分会话始终没有：
+
+```text
+speech started
+utterance complete
+```
+
+手动休眠并重新启动后又恢复。主要风险是：
+
+- 蓝牙通信路由尚未稳定就开始录音
+- 用户立即说话，导致 VAD 把讲话声当成初始环境噪声
+- 固定静音阈值无法适应蓝牙底噪，导致讲话结束后仍不结束录音
+
+4. 听觉状态反馈不可靠
+
+目前虽然有短提示音代码，但存在：
+
+- 音量和持续时间偏弱
+- 使用媒体音频属性，不适合 SCO 通信路由
+- 部分 WAV 使用 `MediaPlayer` 路由到眼镜时返回 `ok=false`
+- 唤醒、收音结束、网络错误、休眠缺少明确区分
+
+5. 网络失败缺少及时反馈
+
+部分超时会进入专用异常处理，但网络切换也可能产生普通 `IOException`。用户只能等待，最后查看手机才知道失败。
+
+6. 后台保活不能理解为绝对常驻
+
+Android 不保证任何第三方应用永久存活。可实现的是：
+
+- 前台服务
+- 常驻媒体通知
+- MediaSession
+- `START_STICKY`
+- 用户授权后的电池优化豁免
+
+仍需处理厂商系统杀进程、媒体键归属变化和 Android 14+ 后台麦克风限制。
+
+**目标架构**
+
+彻底删除 Telecom，由标准媒体架构统一管理生命周期：
+
+```text
+MainMediaLibraryService
+├── MediaSession：媒体键、手表、车机、眼镜控制
+├── Foreground Service：后台保活和通知
+├── VoiceSessionController：Agent 状态机
+├── AudioRouteManager：蓝牙输入输出
+├── AudioRecord + VAD：语音采集
+└── ASR → LLM → TTS
+```
+
+前台服务类型：
+
+```xml
+android:foregroundServiceType="mediaPlayback|microphone"
+```
+
+不再使用：
+
+```text
+MANAGE_OWN_CALLS
+PhoneAccount
+ConnectionService
+TelecomManager.placeCall()
+phoneCall 前台服务类型
+```
+
+**Telecom 清理方案**
+
+- 删除 `MANAGE_OWN_CALLS`
+- 删除 `AssistantConnectionService` Manifest 声明
+- 删除 `AssistantTelecomSession`
+- 删除 PhoneAccount 注册、注销和虚拟拨号
+- 删除所有 `beginListening/endListening`
+- Telecom 事件不再能够控制 Agent 休眠
+- 媒体 `PLAY` 只负责唤醒
+- 媒体 `PAUSE/STOP` 只负责休眠
+- 避免使用 `toggle`，防止重复媒体事件导致状态反转
+
+**蓝牙音频方案**
+
+电话身份和通信音频路由是两个不同概念。纯媒体应用仍可使用蓝牙耳麦麦克风：
+
+- Android 12+：`AudioManager.setCommunicationDevice()`
+- Android 11 及以下：保留 `startBluetoothSco()` 兼容
+- 使用 `MODE_IN_COMMUNICATION`
+- 录音结束或休眠后调用 `clearCommunicationDevice()`
+- 创建 `AudioRecord` 后检查 `routedDevice`
+- 路由失败时明确提示，不能静默退回错误麦克风
+- TTS、提示音和录音尽量使用统一的音频路由管理
+
+A2DP 主要用于高质量播放，通常不提供麦克风；使用眼镜麦克风时仍需进入 SCO/通信音频路径，但不需要建立虚拟电话。
+
+**建议状态机**
+
+```text
+DORMANT
+→ ACTIVATING
+→ LISTENING
+→ CAPTURED
+→ PROCESSING
+→ SPEAKING
+→ LISTENING
+```
+
+异常状态：
+
+```text
+ACTIVATING_FAILED
+NETWORK_WAITING
+NETWORK_FAILED
+ROUTE_LOST
+PRE_SLEEP
+```
+
+关键规则：
+
+- `PLAY` 在任何非激活状态下进入 `ACTIVATING`
+- 重复 `PLAY` 幂等，不重复创建录音器
+- `PAUSE/STOP` 才能进入休眠
+- 蓝牙断连进入恢复流程，不直接休眠
+- 路由恢复失败后播放错误提示，再决定手机麦克风降级或休眠
+- 每次状态变化同步更新 MediaSession、通知和日志
+
+**唤醒体验**
+
+建议顺序：
+
+1. 收到媒体 `PLAY`
+2. 前台服务切换为 `mediaPlayback|microphone`
+3. 请求音频焦点
+4. 设置蓝牙通信设备
+5. 等待约 300–500ms
+6. 再次核验实际输入、输出设备
+7. 播放离线唤醒提示
+8. 提示结束后启动 `AudioRecord`
+9. 进入 `LISTENING`
+
+唤醒音应为本地资源，不能依赖网络。可以是明显的上升音，也可以内置“你好”“我在”等短语音。
+
+**收音和 VAD**
+
+- 限制初始噪声校准上限，避免用户立即说话污染校准
+- 根据本轮语音峰值动态计算结束阈值
+- 保留 300–500ms 前置音频，避免吞掉第一个字
+- 检测到静音约 700–900ms 后结束
+- 收音结束立即播放下降提示音
+- 增加无语音看门狗，避免无限收音
+
+建议无操作流程：
+
+```text
+唤醒后 15 秒无语音
+→ 播放一次“仍在等待”短提示
+
+继续 15 秒无语音
+→ 播放预休眠提示
+
+提示结束
+→ 关闭麦克风和蓝牙通信路由
+→ 进入 DORMANT
+```
+
+用户讲话、媒体 `PLAY` 或界面操作应取消预休眠。
+
+**网络交互反馈**
+
+- 请求开始后短时间内不播放提示，避免正常请求显得拖沓
+- 超过约 3 秒仍无首事件，播放一次本地等待音
+- 达到网络超时时间后，立即播放独立错误音
+- 捕获 `NetworkTimeoutException` 和普通网络 `IOException`
+- UI 和通知显示具体阶段：ASR、LLM、TTS 或网络不可用
+- 网络错误后保持在线并重新聆听，不应默认休眠
+- 防止等待音、错误音和最终 TTS 重叠
+
+**后台运行方案**
+
+- `MediaLibraryService` 作为唯一生命周期所有者
+- 常驻媒体通知展示唤醒/休眠状态
+- `MediaSession` 持续可发现
+- 休眠时仅保留 `mediaPlayback` 类型，不占用麦克风
+- 激活时升级为 `mediaPlayback|microphone`
+- 首次使用必须在前台完成录音、通知和蓝牙权限授权
+- Android 14+ 需要重点验证后台媒体键触发麦克风 FGS 是否被系统接受
+- 系统拒绝后台麦克风时，必须通过通知要求用户点击，不能表现为假唤醒
+- 可提供电池优化豁免引导，但不能宣称绝对保活
+
+**媒体键限制**
+
+纯媒体模式能否工作，取决于外设发送的按键类型。当前眼镜日志已经显示：
+
+```text
+media3.control.play
+```
+
+说明该设备发送标准媒体命令，不依赖 Telecom 接听协议，具备去 Telecom 条件。
+
+但系统一般把媒体键交给最近活跃的媒体会话。如果用户随后播放其他音乐应用，媒体键归属可能发生变化。这是 Android 平台限制，需要通过常驻 MediaSession、通知入口和恢复机制降低影响，不能完全消除。
+
+**验收标准**
+
+- 冷启动后通过眼镜媒体键可以唤醒
+- 唤醒后 1 秒内听到明确反馈
+- 第一个字不会被吞
+- 正常讲话结束后 1 秒左右触发录音完成
+- 收音完成后有明确反馈
+- 不打开 Activity 也能完成 ASR、LLM 和 TTS
+- 蓝牙远端断开不会无条件让 Agent 休眠
+- 网络切换或超时有本地错误音
+- 无语音时先预休眠提示，再自动休眠
+- 休眠后麦克风、SCO 和音频焦点全部释放
+- 反复媒体键操作不会创建重复服务或重复录音器
+- 与其他音乐、通话、微信语音交替使用后能够恢复
+- Android 12、13、14 及目标努比亚设备完成实机验证
+
+**需要专家重点评审的问题**
+
+- Android 14+ 从后台媒体回调升级为麦克风 FGS 的合规性和厂商差异
+- 移除 Telecom 后，目标眼镜 SCO 输入的稳定性
+- `MediaLibraryService` 与语音状态机是否应完全合并为单一服务
+- MediaSession 被其他音乐应用抢占后的恢复策略
+- 蓝牙路由失败时应降级到手机麦克风，还是直接阻止对话
+- 预休眠时间、提示频率和自动休眠策略
+- 是否需要内置真人短语音，还是使用更可靠的离线提示音
+- 努比亚系统的电池优化和后台服务限制
+
+官方模型依据：[前台服务类型](https://developer.android.com/develop/background-work/services/fgs/service-types)、[Media3 后台播放](https://developer.android.com/media/media3/session/background-playback)、[AudioManager 蓝牙通信路由](https://developer.android.com/reference/android/media/AudioManager)、[K 歌实时音频源](https://developer.android.com/reference/android/media/MediaRecorder.AudioSource)。

@@ -164,7 +164,7 @@ class RuleStore(context: Context) {
         private const val BUILTIN_DIAGNOSTIC_RULE_ID = "builtin-diagnostic-rule"
         private val BUILTIN_DIAGNOSTIC_RULE = """
             当用户讨论本 App 的异常、Bug、报错、卡顿、日志、源码或行为不符合预期时，自行判断是否需要诊断。
-            需要多步取证、读取日志或源码、或结论存在不确定性时，先调用 request_deep_reasoning。
+            需要多步取证、读取日志或源码、或结论存在不确定性时，优先调用相关原生工具；若工作量较大或需要专门能力，则委派给 Hub 路由表中的合适执行器。
             优先读取 /logs 的相关时间范围；只有日志不足以解释问题时，再使用代码图谱和 /source。
             诊断结论必须区分已确认事实、可能原因和未验证项。没有明确日志或源码证据时，不得把推测称为根因；时间接近不等于因果。
             诊断完成后，可用 write 将完整报告保存到 /workspace/diagnostics；若用户要求保留问题记录，再用 memory_create 保存简短索引，并标明已确认或假设。

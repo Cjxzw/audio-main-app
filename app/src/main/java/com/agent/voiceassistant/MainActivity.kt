@@ -52,6 +52,7 @@ import com.agent.voiceassistant.ui.showLightDialog
 import com.agent.voiceassistant.tasks.TaskEntity
 import com.agent.voiceassistant.tasks.TaskRepository
 import com.agent.voiceassistant.workspace.WorkspaceRepository
+import com.agent.voiceassistant.workspace.WorkspacePreviewActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayoutMediator
 import kotlinx.coroutines.Dispatchers
@@ -72,7 +73,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var hubBinding: PageHubBinding
     private lateinit var pageTabsMediator: TabLayoutMediator
     private lateinit var store: ConversationStore
-    private val chatAdapter = ChatAdapter()
+    private lateinit var chatAdapter: ChatAdapter
     private lateinit var conversationAdapter: ConversationAdapter
     private lateinit var workspace: WorkspaceRepository
     private lateinit var taskRepository: TaskRepository
@@ -144,6 +145,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         store = ConversationStore(this)
         workspace = WorkspaceRepository(this)
+        chatAdapter = ChatAdapter(::openWorkspaceDump)
         taskRepository = TaskRepository(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
         homeBinding = PageHomeBinding.inflate(layoutInflater)
@@ -157,9 +159,7 @@ class MainActivity : AppCompatActivity() {
         )
         val pageAdapter = MainPageAdapter(mainPages)
         binding.pagePager.adapter = pageAdapter
-        // Use ViewPager2's paging slop so short horizontal drags in the chat do not switch pages.
-        (binding.pagePager.getChildAt(0) as? RecyclerView)
-            ?.setScrollingTouchSlop(RecyclerView.TOUCH_SLOP_PAGING)
+        binding.pagePager.isUserInputEnabled = false
         pageTabsMediator = TabLayoutMediator(binding.pageTabs, binding.pagePager) { tab, position ->
             tab.setText(pageAdapter.pages[position].titleRes)
         }.also(TabLayoutMediator::attach)
@@ -514,10 +514,9 @@ class MainActivity : AppCompatActivity() {
                 val inserted = chatAdapter.addMessage(msg)
                 if (chatTailFollowEnabled) scheduleChatTailFollow()
                 if (inserted) refreshConversations()
-                Timber.d(
-                    "UI chat: role=${msg.role} state=${msg.streamState} " +
-                        "chars=${msg.text.length} preview=${msg.text.take(160)}",
-                )
+                if (msg.streamState != com.agent.voiceassistant.ui.ChatStreamState.STREAMING) {
+                    Timber.d("UI chat: role=${msg.role} state=${msg.streamState} chars=${msg.text.length}")
+                }
             }
         }
         lifecycleScope.launch {
@@ -571,6 +570,17 @@ class MainActivity : AppCompatActivity() {
             val overflow = lastView.bottom - (recyclerView.height - recyclerView.paddingBottom)
             if (overflow > 0) recyclerView.scrollBy(0, overflow)
         }
+    }
+
+    private fun openWorkspaceDump(relativePath: String) {
+        runCatching { workspace.file(relativePath) }
+            .onSuccess {
+                startActivity(
+                    Intent(this, WorkspacePreviewActivity::class.java)
+                        .putExtra(WorkspacePreviewActivity.EXTRA_PATH, relativePath),
+                )
+            }
+            .onFailure { showMessage(it.message ?: "转储文件不存在") }
     }
 
     private fun updateStateDisplay(state: ServiceState) {

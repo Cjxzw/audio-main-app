@@ -45,7 +45,7 @@ class TextEditorActivity : AppCompatActivity() {
         conversationStore = ConversationStore(this)
         ruleStore = RuleStore(this)
         val env = AndroidExecutionEnv(this)
-        skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest)
+        skills = SkillRegistry(env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest, env.systemSkillsRoot, env.disabledSystemSkillsManifest)
         markwon = Markwon.builder(this).usePlugin(TablePlugin.create(this)).build()
 
         source = Source.entries.firstOrNull { it.wireValue == intent.getStringExtra(EXTRA_SOURCE) }

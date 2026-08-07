@@ -37,6 +37,9 @@ class TurnMetricsTracker(
     private var lastToolFinishedElapsed: Long? = null
     private var parallelBatchCount = 0
     private var currentParallelCallIds = emptySet<String>()
+    private var automaticReasoningEscalated = false
+    private var activeBudgetBlocked = false
+    private var activeTaskDurationMs = 0L
     private val startedTools = mutableMapOf<String, StartedTool>()
     private val toolMetrics = mutableListOf<ToolCallMetric>()
     private val toolIntervals = mutableListOf<Interval>()
@@ -54,10 +57,7 @@ class TurnMetricsTracker(
                 currentModelFirstContentElapsed = null
             }
             is AgentEvent.MessageFinished -> {
-                val businessCalls = event.message.toolCalls.filterNot {
-                    it.name == MainToolRegistry.TOOL_REQUEST_DEEP_REASONING
-                }
-                if (businessCalls.isNotEmpty()) currentRound += 1
+                if (event.message.toolCalls.isNotEmpty()) currentRound += 1
                 if (event.message.toolCalls.isEmpty() && finalAnswerContentElapsed == null) {
                     finalAnswerContentElapsed = currentModelFirstContentElapsed
                 }
@@ -76,7 +76,12 @@ class TurnMetricsTracker(
                     }
                 }
             }
-            is AgentEvent.ToolStarted -> if (event.call.name != MainToolRegistry.TOOL_REQUEST_DEEP_REASONING) {
+            is AgentEvent.AutomaticThinkingEscalated -> automaticReasoningEscalated = true
+            is AgentEvent.ActiveToolBudgetExceeded -> {
+                activeBudgetBlocked = true
+                activeTaskDurationMs = maxOf(activeTaskDurationMs, event.activeElapsedMs)
+            }
+            is AgentEvent.ToolStarted -> {
                 startedTools[event.call.id] = StartedTool(
                     name = event.call.name,
                     startedAt = elapsedMs(),
@@ -84,7 +89,7 @@ class TurnMetricsTracker(
                     parallel = event.call.id in currentParallelCallIds,
                 )
             }
-            is AgentEvent.ToolFinished -> if (event.call.name != MainToolRegistry.TOOL_REQUEST_DEEP_REASONING) {
+            is AgentEvent.ToolFinished -> {
                 val finishedAt = elapsedMs()
                 lastToolFinishedElapsed = finishedAt
                 val started = startedTools.remove(event.call.id) ?: return
@@ -148,6 +153,9 @@ class TurnMetricsTracker(
             failedToolCallCount = toolMetrics.count { !it.success && !it.blocked },
             blockedToolCallCount = toolMetrics.count(ToolCallMetric::blocked),
             usedHubDispatch = toolMetrics.any { it.name == MainToolRegistry.TOOL_HUB_DISPATCH_TASK },
+            automaticReasoningEscalated = automaticReasoningEscalated,
+            activeBudgetBlocked = activeBudgetBlocked,
+            activeTaskDurationMs = activeTaskDurationMs,
             tools = toolMetrics.toList(),
         )
     }

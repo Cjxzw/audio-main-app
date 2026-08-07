@@ -12,6 +12,18 @@ import org.junit.Test
 
 class MainAgentHarnessTest {
     @Test
+    fun `manual recovery exposes waiting state and accepts control-only retry`() = runBlocking {
+        val harness = MainAgentHarness()
+        val waiting = async { harness.awaitRetry(networkTimeout = true) }
+        yield()
+
+        assertTrue(harness.isWaiting())
+        assertTrue(harness.resume(""))
+        assertEquals("", waiting.await().text)
+        assertEquals(MainAgentHarness.State.RUNNING, harness.state.value)
+    }
+
+    @Test
     fun `steering and follow ups remain separate fifo queues`() {
         val harness = MainAgentHarness()
 

@@ -240,15 +240,17 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         startedAt: Long,
     ): JsonObject {
         val store = ConversationStore(context)
-        val session = store.startNewConversation("agent debug cli")
-        EventBus.emitChatReset(emptyList())
-        EventBus.emitConversationUpdate()
+        val previousConversationId = store.currentConversationId
+        VoiceAgentService.newConversation(context)
         return success(
             request,
-            "conversation_created",
-            "新会话已创建",
+            "conversation_requested",
+            "新会话已请求",
             startedAt,
-            buildJsonObject { put("id", session.id) },
+            buildJsonObject {
+                put("previous_id", previousConversationId)
+                put("asynchronous", true)
+            },
         )
     }
 

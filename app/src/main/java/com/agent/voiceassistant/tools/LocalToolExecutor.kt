@@ -46,6 +46,9 @@ class LocalToolExecutor(
             "http_request" -> httpRequest(action.payload)
             "code.graph.search" -> codeGraphSearch(action.payload)
             "code.graph.explain" -> codeGraphExplain(action.payload)
+            "skill.use" -> useSkill(action.payload)
+            "skill.create" -> createSkill(action.payload)
+            "skill.edit" -> editSkill(action.payload)
             "skill.register" -> registerSkill(action.payload)
             else -> ToolResult(
                 actionType = action.actionType,
@@ -575,6 +578,91 @@ class LocalToolExecutor(
         )
     }
 
+    private fun useSkill(payload: JsonObject): ToolResult {
+        val registry = skillRegistry ?: return unavailable("skill.use")
+        val name = payload.string("skill_name") ?: return invalidArguments("skill.use", "缺少 skill_name")
+        val resource = payload.string("resource_name")
+        if (resource.equals("SKILL.md", ignoreCase = true)) {
+            return ToolResult(
+                actionType = "skill.use",
+                displayText = "Skill 核心说明已加载",
+                contextText = "SKILL.md 已在首次加载时完整提供，无需再次加载。请直接遵循已加载内容继续当前任务。",
+                shouldAskLlm = true,
+            )
+        }
+        return runCatching { registry.use(name, resource) }.fold(
+            onSuccess = { loaded ->
+                val attachments = loaded.resources.filter { it.relativePath != "SKILL.md" }
+                ToolResult(
+                    actionType = "skill.use",
+                    displayText = "使用 Skill：${loaded.skill.name}",
+                    contextText = buildString {
+                        appendLine("Skill：${loaded.skill.name}")
+                        appendLine("skill_id=${loaded.skill.id} version=${loaded.skill.version} residency=${loaded.skill.residency}")
+                        if (resource == null && attachments.isEmpty()) {
+                            appendLine("状态：该 Skill 为单文件 Skill，已全部加载。")
+                        } else {
+                            appendLine("已加载：${loaded.resourceName}")
+                        }
+                        appendLine("<skill_content>")
+                        appendLine(loaded.content)
+                        appendLine("</skill_content>")
+                        if (resource == null && attachments.isNotEmpty()) {
+                            appendLine("该 Skill 还有以下附属文档，内容尚未加载：")
+                            attachments.forEach { file ->
+                                appendLine("- ${file.relativePath} (${file.size} bytes, text=${file.editable}, sha256=${file.sha256})")
+                            }
+                            appendLine("仅当当前任务确实需要某份附属文档时，才再次调用 skill_use，并同时传入 skill_name 与 resource_name；resource_name 必须完整匹配上方列出的相对路径。不得把任务参数、JSON、/source、/logs 或 /workspace 路径放入 resource_name。")
+                        }
+                    }.trim(),
+                    shouldAskLlm = true,
+                )
+            },
+            onFailure = { error -> failed("skill.use", "Skill 加载失败", error) },
+        )
+    }
+
+    private fun createSkill(payload: JsonObject): ToolResult {
+        val registry = skillRegistry ?: return unavailable("skill.create")
+        val name = payload.string("skill_name") ?: return invalidArguments("skill.create", "缺少 skill_name")
+        val description = payload.string("description") ?: return invalidArguments("skill.create", "缺少 description")
+        val content = payload.rawString("content") ?: return invalidArguments("skill.create", "缺少 content")
+        return runCatching { registry.create(name, description, content) }.fold(
+            onSuccess = { skill -> ToolResult(
+                "skill.create",
+                "创建 Skill：${skill.name}",
+                "Skill '${skill.name}' 已创建，residency=CONVERSATION，version=${skill.version}。需要使用时请调用 skill_use。",
+                true,
+            ) },
+            onFailure = { error -> failed("skill.create", "Skill 创建失败", error) },
+        )
+    }
+
+    private fun editSkill(payload: JsonObject): ToolResult {
+        val registry = skillRegistry ?: return unavailable("skill.edit")
+        val name = payload.string("skill_name") ?: return invalidArguments("skill.edit", "缺少 skill_name")
+        val operation = payload.string("operation") ?: return invalidArguments("skill.edit", "缺少 operation")
+        val expected = payload.string("expected_sha256") ?: return invalidArguments("skill.edit", "缺少 expected_sha256")
+        return runCatching {
+            registry.edit(
+                skillName = name,
+                operation = operation,
+                resourceName = payload.string("resource_name") ?: "SKILL.md",
+                expectedSha256 = expected,
+                oldText = payload.rawString("old_text"),
+                newText = payload.rawString("new_text"),
+            )
+        }.fold(
+            onSuccess = { skill -> ToolResult(
+                "skill.edit",
+                "编辑 Skill：${skill.name}",
+                "Skill '${skill.name}' 已更新，旧会话快照已失效，version=${skill.version}。继续使用前请重新调用 skill_use。",
+                true,
+            ) },
+            onFailure = { error -> failed("skill.edit", "Skill 编辑失败", error) },
+        )
+    }
+
     private companion object {
         private const val MAX_SEARCH_ANSWER_CHARS = 2_000
         private const val DEFAULT_WEB_SEARCH_RESULTS = 8
@@ -585,6 +673,9 @@ class LocalToolExecutor(
 
     private fun JsonObject.string(key: String): String? =
         (this[key] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+
+    private fun JsonObject.rawString(key: String): String? =
+        (this[key] as? JsonPrimitive)?.contentOrNull
 
     private fun JsonObject.int(key: String): Int? =
         this[key]?.jsonPrimitive?.intOrNull

@@ -3,6 +3,7 @@ package com.agent.voiceassistant.data
 import android.content.Context
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
+import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
@@ -90,7 +91,19 @@ class ConversationStore(context: Context) {
     }
 
     fun llmHistory(excludeMessageId: String? = null): List<CloudSpeechClient.LlmMessage> = synchronized(lock) {
-        currentSessionLocked().messages
+        llmHistoryLocked(currentSessionLocked(), excludeMessageId)
+    }
+
+    fun llmHistoryForConversation(conversationId: String): List<CloudSpeechClient.LlmMessage> = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized emptyList()
+        llmHistoryLocked(session, excludeMessageId = null)
+    }
+
+    private fun llmHistoryLocked(
+        session: ConversationSession,
+        excludeMessageId: String?,
+    ): List<CloudSpeechClient.LlmMessage> =
+        session.messages
             .filter { message ->
                 message.llmVisible ?: (message.role == "user" || message.role == "assistant")
             }
@@ -107,7 +120,6 @@ class ConversationStore(context: Context) {
                     attachmentPaths = message.attachments.map(StoredAttachment::virtualPath),
                 )
             }
-    }
 
     fun addMessage(
         role: String,
@@ -118,6 +130,8 @@ class ConversationStore(context: Context) {
         presentation: ChatPresentation = ChatPresentation.STANDARD,
         streamState: ChatStreamState? = null,
         attachments: List<StoredAttachment> = emptyList(),
+        reasoningText: String? = null,
+        responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -134,6 +148,15 @@ class ConversationStore(context: Context) {
             presentation = presentation.name,
             streamState = streamState?.name,
             attachments = attachments,
+            reasoningText = reasoningText,
+            modelId = responseMetadata?.modelId,
+            promptTokens = responseMetadata?.promptTokens,
+            completionTokens = responseMetadata?.completionTokens,
+            reasoningTokens = responseMetadata?.reasoningTokens,
+            contextWindowTokens = responseMetadata?.contextWindowTokens,
+            promptTokensEstimated = responseMetadata?.promptTokensEstimated,
+            finishReason = responseMetadata?.finishReason,
+            streamComplete = responseMetadata?.streamComplete,
         )
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -195,6 +218,8 @@ class ConversationStore(context: Context) {
         timestamp: Long = System.currentTimeMillis(),
         toolStatus: ToolDisplayStatus? = null,
         streamState: ChatStreamState? = null,
+        reasoningText: String? = null,
+        responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
     ): StoredMessage? {
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -205,6 +230,15 @@ class ConversationStore(context: Context) {
                 timestamp = timestamp,
                 toolStatus = toolStatus?.name ?: session.messages[index].toolStatus,
                 streamState = streamState?.name ?: session.messages[index].streamState,
+                reasoningText = reasoningText ?: session.messages[index].reasoningText,
+                modelId = responseMetadata?.modelId ?: session.messages[index].modelId,
+                promptTokens = responseMetadata?.promptTokens ?: session.messages[index].promptTokens,
+                completionTokens = responseMetadata?.completionTokens ?: session.messages[index].completionTokens,
+                reasoningTokens = responseMetadata?.reasoningTokens ?: session.messages[index].reasoningTokens,
+                contextWindowTokens = responseMetadata?.contextWindowTokens ?: session.messages[index].contextWindowTokens,
+                promptTokensEstimated = responseMetadata?.promptTokensEstimated ?: session.messages[index].promptTokensEstimated,
+                finishReason = responseMetadata?.finishReason ?: session.messages[index].finishReason,
+                streamComplete = responseMetadata?.streamComplete ?: session.messages[index].streamComplete,
             )
             session.messages[index] = updated
             session.updatedAt = timestamp
@@ -261,18 +295,7 @@ class ConversationStore(context: Context) {
         success: Boolean,
         timestamp: Long = System.currentTimeMillis(),
     ): StoredMessage {
-        val rawContent = result.content.orEmpty()
-        persistToolTrace(
-            StoredToolTrace(
-                turnId = turnId,
-                toolCallId = call.id,
-                toolName = call.name,
-                arguments = call.arguments,
-                result = rawContent,
-                success = success,
-                timestamp = timestamp,
-            ),
-        )
+        val rawContent = recordToolTrace(turnId, call, result, success, timestamp)
         val compactContent = ToolHistoryPolicy.compact(rawContent, turnId, call.id)
         Timber.i(
             "agent.tool.persisted_chars turn=$turnId id=${call.id} " +
@@ -282,6 +305,78 @@ class ConversationStore(context: Context) {
             message = result.copy(content = compactContent),
             timestamp = timestamp,
         )
+    }
+
+    fun addHarnessResult(
+        turnId: String,
+        call: CloudSpeechClient.ToolCall,
+        result: CloudSpeechClient.LlmMessage,
+        success: Boolean,
+        timestamp: Long = System.currentTimeMillis(),
+    ): StoredMessage {
+        val rawContent = recordToolTrace(turnId, call, result, success, timestamp)
+        val compact = ToolHistoryPolicy.compact(rawContent, turnId, call.id)
+        return addLlmMessage(
+            CloudSpeechClient.LlmMessage(
+                role = "assistant",
+                content = "<harness_result tool=\"${call.name}\" status=\"${if (success) "success" else "failed"}\">\n$compact\n</harness_result>",
+            ),
+            timestamp,
+        )
+    }
+
+    fun recordEphemeralToolResult(
+        turnId: String,
+        call: CloudSpeechClient.ToolCall,
+        result: CloudSpeechClient.LlmMessage,
+        success: Boolean,
+        timestamp: Long = System.currentTimeMillis(),
+    ) {
+        recordToolTrace(turnId, call, result, success, timestamp)
+    }
+
+    private fun recordToolTrace(
+        turnId: String,
+        call: CloudSpeechClient.ToolCall,
+        result: CloudSpeechClient.LlmMessage,
+        success: Boolean,
+        timestamp: Long,
+    ): String {
+        val rawContent = result.content.orEmpty()
+        persistToolTrace(
+            StoredToolTrace(turnId, call.id, call.name, call.arguments, rawContent, success, timestamp),
+        )
+        return rawContent
+    }
+
+    fun retainSkillResource(loaded: SkillRegistry.UseResult) = synchronized(lock) {
+        if (loaded.skill.residency != SkillRegistry.Residency.CONVERSATION) return@synchronized
+        val session = currentSessionLocked()
+        val existing = session.skillSnapshots.indexOfFirst { it.skillId == loaded.skill.id }
+        val base = session.skillSnapshots.getOrNull(existing)
+            ?.takeIf { it.version == loaded.skill.version }
+            ?: StoredSkillSnapshot(loaded.skill.id, loaded.skill.name, loaded.skill.version)
+        val updated = base.copy(resources = base.resources + (loaded.resourceName to loaded.content))
+        if (existing >= 0) session.skillSnapshots[existing] = updated else session.skillSnapshots += updated
+        persistLocked()
+    }
+
+    fun skillContext(registry: SkillRegistry): String = synchronized(lock) {
+        val valid = registry.list().associateBy { it.id }
+        currentSessionLocked().skillSnapshots.mapNotNull { snapshot ->
+            val skill = valid[snapshot.skillId]?.takeIf {
+                it.residency == SkillRegistry.Residency.CONVERSATION && it.version == snapshot.version
+            } ?: return@mapNotNull null
+            buildString {
+                appendLine("<persistent_skill id=\"${skill.id}\" name=\"${skill.name}\" version=\"${skill.version}\">")
+                snapshot.resources.forEach { (path, content) ->
+                    appendLine("<resource name=\"$path\">")
+                    appendLine(content)
+                    appendLine("</resource>")
+                }
+                append("</persistent_skill>")
+            }
+        }.joinToString("\n\n").ifBlank { "当前会话尚未加载常驻 Skill。" }
     }
 
     fun startNewConversation(reason: String = "用户开启新话题"): ConversationSession {
@@ -542,29 +637,33 @@ class ConversationStore(context: Context) {
         snapshot
     }
 
-    private fun memorySummaryLocked(): String =
-        buildString {
-            val memories = state.memories.filter { it.enabled }
-                .sortedWith(
-                    compareByDescending<StoredMemory> { !it.autoGenerated }
-                        .thenByDescending { it.occurrenceCount }
-                        .thenByDescending { it.updatedAt },
-                )
-                .take(MAX_CONTEXT_MEMORIES)
-            if (memories.isNotEmpty()) {
+    private fun memorySummaryLocked(): String {
+        val enabled = state.memories.filter { it.enabled }
+            .sortedWith(
+                compareByDescending<StoredMemory> { !it.autoGenerated }
+                    .thenByDescending { it.occurrenceCount }
+                    .thenByDescending { it.updatedAt },
+            )
+        val loaded = mutableListOf<StoredMemory>()
+        var usedChars = 0
+        enabled.take(MAX_CONTEXT_MEMORIES).forEach { memory ->
+            val lineChars = memory.content.length + 2
+            if (usedChars + lineChars <= MAX_CONTEXT_MEMORY_CHARS) {
+                loaded += memory
+                usedChars += lineChars
+            }
+        }
+        return buildString {
+            appendLine("已启用记忆 ${enabled.size} 条；本轮实际加载 ${loaded.size} 条；未加载 ${enabled.size - loaded.size} 条。")
+            if (enabled.size == loaded.size) appendLine("全部启用记忆均已加载，无需搜索遗漏记忆。")
+            if (loaded.isNotEmpty()) {
                 appendLine("用户记忆：")
-                var usedChars = 0
-                memories.forEach { memory ->
-                    val line = "- ${memory.content}"
-                    if (usedChars + line.length <= MAX_CONTEXT_MEMORY_CHARS) {
-                        appendLine(line)
-                        usedChars += line.length
-                    }
-                }
+                loaded.forEach { memory -> appendLine("- ${memory.content}") }
             } else {
                 appendLine("用户记忆：暂无")
             }
         }.trim()
+    }
 
     private fun ruleChangeChars(change: RuleChange): Int =
         change.rule.title.length + change.rule.body.length + 64
@@ -679,6 +778,11 @@ class ConversationStore(context: Context) {
             streamState = streamState?.let { stored ->
                 runCatching { ChatStreamState.valueOf(stored) }.getOrNull()
             },
+            reasoningText = reasoningText,
+            modelId = modelId,
+            promptTokens = promptTokens,
+            contextWindowTokens = contextWindowTokens,
+            promptTokensEstimated = promptTokensEstimated == true,
         )
     }
 
@@ -782,45 +886,55 @@ internal fun renderRuleLedger(ledger: ConversationRuleLedger): String = buildStr
 private data class SharedConversationState(var state: StoreState)
 
 internal object ToolHistoryPolicy {
-    const val MAX_CURRENT_TURN_RESULT_CHARS = 12_000
-    const val MAX_PERSISTED_RESULT_CHARS = 3_000
+    const val MAX_CURRENT_TURN_RESULT_CHARS = 22_000
+    const val MAX_PERSISTED_RESULT_CHARS = 10_000
 
     fun prepareForCurrentTurn(content: String): String = when {
         content.length <= MAX_PERSISTED_RESULT_CHARS -> content
         content.length <= MAX_CURRENT_TURN_RESULT_CHARS -> buildString {
             appendLine(
-                "[历史保留提示：本工具结果共 ${content.length} 字，已超过 3000 字的后续回合保留上限。" +
-                    "以下内容在当前回合完整可见，但之后的回合只会保留本条结果的开头 3000 字。" +
+                    "[历史保留提示：本工具结果共 ${content.length} 字，已超过 10000 字的后续回合保留上限。" +
+                    "以下内容在当前回合完整可见，但之后的回合会保留本条结果的头部和尾部共 10000 字。" +
                     "如有需要后续查验的关键信息，请在当前回合提炼后写入 /workspace。]",
             )
             append(content)
         }
         else -> buildString {
             appendLine(
-                "[本轮截断提示：本工具原始结果共 ${content.length} 字，已超过 12000 字的本回合读取上限。" +
-                    "以下仅保留原始结果的开头 12000 字，后续内容已截断；" +
+                "[本轮截断提示：本工具原始结果共 ${content.length} 字，已超过 22000 字的本回合读取上限。" +
+                    "以下保留原始结果的头部和尾部；" +
                     "请缩小筛选范围或使用 offset、limit、tail_lines 分段读取。]",
             )
             appendLine(
-                "[历史保留提示：之后的回合只会保留本条结果的开头 3000 字。" +
+                "[历史保留提示：之后的回合会保留本条结果的头部和尾部共 10000 字。" +
                     "如有需要后续查验的关键信息，请在当前回合提炼后写入 /workspace。]",
             )
-            append(content.take(MAX_CURRENT_TURN_RESULT_CHARS))
-            append(
-                "\n[本轮工具结果在此处截断：采用保留开头的方式，" +
-                    "已省略后续 ${content.length - MAX_CURRENT_TURN_RESULT_CHARS} 字。]",
-            )
+            append(headTail(content, MAX_CURRENT_TURN_RESULT_CHARS, "本轮"))
         }
     }
 
     fun compact(content: String, turnId: String, toolCallId: String): String {
         if (content.length <= MAX_PERSISTED_RESULT_CHARS) return content
         val marker =
-            "\n[后续回合历史在此处截断：采用保留开头的方式，本条工具结果最多保留 3000 字；" +
-                "如需完整证据，请检查当前回合已写入 /workspace 的提炼记录。" +
-                " turn=$turnId call=$toolCallId]"
+            "\n[后续回合历史已省略中间内容；本条工具结果保留头尾共 10000 字。" +
+                " turn=$turnId call=$toolCallId]\n"
         val available = (MAX_PERSISTED_RESULT_CHARS - marker.length).coerceAtLeast(0)
-        return content.take(available) + marker
+        val head = (available + 1) / 2
+        val tail = available - head
+        return content.take(head) + marker + content.takeLast(tail)
+    }
+
+    private fun headTail(content: String, limit: Int, label: String): String {
+        if (content.length <= limit) return content
+        var omitted = content.length - limit
+        var marker = ""
+        repeat(2) {
+            marker = "\n[$label 工具结果已省略中间 $omitted 字]\n"
+            omitted = content.length - (limit - marker.length).coerceAtLeast(0)
+        }
+        val available = (limit - marker.length).coerceAtLeast(0)
+        val head = (available + 1) / 2
+        return content.take(head) + marker + content.takeLast(available - head)
     }
 }
 
@@ -842,6 +956,15 @@ data class ConversationSession(
     var contextSnapshot: String? = null,
     var memoryCompressedAt: Long? = null,
     var ruleLedger: ConversationRuleLedger? = null,
+    val skillSnapshots: MutableList<StoredSkillSnapshot> = mutableListOf(),
+)
+
+@Serializable
+data class StoredSkillSnapshot(
+    val skillId: String,
+    val skillName: String,
+    val version: String,
+    val resources: Map<String, String> = emptyMap(),
 )
 
 @Serializable
@@ -900,6 +1023,15 @@ data class StoredMessage(
     val presentation: String? = null,
     val streamState: String? = null,
     val attachments: List<StoredAttachment> = emptyList(),
+    val reasoningText: String? = null,
+    val modelId: String? = null,
+    val promptTokens: Long? = null,
+    val completionTokens: Long? = null,
+    val reasoningTokens: Long? = null,
+    val contextWindowTokens: Long? = null,
+    val promptTokensEstimated: Boolean? = null,
+    val finishReason: String? = null,
+    val streamComplete: Boolean? = null,
 )
 
 @Serializable

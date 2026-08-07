@@ -24,18 +24,25 @@ import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.R
-import com.agent.voiceassistant.agent.BodyToolCallStreamGate
-import com.agent.voiceassistant.agent.BodyToolCallTooLargeException
+import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
+import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.agent.VoiceReplyLengthGate
 import com.agent.voiceassistant.agent.buildCurrentTurnUserContent
 import com.agent.voiceassistant.agent.buildMainSystemPrompt
-import com.agent.voiceassistant.agent.deepReasoningEnabledResult
 import com.agent.voiceassistant.agent.runtime.AgentEvent
 import com.agent.voiceassistant.agent.runtime.AgentLoop
+import com.agent.voiceassistant.agent.runtime.ActiveTurnCheckpointStore
+import com.agent.voiceassistant.agent.runtime.IntentCategory
+import com.agent.voiceassistant.agent.runtime.IntentRoutingParser
+import com.agent.voiceassistant.agent.runtime.IntentRoutingPrompt
+import com.agent.voiceassistant.agent.runtime.IntentRoutingResult
+import com.agent.voiceassistant.agent.runtime.ToolGateDecision
+import com.agent.voiceassistant.agent.runtime.toSystemPrompt
+import com.agent.voiceassistant.agent.runtime.withoutPrivateReasoning
 import com.agent.voiceassistant.agent.runtime.MainAgentHarness
 import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import com.agent.voiceassistant.audio.EarconPlayer
@@ -58,18 +65,17 @@ import com.agent.voiceassistant.cloud.VoiceReplyDirectiveParser
 import com.agent.voiceassistant.cloud.VoiceReplyMode
 import com.agent.voiceassistant.cloud.VoiceReplyOptions
 import com.agent.voiceassistant.data.ConversationStore
+import com.agent.voiceassistant.data.ConversationCompressionSource
 import com.agent.voiceassistant.data.ToolHistoryPolicy
 import com.agent.voiceassistant.data.ConversationMemoryCompactor
 import com.agent.voiceassistant.data.RuleStore
 import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.media.AssistantNotificationContract
-import com.agent.voiceassistant.reflection.ReflectionStore
-import com.agent.voiceassistant.reflection.ReflectionValidator
 import com.agent.voiceassistant.reflection.TurnMetrics
 import com.agent.voiceassistant.reflection.TurnMetricsTracker
-import com.agent.voiceassistant.reflection.TurnReflectionRecord
 import com.agent.voiceassistant.settings.LlmProviderRepository
+import com.agent.voiceassistant.settings.LlmProviderProfile
 import com.agent.voiceassistant.settings.SpeechPreferences
 import com.agent.voiceassistant.settings.AppCapabilityResolver
 import com.agent.voiceassistant.tools.LocalToolExecutor
@@ -91,7 +97,9 @@ import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
 import com.agent.voiceassistant.ui.ChatStreamState
 import com.agent.voiceassistant.ui.ToolDisplayStatus
+import com.agent.voiceassistant.workspace.WorkspaceRepository
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -113,6 +121,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -123,7 +133,6 @@ import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.MessageDigest
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.CancellationException
@@ -158,6 +167,11 @@ class VoiceAgentService : Service() {
         private const val DEEP_MAX_TOOL_ROUNDS = 10
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
+        private const val INTENT_ROUTE_TOOL_GATE = 3
+        private const val INTENT_ROUTE_GATE_WAIT_MS = 2_000L
+        private const val INTENT_ROUTE_HIGH_CONFIDENCE = 0.85
+        private const val INTENT_ROUTE_TIMEOUT_MS = 5_000L
+        private const val INTENT_ROUTE_MAX_TOKENS = 192
         private const val VOICE_REPLY_SUMMARY_TIMEOUT_MS = 6_000L
         private const val VOICE_REPLY_SUMMARY_MAX_TOKENS = 256
         private const val VOICE_REPLY_SUMMARY_INPUT_CHARS = 24_000
@@ -167,7 +181,7 @@ class VoiceAgentService : Service() {
         private const val MAX_IMAGE_HISTORY_TURNS = 3
         private const val MAX_IMAGE_INPUTS = 4
         private const val DRAFT_PERSIST_CHARS = 64
-        private const val DRAFT_UI_INTERVAL_MS = 50L
+        private const val DRAFT_UI_INTERVAL_MS = 150L
         private val DRAFT_PERSIST_MARKS = setOf('。', '！', '？', '.', '!', '?', '\n')
         private const val LEGACY_STREAM_BLUETOOTH_SCO = 6
         private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif")
@@ -345,26 +359,61 @@ class VoiceAgentService : Service() {
     private lateinit var taskRepository: TaskRepository
     private lateinit var taskCoordinator: AsyncTaskCoordinator
     private lateinit var executionEnv: AndroidExecutionEnv
+    private lateinit var workspaceRepository: WorkspaceRepository
     private lateinit var skillRegistry: SkillRegistry
     private lateinit var imageEncoder: MultimodalImageEncoder
     private lateinit var multimodalTranscriber: MultimodalTranscriber
     private lateinit var deviceContextProvider: DeviceContextProvider
-    private lateinit var reflectionStore: ReflectionStore
+    private lateinit var activeTurnCheckpointStore: ActiveTurnCheckpointStore
     private val agentHarness = MainAgentHarness()
     private val memoryCompactor = ConversationMemoryCompactor()
     private lateinit var earcons: EarconPlayer
     private var dormant = true
     private val turnMutex = Mutex()
-    private val reflectionMutex = Mutex()
+    private val backgroundLlmTasks = Channel<BackgroundLlmTask>(Channel.UNLIMITED)
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
     private val assistantDrafts = ConcurrentHashMap<String, AssistantDraft>()
     private val thinkingFeedbackLock = Any()
     private val speechInterruptedForUrgentReport = AtomicBoolean(false)
     private val newConversationInProgress = AtomicBoolean(false)
     private val lastNewConversationRequestAt = AtomicLong(0L)
+    private val checkpointRecoveryStarted = AtomicBoolean(false)
+    private var checkpointWriteJob: Job? = null
     private var lastThinkingFeedbackAudio: Int? = null
     @Volatile private var activeSourceTurnId: String = ""
     @Volatile private var activeTextTurnSilent: Boolean = false
+
+    private data class TurnCheckpointContext(
+        val conversationId: String,
+        val source: String,
+        val speakReplies: Boolean,
+        val userRequest: String,
+        val resumed: ActiveTurnCheckpointStore.Snapshot? = null,
+    )
+
+    private sealed interface BackgroundLlmTask {
+        val taskId: String
+        val purpose: String
+        val provider: LlmProviderProfile
+        val snapshot: List<CloudSpeechClient.LlmMessage>
+
+        data class Memory(
+            override val taskId: String,
+            override val provider: LlmProviderProfile,
+            override val snapshot: List<CloudSpeechClient.LlmMessage>,
+            val source: ConversationCompressionSource,
+        ) : BackgroundLlmTask {
+            override val purpose: String = "memory_compaction"
+        }
+
+    }
+
+    private data class BackgroundLlmResult<T>(
+        val value: T,
+        val completion: CloudSpeechClient.ChatCompletion,
+        val attemptCount: Int,
+        val modelId: String,
+    )
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -374,11 +423,12 @@ class VoiceAgentService : Service() {
         store = ConversationStore(this)
         ruleStore = RuleStore(this)
         llmProviderRepository = LlmProviderRepository(this)
-        reflectionStore = ReflectionStore(this)
+        activeTurnCheckpointStore = ActiveTurnCheckpointStore(this)
         speechPreferences = SpeechPreferences(this)
         capabilityResolver = AppCapabilityResolver(this)
         locationProvider = LocationProvider(this, store)
         executionEnv = AndroidExecutionEnv(this)
+        workspaceRepository = WorkspaceRepository(this)
         taskRepository = TaskRepository(this)
         taskCoordinator = AsyncTaskCoordinator(taskRepository, serviceScope).apply {
             register(DelayedTestExecutor())
@@ -393,6 +443,8 @@ class VoiceAgentService : Service() {
             executionEnv.disabledSkillsRoot,
             executionEnv.deletedSkillsManifest,
             executionEnv.modifiedSkillsManifest,
+            executionEnv.systemSkillsRoot,
+            executionEnv.disabledSystemSkillsManifest,
         )
         imageEncoder = MultimodalImageEncoder(executionEnv.workspaceRoot)
         multimodalTranscriber = MultimodalTranscriber(this) {
@@ -403,6 +455,7 @@ class VoiceAgentService : Service() {
             capabilityResolver,
             llmProviderRepository,
             speechPreferences,
+            locationContext = ::cachedLocationContext,
         )
         toolRegistry = MainToolRegistry(
             LocalToolExecutor(
@@ -424,6 +477,7 @@ class VoiceAgentService : Service() {
         )
         serviceScope.launch { taskCoordinator.recover() }
         serviceScope.launch { taskReportReviewLoop() }
+        serviceScope.launch { backgroundLlmWorker() }
         locationProvider.refreshInBackground("service_start")
         earcons = EarconPlayer { routeManager }
         createNotificationChannel()
@@ -439,7 +493,10 @@ class VoiceAgentService : Service() {
         )
         when (intent?.action) {
             null -> sleepAgent()
-            ACTION_BOOTSTRAP -> sleepAgent()
+            ACTION_BOOTSTRAP -> {
+                sleepAgent()
+                serviceScope.launch { recoverActiveTurnIfNeeded() }
+            }
             ACTION_START, ACTION_WAKE -> wakeAgent()
             ACTION_SLEEP -> sleepAgent()
             ACTION_TEXT_INPUT -> {
@@ -457,7 +514,10 @@ class VoiceAgentService : Service() {
             ACTION_SWITCH_CONVERSATION -> {
                 ensureForegroundForCurrentState()
                 val id = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
-                serviceScope.launch { turnMutex.withLock { switchConversation(id) } }
+                serviceScope.launch {
+                    abortActiveTurnForConversationChange("切换会话")
+                    turnMutex.withLock { switchConversation(id) }
+                }
             }
             ACTION_RENAME_CONVERSATION -> {
                 ensureForegroundForCurrentState()
@@ -491,10 +551,7 @@ class VoiceAgentService : Service() {
                 ensureForegroundForCurrentState()
                 val id = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
                 serviceScope.launch {
-                    turnMutex.withLock {
-                        compactConversationIntoMemory(id, userVisible = true)
-                        EventBus.emitConversationUpdate()
-                    }
+                    enqueueMemoryCompaction(id)
                 }
             }
             ACTION_CANCEL_TASK -> {
@@ -555,7 +612,7 @@ class VoiceAgentService : Service() {
         try {
             hydrated = batch.map { task -> hydrateTaskResult(task) }
             summary = generateTaskReportSummary(hydrated)
-            val reportText = TaskReportPolicy.composeChatReport(summary, hydrated)
+            val reportText = normalizeFinalAssistantText(TaskReportPolicy.composeChatReport(summary, hydrated))
             val stored = store.addMessageToConversation(
                 conversationId = first.conversationId,
                 role = "assistant",
@@ -723,6 +780,7 @@ class VoiceAgentService : Service() {
 
     override fun onDestroy() {
         hardStopAgent(keepForeground = false)
+        backgroundLlmTasks.close()
         serviceScope.cancel()
         locationProvider.close()
         super.onDestroy()
@@ -940,11 +998,37 @@ class VoiceAgentService : Service() {
         turnNote: String? = null,
         attachments: List<String> = emptyList(),
     ) {
-        val speakReplies = AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies)
-        if (LocalConversationCommandPolicy.classify(userText) == LocalConversationCommandPolicy.Command.NEW_TOPIC) {
-            requestNewConversation(userText, greet = true, speakReplies = speakReplies)
+        val isNewTopic = LocalConversationCommandPolicy.classify(userText) == LocalConversationCommandPolicy.Command.NEW_TOPIC
+        if (isNewTopic) {
+            requestNewConversation(
+                userText,
+                greet = true,
+                speakReplies = AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies),
+            )
             return
         }
+        val recoveryCommand = userText.trim()
+        if (agentHarness.isWaiting() && recoveryCommand == "取消") {
+            agentHarness.abort("用户取消等待中的回合")
+            withContext(Dispatchers.IO) { activeTurnCheckpointStore.clear() }
+            val notice = "已取消未完成回合。"
+            EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, notice))
+            emitLog(notice)
+            updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
+            return
+        }
+        val recoveryInput = if (recoveryCommand in setOf("继续", "重试")) "" else userText
+        if (agentHarness.resume(recoveryInput)) {
+            if (recoveryInput.isNotBlank()) {
+                val resumed = store.addMessage("user", recoveryInput)
+                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, recoveryInput, messageId = resumed.id))
+            }
+            EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, "正在继续未完成回合…", messageId = "recovery-$activeSourceTurnId"))
+            emitLog("继续未完成回合($source): ${recoveryCommand.ifBlank { "继续" }}")
+            updateNotification("正在回应...")
+            return
+        }
+        val speakReplies = AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies)
         turnMutex.withLock {
             activeTextTurnSilent = source == "text" && !speakReplies
             try {
@@ -995,8 +1079,11 @@ class VoiceAgentService : Service() {
 
                 speechInterruptedForUrgentReport.set(false)
                 val metricsTracker = TurnMetricsTracker()
-                var reflectionContext = emptyList<CloudSpeechClient.LlmMessage>()
-                var reflectionTools = emptyList<CloudSpeechClient.ToolDefinition>()
+                val intentRouting = startIntentRouting(
+                    userText = userText,
+                    currentUserMessageId = currentUserMessage.id,
+                    attachments = attachments,
+                )
                 val outcome = runAgentLoop(
                     llmClient = llmClient,
                     speechClient = client,
@@ -1009,32 +1096,21 @@ class VoiceAgentService : Service() {
                         attachments = attachments,
                         visualTranscript = visualTranscript,
                     ),
-                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
-                    allowReasoningEscalation = true,
+                    allowReasoningEscalation = false,
                     voiceReplySummaryEnabled = speakReplies,
                     metricsTracker = metricsTracker,
-                    onContextFinalized = { _, messages -> reflectionContext = messages },
-                    onInitialTools = { tools -> reflectionTools = tools },
+                    intentRouting = intentRouting,
+                    checkpointContext = TurnCheckpointContext(
+                        conversationId = store.currentConversationId,
+                        source = source,
+                        speakReplies = speakReplies,
+                        userRequest = userText,
+                    ),
                 )
                 val metrics = metricsTracker.snapshot()
-                val triggerReasons = metrics.reflectionTriggers()
-                val reflectionRecord = TurnReflectionRecord(
-                    turnId = metrics.turnId,
-                    conversationId = store.currentConversationId,
-                    userRequest = userText,
-                    source = source,
-                    metrics = metrics,
-                    triggerReasons = triggerReasons,
-                    status = if (triggerReasons.isEmpty()) "not_triggered" else "pending",
-                    reflectionModel = llmProviderRepository.activeProfile().modelId,
-                    contextHash = reflectionContextHash(reflectionContext),
-                )
-                reflectionStore.save(reflectionRecord)
-                logTurnMetrics(metrics, triggerReasons)
-                if (triggerReasons.isNotEmpty() && reflectionContext.isNotEmpty()) {
-                    scheduleTurnReflection(reflectionRecord, reflectionContext, reflectionTools)
-                }
+                logTurnMetrics(metrics, emptyList())
                 if (ENABLE_PLAYBACK_DONE_EARCON && outcome.playedSpeech) {
                     earcons.playbackDone()
                 }
@@ -1053,22 +1129,7 @@ class VoiceAgentService : Service() {
                 store.addMessage("system", message)
                 EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
                 emitLog(message)
-                val fallback = "这轮没有完成，执行过程中出现了异常。错误已经记入日志，你可以让我重试。"
-                store.addMessage("assistant", fallback)
-                EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, fallback))
-                emitLog("助手兜底: $fallback")
-                val client = speechClient
-                if (client != null && speakReplies) {
-                    try {
-                        speakAssistantText(client, fallback)
-                    } catch (speechError: Exception) {
-                        Timber.w(speechError, "Failed to speak fallback")
-                        earcons.error()
-                    }
-                } else if (speakReplies) {
-                    earcons.error()
-                }
-                updateNotification(if (dormant) "休眠中，等待唤醒" else "聆听中...")
+                updateNotification("回合尚未完成")
             } finally {
                 activeTextTurnSilent = false
             }
@@ -1087,8 +1148,10 @@ class VoiceAgentService : Service() {
         voiceReplySummaryEnabled: Boolean = false,
         beforeSpeech: suspend () -> Unit = {},
         metricsTracker: TurnMetricsTracker? = null,
+        intentRouting: Deferred<IntentRoutingResult?>? = null,
         onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
         onInitialTools: (List<CloudSpeechClient.ToolDefinition>) -> Unit = {},
+        checkpointContext: TurnCheckpointContext? = null,
     ): AgentLoop.Outcome.Completed {
         var reasoningFeedbackJob: Job? = null
         var initialToolsCaptured = false
@@ -1098,7 +1161,7 @@ class VoiceAgentService : Service() {
             null
         }
         var finalizedAssistantForContext: CloudSpeechClient.LlmMessage? = null
-
+        var intentRouteConsumed = false
         fun startReasoningFeedback(source: String) {
             if (!speakReplies) return
             if (reasoningFeedbackJob?.isActive == true) return
@@ -1134,6 +1197,25 @@ class VoiceAgentService : Service() {
                     } else {
                         emptyList()
                     }
+
+                override fun isToolAllowed(
+                    call: CloudSpeechClient.ToolCall,
+                    nativeToolNames: Set<String>,
+                ): Boolean = call.name in nativeToolNames || call.name == MainToolRegistry.TOOL_PROTOCOL_REPAIR
+
+                override suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String {
+                    val state = if (networkTimeout) "网络超时，等待手动继续" else "回合尚未完成，等待继续"
+                    val notice = if (networkTimeout) {
+                        "网络超时，当前回合尚未结束。请回复“继续”手动重试，或回复“取消”结束本回合。"
+                    } else {
+                        "当前回合尚未结束。请回复“继续”重试，或回复“取消”结束本回合。"
+                    }
+                    DiagLog.w("agent.loop.waiting", "timeout=$networkTimeout reason=${reason.take(300)}")
+                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, notice, messageId = "recovery-$activeSourceTurnId"))
+                    emitLog(notice)
+                    updateNotification(state)
+                    return agentHarness.awaitRetry(networkTimeout).text
+                }
 
                 override suspend fun modelTurn(
                     request: CloudSpeechClient.ChatRequest,
@@ -1277,25 +1359,19 @@ class VoiceAgentService : Service() {
                 }
 
                 override fun isReasoningEscalation(call: CloudSpeechClient.ToolCall) =
-                    toolRegistry.isReasoningEscalation(call)
+                    false
 
-                override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) =
-                    toolRegistry.reasoningEscalationReason(call)
+                override fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall) = ""
 
-                override fun onReasoningEscalation(reason: String) {
-                    startReasoningFeedback("model")
-                }
+                override fun onReasoningEscalation(reason: String) = Unit
 
                 override fun reasoningEscalationResult(
                     call: CloudSpeechClient.ToolCall,
                 ): AgentLoop.ToolExecution {
-                    val reason = toolRegistry.reasoningEscalationReason(call)
-                    emitLog("开启深度思考: $reason")
-                    updateNotification("深入思考中...")
                     return AgentLoop.ToolExecution(
                         message = CloudSpeechClient.LlmMessage(
                             role = "tool",
-                            content = deepReasoningEnabledResult(),
+                            content = "当前已默认开启思考模式，无需申请深度思考。",
                             toolCallId = call.id,
                         ),
                         succeeded = true,
@@ -1304,6 +1380,44 @@ class VoiceAgentService : Service() {
 
                 override fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
                     toolRegistry.countsTowardAutomaticReasoning(call)
+
+                override fun isDelegation(call: CloudSpeechClient.ToolCall): Boolean =
+                    call.name == MainToolRegistry.TOOL_HUB_DISPATCH_TASK
+
+                override suspend fun beforeToolBatch(
+                    calls: List<CloudSpeechClient.ToolCall>,
+                    businessToolCallCount: Int,
+                ): ToolGateDecision {
+                    if (intentRouteConsumed) return ToolGateDecision()
+                    val localCalls = calls.filter { call ->
+                        !toolRegistry.isAgentSleep(call) &&
+                            !toolRegistry.isTerminalPresentation(call) &&
+                            !isDelegation(call) &&
+                            toolRegistry.countsTowardAutomaticReasoning(call)
+                    }
+                    if (localCalls.isEmpty()) return ToolGateDecision()
+                    val route = if (businessToolCallCount >= INTENT_ROUTE_TOOL_GATE) {
+                        withTimeoutOrNull(INTENT_ROUTE_GATE_WAIT_MS) { intentRouting?.await() }
+                    } else {
+                        withTimeoutOrNull(1L) { intentRouting?.await() }
+                    }
+                    val validAgentIds = HubRuntime.dispatchableAgents().mapTo(mutableSetOf()) { it.agentId }
+                    val prompt = route?.toSystemPrompt(validAgentIds)
+                    val highConfidenceDelegate = route?.category == IntentCategory.TASK &&
+                        route.delegate &&
+                        route.confidence >= INTENT_ROUTE_HIGH_CONFIDENCE &&
+                        prompt != null
+                    val mandatoryGate = businessToolCallCount >= INTENT_ROUTE_TOOL_GATE
+                    if (highConfidenceDelegate || (mandatoryGate && prompt != null)) {
+                        intentRouteConsumed = true
+                        return ToolGateDecision(
+                            blockedCallIds = localCalls.mapTo(mutableSetOf()) { it.id },
+                            prompt = prompt,
+                        )
+                    }
+                    if (mandatoryGate) intentRouteConsumed = true
+                    return ToolGateDecision()
+                }
 
                 override suspend fun onAutomaticReasoningEscalation(
                     toolCallCount: Int,
@@ -1317,8 +1431,9 @@ class VoiceAgentService : Service() {
 
                 override fun toolDisplayName(toolName: String) = toolRegistry.displayName(toolName)
 
-                override suspend fun executeTool(call: CloudSpeechClient.ToolCall) =
-                    executeToolCall(call)
+                override suspend fun executeTool(call: CloudSpeechClient.ToolCall): AgentLoop.ToolExecution {
+                    return executeToolCall(call)
+                }
 
                 override fun blockedTool(call: CloudSpeechClient.ToolCall, reason: String) =
                     blockedToolCall(call, reason)
@@ -1334,8 +1449,9 @@ class VoiceAgentService : Service() {
                     } else {
                         VoiceReplyPresentation(displayText = rawText, speechText = rawText)
                     }
-                    finalizedAssistantForContext = message.copy(content = presentation.displayText)
-                    finishAssistantDraft(turnId, presentation.displayText)
+                    val displayText = normalizeFinalAssistantText(presentation.displayText)
+                    finalizedAssistantForContext = message.copy(content = displayText)
+                    finishAssistantDraft(turnId, displayText, message.responseMetadata)
                     emitLog("助手: ${presentation.speechText.take(MAX_LOG_PREVIEW_CHARS)}")
                     if (!streamedSpeech || voiceReplyGate != null) {
                         awaitReasoningFeedback()
@@ -1381,6 +1497,9 @@ class VoiceAgentService : Service() {
                     allowReasoningEscalation = allowReasoningEscalation,
                     fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
                     deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
+                    initialBusinessToolCallCount = checkpointContext?.resumed?.businessToolCallCount ?: 0,
+                    initialActiveElapsedMs = checkpointContext?.resumed?.activeElapsedMs ?: 0,
+                    initialActiveBudgetStarted = checkpointContext?.resumed?.activeBudgetStarted ?: false,
                     beforeSpeech = beforeSpeech,
                     onContextFinalized = { turnId, context ->
                         val replacement = finalizedAssistantForContext
@@ -1393,7 +1512,30 @@ class VoiceAgentService : Service() {
                         }
                         onContextFinalized(turnId, finalizedContext)
                     },
+                    onCheckpoint = { turnId, context, mode, toolCount, activeMs, budgetStarted, phase ->
+                        checkpointContext?.let { metadata ->
+                            scheduleActiveTurnCheckpoint(
+                                ActiveTurnCheckpointStore.Snapshot(
+                                    turnId = turnId,
+                                    conversationId = metadata.conversationId,
+                                    source = metadata.source,
+                                    speakReplies = metadata.speakReplies,
+                                    userRequest = metadata.userRequest,
+                                    phase = phase.name,
+                                    messages = ActiveTurnCheckpointStore.encode(context),
+                                    thinkingEnabled = mode == CloudSpeechClient.ThinkingMode.ENABLED,
+                                    businessToolCallCount = toolCount,
+                                    activeElapsedMs = activeMs,
+                                    activeBudgetStarted = budgetStarted,
+                                ),
+                            )
+                        }
+                    },
+                    onTurnCompleted = { turnId ->
+                        if (checkpointContext != null) clearActiveTurnCheckpoint(turnId)
+                    },
                 ),
+                turnId = checkpointContext?.resumed?.turnId,
             )) {
                 is AgentLoop.Outcome.Completed -> outcome
             }
@@ -1403,12 +1545,124 @@ class VoiceAgentService : Service() {
         }
     }
 
+    private fun scheduleActiveTurnCheckpoint(snapshot: ActiveTurnCheckpointStore.Snapshot) {
+        checkpointWriteJob?.cancel()
+        checkpointWriteJob = serviceScope.launch(Dispatchers.IO) {
+            runCatching { activeTurnCheckpointStore.save(snapshot) }
+                .onSuccess {
+                    DiagLog.i(
+                        "agent.checkpoint.saved",
+                        "turn=${snapshot.turnId} phase=${snapshot.phase} messages=${snapshot.messages.size}",
+                    )
+                }
+                .onFailure { Timber.w(it, "Active turn checkpoint failed") }
+        }
+    }
+
+    private fun clearActiveTurnCheckpoint(turnId: String) {
+        checkpointWriteJob?.cancel()
+        checkpointWriteJob = serviceScope.launch(Dispatchers.IO) {
+            runCatching { activeTurnCheckpointStore.clear() }
+                .onSuccess { DiagLog.i("agent.checkpoint.cleared", "turn=$turnId") }
+                .onFailure { Timber.w(it, "Active turn checkpoint clear failed") }
+        }
+    }
+
+    private suspend fun recoverActiveTurnIfNeeded() {
+        if (!checkpointRecoveryStarted.compareAndSet(false, true)) return
+        if (agentHarness.state.value != MainAgentHarness.State.IDLE) return
+        val snapshot = withContext(Dispatchers.IO) { activeTurnCheckpointStore.load() } ?: return
+        if (snapshot.phase == AgentLoop.CheckpointPhase.WAITING_RECOVERY.name) {
+            DiagLog.w(
+                "agent.checkpoint.discarded",
+                "turn=${snapshot.turnId} reason=stale_recovery_checkpoint",
+                showInUi = true,
+            )
+            clearActiveTurnCheckpoint(snapshot.turnId)
+            return
+        }
+        val decoded = repairInterruptedToolCalls(ActiveTurnCheckpointStore.decode(snapshot.messages))
+        if (!store.switchConversation(snapshot.conversationId)) {
+            DiagLog.w("agent.checkpoint.discarded", "turn=${snapshot.turnId} reason=missing_conversation")
+            clearActiveTurnCheckpoint(snapshot.turnId)
+            return
+        }
+        DiagLog.i(
+            "agent.checkpoint.recovering",
+            "turn=${snapshot.turnId} phase=${snapshot.phase} messages=${decoded.size}",
+            showInUi = true,
+        )
+        turnMutex.withLock {
+            activeSourceTurnId = snapshot.turnId
+            activeTextTurnSilent = snapshot.source == "text" && !snapshot.speakReplies
+            try {
+                val speech = if (snapshot.speakReplies) ensureSpeechClient() else null
+                runAgentLoop(
+                    llmClient = createLlmClient(),
+                    speechClient = speech,
+                    speakReplies = snapshot.speakReplies && speech != null,
+                    messages = decoded,
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
+                    maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
+                    allowReasoningEscalation = false,
+                    voiceReplySummaryEnabled = snapshot.speakReplies,
+                    checkpointContext = TurnCheckpointContext(
+                        conversationId = snapshot.conversationId,
+                        source = snapshot.source,
+                        speakReplies = snapshot.speakReplies,
+                        userRequest = snapshot.userRequest,
+                        resumed = snapshot,
+                    ),
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                DiagLog.w(
+                    "agent.checkpoint.recovery_failed",
+                    "turn=${snapshot.turnId} error=${error.message ?: error.javaClass.simpleName}",
+                    showInUi = true,
+                )
+            } finally {
+                activeTextTurnSilent = false
+            }
+        }
+    }
+
+    private fun repairInterruptedToolCalls(
+        messages: List<CloudSpeechClient.LlmMessage>,
+    ): List<CloudSpeechClient.LlmMessage> {
+        val completed = messages.mapNotNullTo(hashSetOf()) { message ->
+            message.toolCallId.takeIf { message.role == "tool" }
+        }
+        val pending = messages.flatMap { message ->
+            if (message.role == "assistant") message.toolCalls else emptyList()
+        }.filterNot { it.id in completed }
+        if (pending.isEmpty()) return messages
+        return messages + pending.map { call ->
+            CloudSpeechClient.LlmMessage(
+                role = "tool",
+                content = "App 进程在该工具返回结果前中断，执行状态未知。不得假定动作成功；请依据现有上下文重新评估，优先总结或委派，避免重复有副作用的操作。",
+                toolCallId = call.id,
+            )
+        }
+    }
+
     private fun onAgentEvent(event: AgentEvent) {
         when (event) {
             is AgentEvent.AgentStarted -> DiagLog.i("agent.loop.started", "turn=${event.turnId}")
             is AgentEvent.TurnStarted -> DiagLog.i(
                 "agent.turn.started",
                 "turn=${event.turnId} thinking=${event.thinkingMode}",
+            )
+            is AgentEvent.ActiveBudgetStarted -> DiagLog.i(
+                "agent.active_budget.started",
+                "turn=${event.turnId}",
+            )
+            is AgentEvent.ActiveToolBudgetExceeded -> DiagLog.w(
+                "agent.active_budget.exceeded",
+                "turn=${event.turnId} activeMs=${event.activeElapsedMs} " +
+                    "blocked=${event.blockedCalls.joinToString(",") { it.name }}",
+                showInUi = true,
             )
             is AgentEvent.ThinkingModeChanged -> DiagLog.i(
                 "agent.thinking.changed",
@@ -1443,12 +1697,14 @@ class VoiceAgentService : Service() {
                 )
                 finishToolStatus(event.call, event.success && !event.blocked)
                 if (!toolRegistry.isReasoningEscalation(event.call)) {
-                    store.addToolResult(
-                        turnId = event.turnId,
-                        call = event.call,
-                        result = event.result,
-                        success = event.success && !event.blocked,
-                    )
+                    when {
+                        event.call.name == MainToolRegistry.TOOL_SKILL_USE -> store.recordEphemeralToolResult(
+                            event.turnId, event.call, event.result, event.success && !event.blocked,
+                        )
+                        else -> store.addToolResult(
+                            event.turnId, event.call, event.result, event.success && !event.blocked,
+                        )
+                    }
                 }
             }
             is AgentEvent.TurnFinished -> DiagLog.i(
@@ -1466,7 +1722,11 @@ class VoiceAgentService : Service() {
                 val persistentCalls = if (event.message.toolCalls.any(toolRegistry::isTerminalPresentation)) {
                     emptyList()
                 } else {
-                    event.message.toolCalls.filterNot(toolRegistry::isReasoningEscalation)
+                    event.message.toolCalls.filter { call ->
+                        toolRegistry.isNativeTool(call.name) &&
+                            call.name != MainToolRegistry.TOOL_SKILL_USE &&
+                            !toolRegistry.isReasoningEscalation(call)
+                    }
                 }
                 if (persistentCalls.isNotEmpty()) {
                     suppressAssistantDraft(event.turnId)
@@ -1488,8 +1748,15 @@ class VoiceAgentService : Service() {
                 )
             }
             is AgentEvent.MessageStarted -> {
-                discardAssistantDraft(event.turnId)
-                assistantDrafts[event.turnId] = AssistantDraft()
+                val existing = assistantDrafts[event.turnId]
+                if (existing == null) {
+                    assistantDrafts[event.turnId] = AssistantDraft()
+                } else {
+                    existing.text.setLength(0)
+                    existing.released = false
+                    existing.suppressed = false
+                    existing.persistedLength = 0
+                }
             }
             is AgentEvent.FinalResponseRetry -> DiagLog.w(
                 "agent.final.retry",
@@ -1500,8 +1767,39 @@ class VoiceAgentService : Service() {
             }
             is AgentEvent.ToolCallDetected -> suppressAssistantDraft(event.turnId)
             is AgentEvent.AgentFinished -> assistantDrafts.remove(event.turnId)
-            is AgentEvent.ReasoningDelta,
+            is AgentEvent.ReasoningDelta -> appendAssistantReasoning(event.turnId, event.text)
             is AgentEvent.ToolProgress -> Unit
+        }
+    }
+
+    private fun appendAssistantReasoning(turnId: String, delta: String) {
+        if (delta.isEmpty()) return
+        val draft = assistantDrafts.computeIfAbsent(turnId) { AssistantDraft() }
+        draft.reasoning.append(delta)
+        val reasoning = draft.reasoning.toString()
+        if (draft.messageId == null) {
+            val stored = store.addMessage(
+                role = "assistant",
+                content = draft.text.toString(),
+                streamState = ChatStreamState.STREAMING,
+                reasoningText = reasoning,
+            )
+            draft.messageId = stored.id
+            draft.timestamp = stored.timestamp
+        } else {
+            store.updateMessage(
+                messageId = requireNotNull(draft.messageId),
+                content = draft.text.toString(),
+                streamState = ChatStreamState.STREAMING,
+                reasoningText = reasoning,
+            )
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (draft.lastEmittedAt == 0L || now - draft.lastEmittedAt >= DRAFT_UI_INTERVAL_MS) {
+            draft.lastEmittedAt = now
+            EventBus.emitChatMessage(
+                draft.toChatMessage(draft.text.toString(), ChatStreamState.STREAMING),
+            )
         }
     }
 
@@ -1538,16 +1836,17 @@ class VoiceAgentService : Service() {
             draft.persistedLength = text.length
         }
         val now = SystemClock.elapsedRealtime()
-        if (draft.lastEmittedAt == 0L ||
-            now - draft.lastEmittedAt >= DRAFT_UI_INTERVAL_MS ||
-            text.lastOrNull() in DRAFT_PERSIST_MARKS
-        ) {
+        if (draft.lastEmittedAt == 0L || now - draft.lastEmittedAt >= DRAFT_UI_INTERVAL_MS) {
             draft.lastEmittedAt = now
             EventBus.emitChatMessage(draft.toChatMessage(text, ChatStreamState.STREAMING))
         }
     }
 
-    private fun finishAssistantDraft(turnId: String, finalText: String) {
+    private fun finishAssistantDraft(
+        turnId: String,
+        finalText: String,
+        responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
+    ) {
         val draft = assistantDrafts.remove(turnId)
         val messageId = draft?.messageId
         if (messageId == null) {
@@ -1555,6 +1854,8 @@ class VoiceAgentService : Service() {
                 role = "assistant",
                 content = finalText,
                 streamState = ChatStreamState.COMPLETED,
+                reasoningText = draft?.reasoning?.toString()?.takeIf(String::isNotBlank),
+                responseMetadata = responseMetadata,
             )
             EventBus.emitChatMessage(
                 ChatMessage(
@@ -1563,12 +1864,40 @@ class VoiceAgentService : Service() {
                     timestamp = stored.timestamp,
                     messageId = stored.id,
                     streamState = ChatStreamState.COMPLETED,
+                    reasoningText = draft?.reasoning?.toString()?.takeIf(String::isNotBlank),
+                    modelId = responseMetadata?.modelId,
+                    promptTokens = responseMetadata?.promptTokens,
+                    contextWindowTokens = responseMetadata?.contextWindowTokens,
+                    promptTokensEstimated = responseMetadata?.promptTokensEstimated == true,
                 ),
             )
             return
         }
-        store.updateMessage(messageId, finalText, streamState = ChatStreamState.COMPLETED)
-        EventBus.emitChatMessage(draft.toChatMessage(finalText, ChatStreamState.COMPLETED))
+        store.updateMessage(
+            messageId,
+            finalText,
+            streamState = ChatStreamState.COMPLETED,
+            reasoningText = draft.reasoning.toString().takeIf(String::isNotBlank),
+            responseMetadata = responseMetadata,
+        )
+        EventBus.emitChatMessage(
+            draft.toChatMessage(finalText, ChatStreamState.COMPLETED, responseMetadata),
+        )
+    }
+
+    private fun normalizeFinalAssistantText(text: String): String {
+        val detailsChars = ReplyDetailPolicy.extract(text).detailsText.length
+        val result = LongDetailsPolicy.normalize(text) { details ->
+            workspaceRepository.dumpLongMarkdown(details).virtualPath
+        }
+        result.dumpedPath?.let { path ->
+            DiagLog.i(
+                "assistant.details.dumped",
+                "chars=$detailsChars path=$path",
+                showInUi = true,
+            )
+        }
+        return result.content
     }
 
     private fun interruptAssistantDraft(turnId: String) {
@@ -1602,6 +1931,7 @@ class VoiceAgentService : Service() {
 
     private data class AssistantDraft(
         val text: StringBuilder = StringBuilder(),
+        val reasoning: StringBuilder = StringBuilder(),
         var messageId: String? = null,
         var timestamp: Long = System.currentTimeMillis(),
         var released: Boolean = false,
@@ -1609,12 +1939,21 @@ class VoiceAgentService : Service() {
         var persistedLength: Int = 0,
         var lastEmittedAt: Long = 0L,
     ) {
-        fun toChatMessage(content: String, state: ChatStreamState) = ChatMessage(
+        fun toChatMessage(
+            content: String,
+            state: ChatStreamState,
+            metadata: CloudSpeechClient.ResponseMetadata? = null,
+        ) = ChatMessage(
             role = ChatRole.BOT,
             text = content,
             timestamp = timestamp,
             messageId = messageId,
             streamState = state,
+            reasoningText = reasoning.toString().takeIf(String::isNotBlank),
+            modelId = metadata?.modelId,
+            promptTokens = metadata?.promptTokens,
+            contextWindowTokens = metadata?.contextWindowTokens,
+            promptTokensEstimated = metadata?.promptTokensEstimated == true,
         )
     }
 
@@ -1708,31 +2047,7 @@ class VoiceAgentService : Service() {
         if (message.toolCalls.isNotEmpty()) return message
         val raw = message.content.orEmpty()
         if (!StructuredOutputParser.containsStructuredProtocol(raw)) return message
-        if (StructuredOutputParser.containsToolProtocol(raw)) {
-            val bodyCalls = StructuredOutputParser.parseBodyToolCalls(raw)
-            if (bodyCalls.isNotEmpty()) {
-                return message.copy(
-                    content = "",
-                    toolCalls = bodyCalls.map { bodyCall ->
-                        CloudSpeechClient.ToolCall(
-                            id = "body_${UUID.randomUUID()}",
-                            name = bodyCall.name,
-                            arguments = bodyCall.arguments.toString(),
-                        )
-                    },
-                )
-            }
-            return message.copy(
-                content = "",
-                toolCalls = listOf(
-                    CloudSpeechClient.ToolCall(
-                        id = "repair_${UUID.randomUUID()}",
-                        name = MainToolRegistry.TOOL_PROTOCOL_REPAIR,
-                        arguments = "{}",
-                    ),
-                ),
-            )
-        }
+        if (StructuredOutputParser.containsToolProtocol(raw)) return message
         val parsed = StructuredOutputParser.parse(raw)
         return message.copy(content = parsed.speakText, toolCalls = emptyList())
     }
@@ -1753,9 +2068,6 @@ class VoiceAgentService : Service() {
             speakReplies && speechClient != null && shouldStreamDirectSpeech(request)
         val extractor = StreamingSpeechExtractor()
         val segmenter = SpeechSegmenter()
-        val bodyToolGate = BodyToolCallStreamGate(
-            probeChars = if (voiceReplyGate != null) VoiceReplyLengthGate.DEFAULT_THRESHOLD else 160,
-        )
         val ttsQueue = Channel<String>(Channel.UNLIMITED)
         val startedAt = System.currentTimeMillis()
         var firstDeltaLogged = false
@@ -1781,7 +2093,7 @@ class VoiceAgentService : Service() {
             }.hashCode(),
         )
         Timber.i(
-            "Latency LLM request_start thinking=${request.thinkingMode} " +
+            "Latency LLM request_start requestId=${request.requestId} thinking=${request.thinkingMode} " +
                 "messages=${request.messages.size} promptChars=$promptChars " +
                 "systemHash=$systemHash toolsHash=$toolsHash tools=${request.tools.size}",
         )
@@ -1848,8 +2160,7 @@ class VoiceAgentService : Service() {
         }
 
         try {
-            val completion = try {
-                llmClient.streamChat(request) { event ->
+            val completion = llmClient.streamChat(request) { event ->
                 firstModelEvent.set(true)
                 slowNetworkFeedback.cancel()
                 when (event) {
@@ -1861,35 +2172,12 @@ class VoiceAgentService : Service() {
                         }
                     }
                     is CloudSpeechClient.ChatStreamEvent.ContentDelta -> {
-                        val gated = bodyToolGate.append(event.text)
-                        if (gated.tooLarge) throw BodyToolCallTooLargeException()
-                        if (gated.protocolDetected) {
-                            onStreamEvent(
-                                CloudSpeechClient.ChatStreamEvent.ToolCallDelta(
-                                    index = -1,
-                                    id = null,
-                                    name = "body_tool_protocol",
-                                    argumentsDelta = null,
-                                ),
-                            )
-                        }
-                        consumeContentDelta(gated.text)
+                        consumeContentDelta(event.text)
                     }
                     is CloudSpeechClient.ChatStreamEvent.ToolCallDelta,
                     is CloudSpeechClient.ChatStreamEvent.Finished -> onStreamEvent(event)
                 }
                 }
-            } catch (error: BodyToolCallTooLargeException) {
-                emitLog("已拦截超长正文工具调用，未执行写入")
-                CloudSpeechClient.ChatCompletion(
-                    message = CloudSpeechClient.LlmMessage(
-                        role = "assistant",
-                        content = "工具调用内容过长，未执行写入。请使用 exec 的 argv 复制已有文件，或用 write append 分段写入。",
-                    ),
-                    finishReason = "body_protocol_too_large",
-                )
-            }
-            consumeContentDelta(bodyToolGate.finish().text)
             onModelStreamDone()
             if (allowDirectSpeech || voiceReplyGate != null) {
                 val tail = extractor.finish()
@@ -1906,12 +2194,27 @@ class VoiceAgentService : Service() {
                 }
             }
             Timber.i(
-                "Latency LLM done elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                    "chars=${completion.message.content.orEmpty().length} tools=${completion.message.toolCalls.size}",
+                "Latency LLM done requestId=${request.requestId} elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                    "model=${completion.modelId ?: "unknown"} " +
+                    "chars=${completion.message.content.orEmpty().length} " +
+                    "reasoningChars=${completion.message.reasoningContent.orEmpty().length} " +
+                    "tools=${completion.message.toolCalls.size} finish=${completion.finishReason ?: "null"} " +
+                    "done=${completion.streamDiagnostics.receivedDoneMarker} " +
+                    "finishEvent=${completion.streamDiagnostics.receivedFinishEvent} " +
+                    "eof=${completion.streamDiagnostics.reachedEof} " +
+                    "malformed=${completion.streamDiagnostics.malformedEventCount} " +
+                    "interruption=${completion.streamDiagnostics.interruptionReason ?: "none"} " +
+                    "promptTokens=${completion.usage?.promptTokens ?: -1} " +
+                    "completionTokens=${completion.usage?.completionTokens ?: -1} " +
+                    "reasoningTokens=${completion.usage?.reasoningTokens ?: -1}",
             )
             ttsQueue.close()
             playbackJob.join()
             return@coroutineScope AgentLoop.ModelTurn(completion, streamedSpeech)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            Timber.w("Latency LLM failed requestId=${request.requestId} elapsed=${System.currentTimeMillis() - startedAt}ms error=${error.javaClass.simpleName}:${error.message}")
+            throw error
         } finally {
             slowNetworkFeedback.cancel()
             ttsQueue.close()
@@ -1957,7 +2260,7 @@ class VoiceAgentService : Service() {
         llmClient: LlmClient,
         rawText: String,
     ): VoiceReplyPresentation {
-        if (VoiceReplyLengthGate.countVisible(rawText) <= VoiceReplyLengthGate.DEFAULT_THRESHOLD) {
+        if (!VoiceReplyLengthGate.shouldSummarize(rawText)) {
             return VoiceReplyPresentation(displayText = rawText, speechText = rawText)
         }
 
@@ -1984,21 +2287,20 @@ class VoiceAgentService : Service() {
                         maxCompletionTokens = VOICE_REPLY_SUMMARY_MAX_TOKENS,
                     ),
                 ) {}.message.content.orEmpty().trim()
-            }
+            } ?: throw NetworkTimeoutException("voice reply summary")
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            Timber.w(error, "Voice reply summary failed; using local fallback")
-            null
+            Timber.w(error, "Voice reply summary failed")
+            throw error
         }
 
         val summary = candidate
-            ?.let { ReplyDetailPolicy.stripDetails(it).speakableText.trim() }
-            ?.takeIf { it.isNotBlank() && !StructuredOutputParser.containsToolProtocol(it) }
+            .let { ReplyDetailPolicy.stripDetails(it).speakableText.trim() }
+            .takeIf { it.isNotBlank() && !StructuredOutputParser.containsToolProtocol(it) }
             ?.let(::limitVoiceSentences)
             ?.takeIf(String::isNotBlank)
-            ?: limitVoiceSentences(SpokenReplyPolicy.fallback(rawText))
-                .ifBlank { "详细内容已经整理在聊天窗口里。" }
+            ?: error("摘要模型没有返回有效正文")
         val details = ReplyDetailPolicy.forDisplay(rawText).trim()
         return VoiceReplyPresentation(
             displayText = "$summary\n\n<DETAILS>\n$details\n</DETAILS>",
@@ -2063,6 +2365,75 @@ class VoiceAgentService : Service() {
         }
     }
 
+    private fun startIntentRouting(
+        userText: String,
+        currentUserMessageId: String,
+        attachments: List<String>,
+    ): Deferred<IntentRoutingResult?> = serviceScope.async(Dispatchers.IO) {
+        val startedAt = System.currentTimeMillis()
+        val routeTable = HubRuntime.dispatchableAgents().joinToString("\n") { agent ->
+            val model = listOf(agent.model, agent.version).filter { it.isNotBlank() }.joinToString(" ")
+            "- ${agent.agentId}: ${agent.name}; type=${if (agent.companion) "companion" else "executor"}; model=$model; capabilities=${agent.capabilities.joinToString(",")}; description=${agent.description}"
+        }
+        val history = store.llmHistory(excludeMessageId = currentUserMessageId)
+            .withoutPrivateReasoning()
+        val messages = buildList {
+            add(CloudSpeechClient.LlmMessage("system", IntentRoutingPrompt.SYSTEM))
+            add(CloudSpeechClient.LlmMessage("system", IntentRoutingPrompt.userContent(routeTable)))
+            addAll(history)
+            add(
+                CloudSpeechClient.LlmMessage(
+                    role = "user",
+                    content = userText,
+                    attachmentPaths = attachments,
+                ),
+            )
+        }
+        val client = runCatching { OpenAiCompatibleLlmClient(capabilityResolver.llmConfig()) }
+            .getOrElse { error ->
+                DiagLog.w("intent.route.failed", "stage=create_client reason=${error.message}")
+                return@async null
+            }
+        try {
+            val completion = withTimeoutOrNull(INTENT_ROUTE_TIMEOUT_MS) {
+                client.streamChat(
+                    CloudSpeechClient.ChatRequest(
+                        messages = messages,
+                        tools = emptyList(),
+                        thinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                        maxCompletionTokens = INTENT_ROUTE_MAX_TOKENS,
+                        responseFormat = CloudSpeechClient.ResponseFormat.JSON_OBJECT,
+                        transportAttemptLimit = 1,
+                        requestId = "intent-${UUID.randomUUID()}",
+                    ),
+                ) { }
+            }
+            if (completion == null) {
+                DiagLog.w("intent.route.failed", "stage=timeout elapsedMs=${System.currentTimeMillis() - startedAt}")
+                return@async null
+            }
+            val content = completion.message.content.orEmpty().trim()
+            val result = IntentRoutingParser.parse(content).getOrElse { error ->
+                DiagLog.w("intent.route.failed", "stage=parse reason=${error.message} contentChars=${content.length}")
+                return@async null
+            }
+            DiagLog.i(
+                "intent.route.completed",
+                "category=${result.category} complexity=${result.complexity} delegate=${result.delegate} " +
+                    "agent=${result.agentId ?: "none"} confidence=${result.confidence} " +
+                    "elapsedMs=${System.currentTimeMillis() - startedAt} promptTokens=${completion.usage?.promptTokens ?: -1}",
+            )
+            result
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            DiagLog.w("intent.route.failed", "stage=request reason=${error.javaClass.simpleName}:${error.message}")
+            null
+        } finally {
+            client.close()
+        }
+    }
+
     private suspend fun buildMessages(
         userText: String,
         currentUserMessageId: String,
@@ -2102,37 +2473,14 @@ class VoiceAgentService : Service() {
         }
 
         return buildList {
-        add(CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()))
-        val runtimeContext = buildString {
-            appendLine(deviceContextProvider.build(source, currentNetworkLabel()))
-            appendLine()
-            append("Agent 虚拟文件系统：\n")
-            append(executionEnv.virtualRootSummary())
-            append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
-            append(executionEnv.credentialProfileSummary())
-            append("\n\n会话上下文资产快照：\n")
-            append(store.sessionContextSnapshot(skillRegistry.promptSummary()))
-            append("\n\n全局用户规则：\n")
-            append(store.ruleContext(ruleStore))
-            append("\n\n跨会话长期记忆：\n")
-            append(store.contextSummary())
-            if (hubFacts != null) {
-                append("\n\n枢卫 Hub 可派遣 Agent 路由表（已排除当前 Main，facts 只读）：\n")
-                val facts = hubFacts
-                val dispatchableAgents = HubRuntime.dispatchableAgents(facts)
-                if (dispatchableAgents.isEmpty()) {
-                    append("当前没有可用远程 Agent。\n")
-                } else {
-                    dispatchableAgents.forEach { agent ->
-                        val model = listOf(agent.model, agent.version).filter { it.isNotBlank() }.joinToString(" ")
-                        appendLine("- ${agent.agentId}：${agent.name}，类型=${if (agent.companion) "companion" else "executor"}，型号=$model，能力=${agent.capabilities.joinToString(",")}，说明=${agent.description}")
-                    }
-                }
-                appendLine("factsVersion=${facts.factsVersion}，委派时只能使用上表中的 agentId；不得选择 Main 自身或编造 ID。")
-            }
-        }.trim()
-        add(CloudSpeechClient.LlmMessage("system", runtimeContext))
+        addAll(buildSystemMessagePrefix(source, hubFacts))
         addAll(hydratedHistory)
+        add(
+            CloudSpeechClient.LlmMessage(
+                role = "system",
+                content = buildRuntimeSystemContext(source, hubFacts),
+            ),
+        )
         val timestamp = ZonedDateTime.now().format(
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss EEEE XXX", Locale.CHINA),
         )
@@ -2148,7 +2496,6 @@ class VoiceAgentService : Service() {
                         else -> source
                     },
                     network = currentNetworkLabel(),
-                    recentUserTiming = store.recentUserTimingSummary(),
                     turnNote = turnNote,
                 ) + buildString {
                     if (attachments.isNotEmpty()) append("\n本轮附件：\n${attachments.joinToString("\n") { "- $it" }}")
@@ -2168,6 +2515,55 @@ class VoiceAgentService : Service() {
             ),
         )
         }
+    }
+
+    private fun buildSystemMessagePrefix(
+        source: String,
+        hubFacts: com.agent.voiceassistant.hub.HubFacts?,
+    ): List<CloudSpeechClient.LlmMessage> = listOf(
+        CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()),
+    )
+
+    private fun buildRuntimeSystemContext(
+        source: String,
+        hubFacts: com.agent.voiceassistant.hub.HubFacts?,
+    ): String {
+        val runtimeContext = buildString {
+            appendLine(deviceContextProvider.build(source, currentNetworkLabel()))
+            appendLine()
+            append("Agent 虚拟文件系统：\n")
+            append(executionEnv.virtualRootSummary())
+            append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
+            append(executionEnv.credentialProfileSummary())
+            append("\n\n全局用户规则：\n")
+            append(store.ruleContext(ruleStore))
+            append("\n\n跨会话长期记忆：\n")
+            append(store.contextSummary())
+            if (hubFacts != null) {
+                append("\n\n枢卫 Hub 可派遣 Agent 路由表（已排除当前 Main，facts 只读）：\n")
+                val facts = hubFacts
+                val dispatchableAgents = HubRuntime.dispatchableAgents(facts)
+                if (dispatchableAgents.isEmpty()) {
+                    append("当前没有可用远程 Agent。\n")
+                } else {
+                    dispatchableAgents.forEach { agent ->
+                        val model = listOf(agent.model, agent.version).filter { it.isNotBlank() }.joinToString(" ")
+                        appendLine("- ${agent.agentId}：${agent.name}，类型=${if (agent.companion) "companion" else "executor"}，型号=$model，能力=${agent.capabilities.joinToString(",")}，说明=${agent.description}")
+                    }
+                }
+                appendLine("factsVersion=${facts.factsVersion}，委派时只能使用上表中的 agentId；不得选择 Main 自身或编造 ID。")
+            }
+        }.trim()
+        return runtimeContext
+    }
+
+    private fun cachedLocationContext(): String {
+        val location = store.lastLocation() ?: return "位置缓存：暂无可用位置"
+        val ageSeconds = ((System.currentTimeMillis() - location.timestamp).coerceAtLeast(0L) / 1_000L)
+        val place = location.address?.takeIf(String::isNotBlank) ?: "已定位，尚无地址摘要"
+        val accuracy = location.accuracyMeters?.let { "，精度约 ${it.toInt()} 米" }.orEmpty()
+        val stale = if (ageSeconds > 600) "，已过期" else "，仍在有效期内"
+        return "位置缓存：$place；缓存年龄 ${ageSeconds} 秒$accuracy$stale。不得主动输出经纬度。"
     }
 
     private suspend fun hydrateImages(
@@ -2208,6 +2604,15 @@ class VoiceAgentService : Service() {
             else -> "其他网络"
         }
     }.getOrElse { "未知" }
+
+    @SuppressLint("MissingPermission")
+    private fun hasValidatedNetwork(): Boolean = runCatching {
+        val manager = getSystemService(ConnectivityManager::class.java)
+        val network = manager.activeNetwork ?: return@runCatching false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return@runCatching false
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }.getOrDefault(false)
 
     @SuppressLint("MissingPermission")
     private fun cellularNetworkLabel(): String = runCatching {
@@ -2299,12 +2704,22 @@ class VoiceAgentService : Service() {
         speakReplies: Boolean = true,
     ): Boolean {
         val previousConversationId = store.currentConversationId
+        val memorySource = store.conversationForCompression(previousConversationId)
+        val memorySnapshot = memorySource?.let { buildBackgroundSnapshot(previousConversationId) }
+        val memoryProvider = llmProviderRepository.activeProfile()
         store.startNewConversation(reason = text)
         locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
         EventBus.emitConversationUpdate()
-        serviceScope.launch {
-            compactConversationIntoMemory(previousConversationId, userVisible = false)
+        if (memorySource != null && memorySnapshot != null) {
+            enqueueBackgroundTask(
+                BackgroundLlmTask.Memory(
+                    taskId = UUID.randomUUID().toString(),
+                    provider = memoryProvider,
+                    snapshot = memorySnapshot,
+                    source = memorySource,
+                ),
+            )
         }
         if (!greet) {
             emitLog("已开启新会话")
@@ -2361,6 +2776,7 @@ class VoiceAgentService : Service() {
         }
         EventBus.emitConversationBusy(true)
         return try {
+            abortActiveTurnForConversationChange("开启新会话")
             turnMutex.withLock { createNewConversation(text, greet, speakReplies) }
         } finally {
             newConversationInProgress.set(false)
@@ -2401,171 +2817,193 @@ class VoiceAgentService : Service() {
     }
 
     private fun switchConversation(id: String) {
-        if (id.isBlank() || !store.switchConversation(id)) return
+        if (id.isBlank()) return
+        if (!store.switchConversation(id)) return
         EventBus.emitChatReset(store.recentChatMessages())
         EventBus.emitConversationUpdate()
         emitLog("已切换会话")
     }
 
-    private suspend fun compactConversationIntoMemory(id: String, userVisible: Boolean): Boolean {
-        val source = store.conversationForCompression(id) ?: return false
-        val client = runCatching { createLlmClient() }.getOrElse { error ->
-            Timber.w(error, "Conversation memory compression unavailable")
-            if (userVisible) {
-                val message = "无法提炼记忆：${error.message ?: "未配置 LLM"}"
-                emitLog(message)
-                EventBus.emitUserNotice(message)
-            }
-            return false
+    private fun abortActiveTurnForConversationChange(reason: String) {
+        if (agentHarness.abort(reason)) {
+            DiagLog.i("agent.turn.aborted", "reason=$reason", showInUi = true)
         }
-        return try {
-            if (userVisible) emitLog("正在从会话中提炼长期记忆")
-            val drafts = memoryCompactor.compact(client, source, store.memories())
-            store.mergeConversationMemories(source.id, drafts)
-            val message = if (drafts.isEmpty()) "本会话没有需要长期保存的信息" else "已提炼 ${drafts.size} 条长期记忆"
-            emitLog(message)
-            if (userVisible) EventBus.emitUserNotice(message)
-            true
-        } catch (error: Exception) {
-            Timber.w(error, "Conversation memory compression failed id=$id")
-            if (userVisible) {
-                val message = "提炼记忆失败：${error.message ?: error.javaClass.simpleName}"
-                emitLog(message)
-                EventBus.emitUserNotice(message)
-            }
-            false
-        } finally {
-            client.close()
-        }
+        checkpointWriteJob?.cancel()
+        runCatching { activeTurnCheckpointStore.clear() }
+            .onFailure { Timber.w(it, "Active turn checkpoint clear failed") }
     }
 
-    private fun scheduleTurnReflection(
-        record: TurnReflectionRecord,
-        contextMessages: List<CloudSpeechClient.LlmMessage>,
-        tools: List<CloudSpeechClient.ToolDefinition>,
-    ) {
-        serviceScope.launch {
-            reflectionMutex.withLock {
-                runTurnReflection(record, contextMessages, tools)
-            }
+    private fun enqueueMemoryCompaction(conversationId: String) {
+        val source = store.conversationForCompression(conversationId)
+        if (source == null) {
+            DiagLog.i("background.llm.skipped", "purpose=memory_compaction conversation=$conversationId reason=no_source")
+            return
         }
-    }
-
-    private suspend fun runTurnReflection(
-        record: TurnReflectionRecord,
-        contextMessages: List<CloudSpeechClient.LlmMessage>,
-        tools: List<CloudSpeechClient.ToolDefinition>,
-    ) {
-        val baseMessages = contextMessages + CloudSpeechClient.LlmMessage(
-            role = "system",
-            content = buildReflectionInstruction(record),
+        val snapshot = runCatching { buildBackgroundSnapshot(conversationId) }.getOrElse { error ->
+            DiagLog.w(
+                "background.llm.snapshot_failed",
+                "purpose=memory_compaction conversation=$conversationId reason=${error.javaClass.simpleName}:${error.message}",
+            )
+            return
+        }
+        enqueueBackgroundTask(
+            BackgroundLlmTask.Memory(
+                taskId = UUID.randomUUID().toString(),
+                provider = llmProviderRepository.activeProfile(),
+                snapshot = snapshot,
+                source = source,
+            ),
         )
-        var correction = ""
-        var lastFailure = "unknown"
-        repeat(3) { attempt ->
-            val client = runCatching { createLlmClient(silent = true) }.getOrElse { error ->
-                lastFailure = error.message ?: error.javaClass.simpleName
-                return@repeat
-            }
+    }
+
+    private fun buildBackgroundSnapshot(conversationId: String): List<CloudSpeechClient.LlmMessage> {
+        val cachedHubFacts = HubRuntime.facts().value.takeIf {
+            HubRuntime.state().value == HubConnectionState.CONNECTED && it.eventId.isNotBlank()
+        }
+        return (buildSystemMessagePrefix("background", cachedHubFacts) + store.llmHistoryForConversation(conversationId)).map { message ->
+            message.copy(reasoningContent = null, responseMetadata = null)
+        }
+    }
+
+    private fun enqueueBackgroundTask(task: BackgroundLlmTask) {
+        val result = backgroundLlmTasks.trySend(task)
+        if (result.isSuccess) {
+            DiagLog.i(
+                "background.llm.queued",
+                    "purpose=${task.purpose} task=${task.taskId} provider=${task.provider.id} " +
+                        "model=${task.provider.modelId} messages=${task.snapshot.size}",
+            )
+        } else {
+            DiagLog.w(
+                "background.llm.queue_failed",
+                "purpose=${task.purpose} task=${task.taskId} reason=${result.exceptionOrNull()?.message ?: "channel_closed"}",
+            )
+        }
+    }
+
+    private suspend fun backgroundLlmWorker() {
+        for (task in backgroundLlmTasks) {
             try {
-                val messages = if (correction.isBlank()) {
-                    baseMessages
-                } else {
-                    baseMessages + CloudSpeechClient.LlmMessage("system", correction)
+                when (task) {
+                    is BackgroundLlmTask.Memory -> runMemoryCompaction(task)
                 }
-                val completion = withTimeoutOrNull(60_000) {
-                    client.streamChat(
-                        CloudSpeechClient.ChatRequest(
-                            messages = messages,
-                            tools = tools,
-                            thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
-                            maxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
-                        ),
-                    ) { }
-                }
-                if (completion == null) {
-                    lastFailure = "timeout"
-                    correction = reflectionRepairInstruction("上次反思请求超时")
-                    return@repeat
-                }
-                if (completion.message.toolCalls.isNotEmpty()) {
-                    lastFailure = "tool_call_returned"
-                    correction = reflectionRepairInstruction("上次返回了工具调用")
-                    return@repeat
-                }
-                val content = completion.message.content.orEmpty().trim()
-                val parsed = ReflectionValidator.parse(content)
-                if (parsed.isFailure) {
-                    lastFailure = parsed.exceptionOrNull()?.message ?: "invalid_json"
-                    correction = reflectionRepairInstruction("上次输出校验失败：$lastFailure")
-                    return@repeat
-                }
-                reflectionStore.save(
-                    record.copy(
-                        status = "completed",
-                        analysis = parsed.getOrThrow(),
-                        rawReflection = content,
-                        attemptCount = attempt + 1,
-                        completedAt = System.currentTimeMillis(),
-                    ),
-                )
-                DiagLog.i(
-                    "agent.reflection.completed",
-                    "turn=${record.turnId} attempts=${attempt + 1} triggers=${record.triggerReasons.joinToString("|")}",
-                )
-                return
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
-                lastFailure = error.message ?: error.javaClass.simpleName
-                correction = reflectionRepairInstruction("上次反思请求失败：$lastFailure")
+                DiagLog.w(
+                    "background.llm.worker_failed",
+                    "purpose=${task.purpose} task=${task.taskId} reason=${error.javaClass.simpleName}:${error.message}",
+                )
+            }
+        }
+    }
+
+    private suspend fun runMemoryCompaction(task: BackgroundLlmTask.Memory) {
+        val instruction = memoryCompactor.instruction(task.source, store.memories())
+        val result = executeBackgroundLlm(task, instruction, memoryCompactor::parseStrict)
+        result.onSuccess { output ->
+            store.mergeConversationMemories(task.source.id, output.value)
+            DiagLog.i(
+                "background.memory.completed",
+                "task=${task.taskId} conversation=${task.source.id} memories=${output.value.size} " +
+                    "attempts=${output.attemptCount} model=${output.modelId}",
+            )
+        }.onFailure { error ->
+            DiagLog.w(
+                "background.memory.failed",
+                "task=${task.taskId} conversation=${task.source.id} attempts=3 " +
+                    "reason=${error.javaClass.simpleName}:${error.message}",
+            )
+        }
+    }
+
+    private suspend fun <T> executeBackgroundLlm(
+        task: BackgroundLlmTask,
+        instruction: String,
+        parser: (String) -> Result<T>,
+    ): Result<BackgroundLlmResult<T>> {
+        var lastFailure: Throwable = IOException("后台 LLM 请求未执行")
+        repeat(3) { attemptIndex ->
+            val attempt = attemptIndex + 1
+            val config = runCatching { backgroundLlmConfig(task.provider, attempt) }.getOrElse { error ->
+                lastFailure = error
+                logBackgroundAttemptFailure(task, attempt, null, error)
+                return@repeat
+            }
+            val requestId = "${task.taskId}:$attempt"
+            val client = OpenAiCompatibleLlmClient(config)
+            try {
+                DiagLog.i(
+                    "background.llm.attempt_started",
+                    "purpose=${task.purpose} task=${task.taskId} attempt=$attempt/3 " +
+                        "provider=${if (BackgroundLlmRetryPlan.usesDefaultProvider(task.provider.builtIn, attempt)) LlmProviderRepository.BUILT_IN_ID else task.provider.id} " +
+                        "model=${config.modelName} request=$requestId",
+                )
+                val completion = withTimeoutOrNull(60_000L) {
+                    client.streamChat(
+                        CloudSpeechClient.ChatRequest(
+                            messages = task.snapshot + CloudSpeechClient.LlmMessage("system", instruction),
+                            tools = emptyList(),
+                            thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
+                            maxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
+                            responseFormat = CloudSpeechClient.ResponseFormat.JSON_OBJECT,
+                            transportAttemptLimit = 1,
+                            requestId = requestId,
+                        ),
+                    ) { }
+                } ?: throw NetworkTimeoutException("background ${task.purpose}", timeoutSeconds = 60)
+                requireValidBackgroundCompletion(completion)
+                val content = completion.message.content.orEmpty().trim()
+                val parsed = parser(content).getOrThrow()
+                DiagLog.i(
+                    "background.llm.attempt_completed",
+                    "purpose=${task.purpose} task=${task.taskId} attempt=$attempt/3 model=${completion.modelId ?: config.modelName} " +
+                        "contentChars=${content.length} reasoningChars=${completion.message.reasoningContent.orEmpty().length} " +
+                        "finish=${completion.finishReason} normalEnd=${completion.streamDiagnostics.hasNormalEnd}",
+                )
+                return Result.success(
+                    BackgroundLlmResult(parsed, completion, attempt, completion.modelId ?: config.modelName),
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                lastFailure = error
+                logBackgroundAttemptFailure(task, attempt, config, error)
             } finally {
                 client.close()
             }
         }
-        reflectionStore.save(
-            record.copy(
-                status = "failed",
-                attemptCount = 3,
-                completedAt = System.currentTimeMillis(),
-            ),
-        )
-        DiagLog.w("agent.reflection.failed", "turn=${record.turnId} reason=$lastFailure")
+        return Result.failure(lastFailure)
     }
 
-    private fun buildReflectionInstruction(record: TurnReflectionRecord): String = buildString {
-        appendLine("这是内部反思回合，不是用户的新请求。切勿调用任何工具，不得向用户答复。")
-        appendLine("请结合前面的完整会话和本回合运行轨迹，判断用户实际交办了什么任务、任务性质、是否更适合委派，以及本次为什么没有或已经进行了委派。")
-        appendLine("反思结果仅用于影子统计，不会直接改变路由策略。不要输出思考过程，只输出一个严格 JSON 对象，不要使用 Markdown 代码围栏。")
-        appendLine("本回合客观指标：${Json.encodeToString(record.metrics)}")
-        appendLine("触发原因：${record.triggerReasons.joinToString("；")}")
-        appendLine("JSON 必须严格包含以下字段：")
-        appendLine(
-            "{\"title\":\"[反思] 简短标题\",\"taskSummary\":\"任务摘要\"," +
-                "\"taskNature\":[\"research\"],\"complexity\":\"low|medium|high\"," +
-                "\"delegationAssessment\":\"prefer_delegate|prefer_local|uncertain\"," +
-                "\"preferredCapabilities\":[\"research\"],\"whyDelegateOrNot\":\"判断依据\"," +
-                "\"whyNotDelegated\":\"未委派原因；已委派则说明触发原因\"," +
-                "\"lesson\":\"可供统计归纳的经验\",\"confidence\":0.0}",
-        )
-    }
-
-    private fun reflectionRepairInstruction(reason: String): String =
-        "$reason。请重新完成内部反思。不得调用任何工具，只能输出上一条系统消息指定的严格 JSON 对象。"
-
-    private fun reflectionContextHash(messages: List<CloudSpeechClient.LlmMessage>): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        messages.forEach { message ->
-            digest.update(message.role.toByteArray())
-            digest.update(message.content.orEmpty().toByteArray())
-            message.toolCalls.forEach { call ->
-                digest.update(call.id.toByteArray())
-                digest.update(call.name.toByteArray())
-                digest.update(call.arguments.toByteArray())
-            }
-            message.imageInputs.forEach { image -> digest.update(image.base64Data.toByteArray()) }
+    private fun backgroundLlmConfig(provider: LlmProviderProfile, attempt: Int): LLMConfig =
+        if (BackgroundLlmRetryPlan.usesDefaultProvider(provider.builtIn, attempt)) {
+            capabilityResolver.defaultLlmConfig()
+        } else {
+            llmProviderRepository.runtimeConfig(provider)
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+
+    private fun requireValidBackgroundCompletion(completion: CloudSpeechClient.ChatCompletion) {
+        val diagnostics = completion.streamDiagnostics
+        require(completion.message.toolCalls.isEmpty()) { "结构化后台请求返回了工具调用" }
+        require(completion.message.content?.isNotBlank() == true) { "结构化后台请求返回空正文" }
+        require(completion.finishReason != "length") { "结构化后台响应被长度限制截断" }
+        require(diagnostics.hasNormalEnd) { "结构化后台流缺少结束标记" }
+        require(diagnostics.malformedEventCount == 0) { "结构化后台流包含损坏事件" }
+        require(diagnostics.interruptionReason == null) { "结构化后台流中断：${diagnostics.interruptionReason}" }
+    }
+
+    private fun logBackgroundAttemptFailure(
+        task: BackgroundLlmTask,
+        attempt: Int,
+        config: LLMConfig?,
+        error: Throwable,
+    ) {
+        DiagLog.w(
+            "background.llm.attempt_failed",
+            "purpose=${task.purpose} task=${task.taskId} attempt=$attempt/3 model=${config?.modelName ?: "unavailable"} " +
+                "reason=${error.javaClass.simpleName}:${error.message}",
+        )
     }
 
     private fun logTurnMetrics(metrics: TurnMetrics, triggers: List<String>) {
@@ -2596,7 +3034,7 @@ class VoiceAgentService : Service() {
                 }
                 val message = "自定义 LLM 当前不可用，已切回默认模型。原因：$reason"
                 if (silent) {
-                    DiagLog.w("agent.reflection.fallback", message)
+                    DiagLog.w("intent.route.fallback", message)
                 } else {
                     store.addMessage("system", message)
                     EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
@@ -3261,8 +3699,12 @@ class VoiceAgentService : Service() {
             return
         }
         dormant = true
-        if (cancelConversationLoop) loopJob?.cancel()
-        loopJob = null
+        val unfinishedTurn = agentHarness.state.value in setOf(
+            MainAgentHarness.State.WAITING_RETRY,
+            MainAgentHarness.State.WAITING_RECOVERY,
+        )
+        if (cancelConversationLoop && !unfinishedTurn) loopJob?.cancel()
+        if (!unfinishedTurn) loopJob = null
         recorder?.stop()
         recorder = null
         player?.let { releasePlayer(it) }

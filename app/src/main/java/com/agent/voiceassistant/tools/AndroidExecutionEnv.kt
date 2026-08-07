@@ -80,11 +80,15 @@ class AndroidExecutionEnv(
     val disabledSkillsRoot = File(runtimeRoot, "skills-disabled")
     val deletedSkillsManifest = File(runtimeRoot, "skills-deleted")
     val modifiedSkillsManifest = File(runtimeRoot, "skills-user-modified")
-    private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot, skillsRoot)
+    val systemSkillsRoot = File(runtimeRoot, "system-skills")
+    val disabledSystemSkillsManifest = File(runtimeRoot, "system-skills-disabled")
+    private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot)
     private val workspaceTrash = WorkspaceTrashRepository(appContext)
 
     init {
-        listOf(runtimeRoot, logsRoot, workspaceRoot, skillsRoot, disabledSkillsRoot).forEach(File::mkdirs)
+        makeWritable(systemSkillsRoot)
+        systemSkillsRoot.deleteRecursively()
+        listOf(runtimeRoot, logsRoot, workspaceRoot, skillsRoot, disabledSkillsRoot, systemSkillsRoot).forEach(File::mkdirs)
         installAssetTree("source", sourceRoot, marker = fingerprintAssetTree("source"))
         installBundledSkills()
     }
@@ -207,6 +211,9 @@ class AndroidExecutionEnv(
         require(argv.isNotEmpty()) { "argv 不能为空" }
         require(argv.size <= MAX_EXEC_ARGV_ITEMS) { "argv 项目过多" }
         require(argv.none { it.length > MAX_EXEC_ARG_CHARS }) { "argv 参数过长" }
+        require(argv.none { argument -> argument.replace('\\', '/').split('/').contains("..") }) {
+            "exec 参数不能通过 .. 离开已授权虚拟目录"
+        }
         val displayCommand = argv.joinToString(" ") { argument ->
             if (argument.any(Char::isWhitespace)) "\"${argument.replace("\"", "\\\"")}" else argument
         }
@@ -321,8 +328,7 @@ class AndroidExecutionEnv(
     fun virtualRootSummary(): String = buildString {
         appendLine("/source：随 APK 构建的只读源码快照")
         appendLine("/logs：应用轮转日志，只读")
-        appendLine("/workspace：Agent 可读写工作区")
-        append("/skills：已安装 Skill")
+        append("/workspace：Agent 可读写工作区。Skill 目录不属于通用虚拟文件系统，只能通过 Skill 专用工具访问。")
     }
 
     fun credentialProfileSummary(): String {

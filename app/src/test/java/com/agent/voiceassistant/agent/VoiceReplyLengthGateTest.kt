@@ -7,9 +7,10 @@ import org.junit.Test
 
 class VoiceReplyLengthGateTest {
     @Test
-    fun countsOnlyVisibleLettersAndDigits() {
-        assertEquals(4, VoiceReplyLengthGate.countVisible("你好，世界！<DETAILS>隐藏内容</DETAILS>"))
-        assertEquals(2, VoiceReplyLengthGate.countVisible("```json\n{\"ok\":true}\n```测试"))
+    fun countsHanAndNonHanThresholdsIndependently() {
+        assertFalse(VoiceReplyLengthGate.shouldSummarize("汉".repeat(49), threshold = 50))
+        assertTrue(VoiceReplyLengthGate.shouldSummarize("汉".repeat(50), threshold = 50))
+        assertTrue(VoiceReplyLengthGate.shouldSummarize("a".repeat(50), threshold = 50))
     }
 
     @Test

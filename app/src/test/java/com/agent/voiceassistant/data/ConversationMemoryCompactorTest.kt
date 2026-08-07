@@ -29,4 +29,21 @@ class ConversationMemoryCompactorTest {
 
         assertTrue(result.isEmpty())
     }
+
+    @Test
+    fun `strict parser accepts an explicit empty result`() {
+        val result = compactor.parseStrict("""{"memories":[]}""")
+
+        assertTrue(result.isSuccess)
+        assertTrue(result.getOrThrow().isEmpty())
+    }
+
+    @Test
+    fun `strict parser rejects malformed memory rather than treating it as empty`() {
+        val result = compactor.parseStrict(
+            """{"memories":[{"content":"没有证据","category":"profile","tags":[],"evidence_message_ids":[]}]}""",
+        )
+
+        assertTrue(result.isFailure)
+    }
 }

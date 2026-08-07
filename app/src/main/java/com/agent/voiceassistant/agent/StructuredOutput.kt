@@ -65,10 +65,11 @@ object StructuredOutputParser {
         val visible = executableBody(raw)
         if (looseToolXmlPattern.containsMatchIn(visible)) return true
         val stripped = stripCodeFence(visible).trim()
-        if (!(stripped.startsWith('{') || stripped.startsWith('['))) return false
-        return actionTypeJsonPattern.containsMatchIn(stripped) ||
-            namedFunctionJsonPattern.containsMatchIn(stripped) ||
+        if (namedFunctionJsonPattern.containsMatchIn(stripped) ||
             toolPayloadJsonPattern.containsMatchIn(stripped)
+        ) return true
+        if (!(stripped.startsWith('{') || stripped.startsWith('['))) return false
+        return actionTypeJsonPattern.containsMatchIn(stripped)
     }
 
     /**
@@ -106,15 +107,62 @@ object StructuredOutputParser {
 
         if (calls.isEmpty()) {
             parseJsonToolCalls(visible).forEach(calls::add)
-            if (calls.isEmpty() && pseudoFunctionPattern.matches(visible)) {
-                parsePseudoToolCall(visible)?.let { action ->
-                    calls += BodyToolCall(action.actionType, action.payload)
+            if (calls.isEmpty()) {
+                extractJsonObjects(visible)
+                    .flatMap(::parseJsonToolCalls)
+                    .forEach(calls::add)
+            }
+            if (calls.isEmpty()) {
+                pseudoFunctionPattern.findAll(visible).forEach { match ->
+                    parsePseudoToolCall(match.value)?.let { action ->
+                        calls += BodyToolCall(action.actionType, action.payload)
+                    }
                 }
             }
         }
         return calls
             .filter { it.name.matches(Regex("[A-Za-z0-9_-]{1,128}")) }
             .distinctBy { "${it.name}:${it.arguments}" }
+    }
+
+    private fun extractJsonObjects(raw: String): List<String> {
+        val candidates = mutableListOf<String>()
+        var start = 0
+        while (start < raw.length) {
+            val opening = raw.indexOf('{', start)
+            if (opening < 0) break
+            var depth = 0
+            var inString = false
+            var escaped = false
+            var end = -1
+            for (index in opening until raw.length) {
+                val ch = raw[index]
+                if (inString) {
+                    if (escaped) escaped = false
+                    else if (ch == '\\') escaped = true
+                    else if (ch == '"') inString = false
+                    continue
+                }
+                when (ch) {
+                    '"' -> inString = true
+                    '{' -> depth += 1
+                    '}' -> {
+                        depth -= 1
+                        if (depth == 0) {
+                            end = index
+                            break
+                        }
+                    }
+                }
+            }
+            if (end >= 0) {
+                candidates += raw.substring(opening, end + 1)
+                start = end + 1
+            } else {
+                start = opening + 1
+            }
+        }
+        return candidates
     }
 
     fun parse(raw: String): AgentOutput {

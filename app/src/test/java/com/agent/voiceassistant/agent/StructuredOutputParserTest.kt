@@ -94,6 +94,17 @@ class StructuredOutputParserTest {
     }
 
     @Test
+    fun `parses json tool call after natural language prefix`() {
+        val raw = "让我先查一下最近的日志。 {\"name\":\"read\",\"arguments\":{\"path\":\"/logs\"}}"
+
+        assertTrue(StructuredOutputParser.containsToolProtocol(raw))
+        val call = StructuredOutputParser.parseBodyToolCalls(raw).single()
+
+        assertEquals("read", call.name)
+        assertEquals("/logs", call.arguments["path"]?.toString()?.trim('"'))
+    }
+
+    @Test
     fun `does not parse tool example inside details`() {
         val raw = """
             <DETAILS>

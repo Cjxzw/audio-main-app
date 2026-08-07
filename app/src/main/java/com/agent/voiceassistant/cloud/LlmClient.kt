@@ -27,6 +27,7 @@ import timber.log.Timber
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 
 interface LlmClient {
@@ -60,12 +61,13 @@ class OpenAiCompatibleLlmClient(
         onEvent: suspend (CloudSpeechClient.ChatStreamEvent) -> Unit,
     ): CloudSpeechClient.ChatCompletion {
         var firstTimeout: FirstEventTimeoutException? = null
-        repeat(MAX_NETWORK_ATTEMPTS) { attempt ->
+        val attemptLimit = request.transportAttemptLimit.coerceIn(1, MAX_NETWORK_ATTEMPTS)
+        repeat(attemptLimit) { attempt ->
             try {
                 return streamChatOnce(request, onEvent)
             } catch (error: FirstEventTimeoutException) {
                 firstTimeout = error
-                if (attempt + 1 < MAX_NETWORK_ATTEMPTS) {
+                if (attempt + 1 < attemptLimit) {
                     Timber.w("LLM first event timeout; retrying chat request")
                 }
             }
@@ -121,13 +123,20 @@ class OpenAiCompatibleLlmClient(
     internal fun buildChatPayload(request: CloudSpeechClient.ChatRequest): JsonObject = buildJsonObject {
         put("model", config.modelName)
         put("stream", true)
+        val supportsNativeThinking = config.providerMode == LlmProviderMode.MIMO ||
+            config.modelName.startsWith("deepseek", ignoreCase = true)
         if (config.providerMode == LlmProviderMode.MIMO) {
             put("max_completion_tokens", request.maxCompletionTokens)
+        } else {
+            put("max_tokens", request.maxCompletionTokens)
+        }
+        if (supportsNativeThinking) {
             putJsonObject("thinking") {
                 put("type", request.thinkingMode.wireValue)
             }
-        } else {
-            put("max_tokens", request.maxCompletionTokens)
+        }
+        if (request.responseFormat == CloudSpeechClient.ResponseFormat.JSON_OBJECT) {
+            putJsonObject("response_format") { put("type", "json_object") }
         }
         if (request.thinkingMode == CloudSpeechClient.ThinkingMode.DISABLED) {
             put("temperature", config.temperature)
@@ -137,7 +146,7 @@ class OpenAiCompatibleLlmClient(
                 message.toolCalls.forEach(ToolCallSafety::requireValid)
                 add(message.toJson())
             }
-            if (config.providerMode == LlmProviderMode.OPENAI_COMPATIBLE &&
+            if (!supportsNativeThinking &&
                 request.thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED
             ) {
                 add(
@@ -170,19 +179,50 @@ class OpenAiCompatibleLlmClient(
         onEvent: suspend (CloudSpeechClient.ChatStreamEvent) -> Unit,
     ): CloudSpeechClient.ChatCompletion = coroutineScope {
         val accumulator = ChatStreamAccumulator()
+        var receivedDoneMarker = false
+        var reachedEof = false
+        var malformedEventCount = 0
+        var streamingProtocol = false
         val call = newJsonCall(buildChatPayload(request)).also {
             // The read timeout remains an idle-stream limit. A continuously streaming reply
             // gets a longer bounded budget so it is not cancelled at the old 60-second mark.
             it.timeout().timeout(STREAM_HARD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         }
         val receivedEvent = AtomicBoolean(false)
+        val streamStartedAtMs = monotonicNowMs()
+        val lastProgressAtMs = AtomicLong(streamStartedAtMs)
         val firstEventTimedOut = AtomicBoolean(false)
+        val streamIdleTimedOut = AtomicBoolean(false)
         val cancellation = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+        fun withDiagnostics(
+            completion: CloudSpeechClient.ChatCompletion,
+            interruptionReason: String? = null,
+        ): CloudSpeechClient.ChatCompletion = completion.copy(
+            modelId = config.modelName,
+            streamDiagnostics = completion.streamDiagnostics.copy(
+                protocolObserved = streamingProtocol,
+                receivedDoneMarker = receivedDoneMarker,
+                reachedEof = reachedEof,
+                malformedEventCount = completion.streamDiagnostics.malformedEventCount + malformedEventCount,
+                interruptionReason = interruptionReason ?: completion.streamDiagnostics.interruptionReason,
+            ),
+        )
         val watchdog = launch(Dispatchers.IO) {
-            delay(FIRST_EVENT_TIMEOUT_MS)
-            if (!receivedEvent.get()) {
-                firstEventTimedOut.set(true)
-                call.cancel()
+            while (true) {
+                delay(STREAM_WATCHDOG_POLL_MS)
+                val idleMs = monotonicNowMs() - lastProgressAtMs.get()
+                val timeoutMs = if (receivedEvent.get()) STREAM_IDLE_TIMEOUT_MS else firstEventTimeoutMs(request)
+                if (idleMs >= timeoutMs) {
+                    if (receivedEvent.get()) streamIdleTimedOut.set(true)
+                    else firstEventTimedOut.set(true)
+                    Timber.w(
+                        "LLM stream watchdog requestId=${request.requestId} " +
+                            "phase=${if (receivedEvent.get()) "idle" else "first_event"} " +
+                            "idleMs=$idleMs timeoutMs=$timeoutMs",
+                    )
+                    call.cancel()
+                    return@launch
+                }
             }
         }
 
@@ -199,33 +239,61 @@ class OpenAiCompatibleLlmClient(
                         val events = accumulator.accept(element)
                         if (events.isNotEmpty()) {
                             receivedEvent.set(true)
-                            watchdog.cancel()
+                            lastProgressAtMs.set(monotonicNowMs())
                         }
                         events.forEach { onEvent(it) }
                         return@withContext
                     }
+                    streamingProtocol = true
                     val source = body.source()
                     while (true) {
-                        val line = source.readUtf8Line() ?: break
+                        val line = source.readUtf8Line()
+                        if (line == null) {
+                            reachedEof = true
+                            break
+                        }
                         if (!line.startsWith("data:")) continue
                         val data = line.removePrefix("data:").trim()
-                        if (data == "[DONE]") break
+                        if (data == "[DONE]") {
+                            receivedDoneMarker = true
+                            break
+                        }
                         val element = runCatching {
                             kotlinx.serialization.json.Json.parseToJsonElement(data)
-                        }.getOrNull() ?: continue
+                        }.getOrNull()
+                        if (element == null) {
+                            malformedEventCount += 1
+                            continue
+                        }
                         val events = accumulator.accept(element)
                         if (events.isNotEmpty()) {
                             receivedEvent.set(true)
-                            watchdog.cancel()
+                            lastProgressAtMs.set(monotonicNowMs())
                         }
                         events.forEach { onEvent(it) }
                     }
                 }
             }
-            accumulator.complete()
+            val completion = accumulator.complete()
+            withDiagnostics(completion)
         } catch (error: IOException) {
             if (firstEventTimedOut.get() && !receivedEvent.get()) {
                 throw FirstEventTimeoutException(error)
+            }
+            if (receivedEvent.get() && streamingProtocol) {
+                val interruption = if (streamIdleTimedOut.get()) {
+                    "idle_watchdog"
+                } else {
+                    "transport_${error.javaClass.simpleName}"
+                }
+                Timber.w(
+                    "LLM stream interrupted after output requestId=${request.requestId} " +
+                        "reason=$interruption; returning partial completion for continuation",
+                )
+                return@coroutineScope withDiagnostics(accumulator.complete(), interruption)
+            }
+            if (streamIdleTimedOut.get()) {
+                throw StreamIdleTimeoutException(error)
             }
             throw error
         } finally {
@@ -302,6 +370,21 @@ class OpenAiCompatibleLlmClient(
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         const val FIRST_EVENT_TIMEOUT_MS = 15_000L
         const val STREAM_HARD_TIMEOUT_SECONDS = 120L
+        const val STREAM_IDLE_TIMEOUT_MS = 45_000L
+        const val STREAM_WATCHDOG_POLL_MS = 250L
         const val MAX_NETWORK_ATTEMPTS = 2
+
+        fun monotonicNowMs(): Long = System.nanoTime() / 1_000_000L
+
+        fun firstEventTimeoutMs(request: CloudSpeechClient.ChatRequest): Long {
+            val promptChars = request.messages.sumOf { message ->
+                message.content.orEmpty().length + message.reasoningContent.orEmpty().length
+            }
+            return when {
+                promptChars >= 50_000 -> 45_000L
+                promptChars >= 20_000 -> 30_000L
+                else -> FIRST_EVENT_TIMEOUT_MS
+            }
+        }
     }
 }

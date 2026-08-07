@@ -18,7 +18,11 @@ class FallbackLlmClient(
         var producedOutput = false
         return try {
             val completion = primary.streamChat(request) { event ->
-                if (event !is CloudSpeechClient.ChatStreamEvent.Finished) producedOutput = true
+                if (event is CloudSpeechClient.ChatStreamEvent.ContentDelta ||
+                    event is CloudSpeechClient.ChatStreamEvent.ToolCallDelta
+                ) {
+                    producedOutput = true
+                }
                 onEvent(event)
             }
             if (completion.message.content.isNullOrBlank() && completion.message.toolCalls.isEmpty()) {

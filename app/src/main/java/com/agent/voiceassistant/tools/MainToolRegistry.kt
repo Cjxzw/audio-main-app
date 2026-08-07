@@ -17,6 +17,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import java.security.MessageDigest
 
 class MainToolRegistry(
     private val executor: LocalToolExecutor,
@@ -49,39 +50,39 @@ class MainToolRegistry(
     fun definitions(
         profile: Profile = Profile.STANDALONE,
         allowReasoningEscalation: Boolean,
-    ): List<CloudSpeechClient.ToolDefinition> = buildList {
-        add(memoryCreate())
-        add(memorySearch())
-        add(locationRefresh())
-        add(locationReverseGeocode())
-        add(weatherCurrent())
-        add(webSearch())
-        add(agentSleep())
-        add(voiceReply())
-        add(singSong())
-        add(taskStatus())
-        add(cancelTask())
-        add(readFile())
-        add(writeFile())
-        add(workspaceDelete())
-        add(execCommand())
-        add(httpRequest())
-        add(codeGraphSearch())
-        add(codeGraphExplain())
-        add(skillRegister())
-        if (allowReasoningEscalation) add(reasoningEscalation())
+    ): List<CloudSpeechClient.ToolDefinition> = listOf(
+        memoryCreate(),
+        memorySearch(),
+        locationRefresh(),
+        locationReverseGeocode(),
+        weatherCurrent(),
+        webSearch(),
+        readFile(),
+        writeFile(),
+        workspaceDelete(),
+        execCommand(),
+        httpRequest(),
+        codeGraphSearch(),
+        codeGraphExplain(),
+        skillRegister(),
+        skillUse(),
+        voiceReply(),
+        singSong(),
+        taskStatus(),
+        cancelTask(),
+        agentSleep(),
+        hubDispatchTask(),
+    )
 
-        if (profile == Profile.CONNECTED) add(hubDispatchTask())
-    }
-
-    fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean =
-        call.name == TOOL_REQUEST_DEEP_REASONING
+    fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean = false
 
     fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean =
         call.name == TOOL_VOICE_REPLY || call.name == TOOL_AGENT_SLEEP
 
     fun isAgentSleep(call: CloudSpeechClient.ToolCall): Boolean =
         call.name == TOOL_AGENT_SLEEP
+
+    fun isNativeTool(name: String): Boolean = name in NATIVE_TOOL_NAMES
 
     fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall): String =
         (parseArguments(call.arguments)["reason"] as? JsonPrimitive)
@@ -117,6 +118,7 @@ class MainToolRegistry(
             TOOL_LOCATION_REVERSE_GEOCODE -> "location.reverse_geocode"
             TOOL_WEATHER_CURRENT -> "weather.get_current"
             TOOL_WEB_SEARCH -> "web.search"
+            TOOL_SKILL_USE -> "skill.use"
             TOOL_READ -> "read"
             TOOL_WRITE -> "write"
             TOOL_WORKSPACE_DELETE -> "workspace.delete"
@@ -124,6 +126,8 @@ class MainToolRegistry(
             TOOL_HTTP_REQUEST -> "http_request"
             TOOL_CODE_GRAPH_SEARCH -> "code.graph.search"
             TOOL_CODE_GRAPH_EXPLAIN -> "code.graph.explain"
+            TOOL_SKILL_CREATE -> "skill.create"
+            TOOL_SKILL_EDIT -> "skill.edit"
             TOOL_SKILL_REGISTER -> "skill.register"
             else -> call.name
         }
@@ -161,21 +165,34 @@ class MainToolRegistry(
             )
         }
         val context = taskContext()
+        val actionPayload = buildJsonObject {
+            put("targetAgentId", target!!)
+            put("task", buildJsonObject {
+                put("title", title!!)
+                put("summary", summary!!)
+                put("urgency", payload.text("urgency") ?: "normal")
+                put("instructions", instructions!!)
+                put("expectedOutput", expectedOutput!!)
+            })
+        }
+        val idempotencyKey = buildString {
+            append("dispatch:")
+            append(context.sourceTurnId)
+            append(':')
+            append(
+                MessageDigest.getInstance("SHA-256")
+                    .digest(actionPayload.toString().toByteArray())
+                    .joinToString("") { "%02x".format(it) }
+                    .take(24),
+            )
+        }
         val result = runCatching {
             HubRuntime.submitAction(
                 actionType = "dispatch_task",
-                payload = buildJsonObject {
-                    put("targetAgentId", target!!)
-                    put("task", buildJsonObject {
-                        put("title", title!!)
-                        put("summary", summary!!)
-                        put("urgency", payload.text("urgency") ?: "normal")
-                        put("instructions", instructions!!)
-                        put("expectedOutput", expectedOutput!!)
-                    })
-                },
+                payload = actionPayload,
                 turnId = context.sourceTurnId,
                 conversationId = context.conversationId,
+                idempotencyKey = idempotencyKey,
             )
         }.getOrElse { error ->
             return LocalToolExecutor.ToolResult(
@@ -220,7 +237,7 @@ class MainToolRegistry(
 
     private fun hubDispatchTask() = tool(
         name = TOOL_HUB_DISPATCH_TASK,
-        description = "通过枢卫 Hub 将重型任务交给当前路由表中的在线远程 Agent。只有用户明确要求后台执行、调研、编码或长任务时调用；必须从 Hub facts 选择真实 target_agent_id，不得编造 Agent。",
+        description = "创建一个 subagent 任务并通过枢卫 Hub 交给外部执行代理。这是 Main 的核心能力：调研、编码、长耗时、多步骤或需要专门能力的任务应优先委派给 subagent。根据 Hub 路由表中的能力、类型和说明选择最合适的在线执行器；必须使用真实 target_agent_id，不得选择 Main 自身或编造 Agent。",
         required = listOf("target_agent_id", "title", "summary", "instructions", "expected_output"),
     ) {
         putJsonObject("target_agent_id") { put("type", "string") }
@@ -312,6 +329,9 @@ class MainToolRegistry(
         TOOL_LOCATION_REVERSE_GEOCODE -> "解析当前位置"
         TOOL_WEATHER_CURRENT -> "查询天气"
         TOOL_WEB_SEARCH -> "网络搜索"
+        TOOL_SKILL_USE -> "使用 Skill"
+        TOOL_SKILL_CREATE -> "创建 Skill"
+        TOOL_SKILL_EDIT -> "编辑 Skill"
         TOOL_READ -> "读取文件"
         TOOL_WRITE -> "写入文件"
         TOOL_WORKSPACE_DELETE -> "移入回收站"
@@ -320,7 +340,6 @@ class MainToolRegistry(
         TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
         TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
         TOOL_SKILL_REGISTER -> "注册 Skill"
-        TOOL_REQUEST_DEEP_REASONING -> "开启深度思考"
         TOOL_AGENT_SLEEP -> "进入休眠"
         TOOL_VOICE_REPLY -> "个性化播报"
         TOOL_SING_SONG -> "准备歌曲"
@@ -342,6 +361,8 @@ class MainToolRegistry(
                 .joinToString(" · ")
                 .ifBlank { "当前位置" }
             TOOL_WEB_SEARCH -> payload.text("query")
+            TOOL_SKILL_USE -> payload.text("skill_name")
+            TOOL_SKILL_CREATE, TOOL_SKILL_EDIT -> payload.text("skill_name")
             TOOL_READ -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
                 ?: (payload["paths"] as? JsonArray)?.size?.let { "$it 个项目" }
             TOOL_WRITE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
@@ -354,7 +375,6 @@ class MainToolRegistry(
             TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
             TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
             TOOL_SKILL_REGISTER -> payload.text("name")
-            TOOL_REQUEST_DEEP_REASONING -> "当前回合"
             TOOL_SING_SONG -> payload.text("title") ?: "未命名歌曲"
             TOOL_TASK_STATUS, TOOL_CANCEL_TASK -> payload.text("task_id")
             else -> null
@@ -367,7 +387,7 @@ class MainToolRegistry(
     }
 
     fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
-        call.name != TOOL_REQUEST_DEEP_REASONING &&
+            call.name != TOOL_HUB_DISPATCH_TASK &&
             call.name != TOOL_PROTOCOL_REPAIR &&
             call.name != TOOL_AGENT_SLEEP &&
             call.name != TOOL_VOICE_REPLY
@@ -400,6 +420,14 @@ class MainToolRegistry(
             put("description", "可选的简短分类标签")
             put("items", buildJsonObject { put("type", "string") })
         }
+    }
+
+    private fun skillUse() = tool(
+        name = TOOL_SKILL_USE,
+        description = "按名称加载一个已启用 Skill 的核心说明，并遵循加载结果完成当前任务。支持中文 Skill 名称。",
+        required = listOf("skill_name"),
+    ) {
+        putJsonObject("skill_name") { put("type", "string") }
     }
 
     private fun skillRegister() = tool(
@@ -477,7 +505,7 @@ class MainToolRegistry(
 
     private fun webSearch() = tool(
         name = TOOL_WEB_SEARCH,
-        description = "搜索并核实公开网络信息。用于近期变化、新闻、产品资料，以及模型不知道、记忆模糊、把握不足、资料冷门或来源可能冲突的客观事实。得到结果后必须评估相关性、覆盖度、来源可靠性、时效和冲突；优先一手来源，关键事实尽量由两个独立可靠来源交叉验证。结果不足或噪声大时，使用实质不同且限定更准确的查询再次搜索，不要直接回答不知道，也不要机械重复。禁止在查询中加入私人信息。",
+        description = "仅用于公开网络信息的快速查询与简短事实核实，适合一次或少量查询即可完成的即时问答。多来源调研、系统性研究、竞品分析、编码及其他重型任务不得通过本工具自行展开，应调用 hub_dispatch_task 委派给远程执行器。禁止在查询中加入私人信息。",
         required = listOf("query"),
     ) {
         putJsonObject("query") {
@@ -488,17 +516,6 @@ class MainToolRegistry(
             put("type", "integer")
             put("minimum", 1)
             put("maximum", 10)
-        }
-    }
-
-    private fun reasoningEscalation() = tool(
-        name = TOOL_REQUEST_DEEP_REASONING,
-        description = "为当前用户回合申请一次深度思考。适用于多步分析、方案权衡、复杂排障、头脑风暴，或需要明显提高回答质量的情况；简单问答不得使用。可以与参数互不依赖的其他工具在同一批次调用。",
-        required = listOf("reason"),
-    ) {
-        putJsonObject("reason") {
-            put("type", "string")
-            put("description", "需要深度思考的简短原因，不向用户播报")
         }
     }
 
@@ -580,7 +597,7 @@ class MainToolRegistry(
 
     private fun readFile() = tool(
         name = TOOL_READ,
-        description = "读取虚拟文件系统中的一个或多个文本文件，也可列出目录。读取单项时传 path；同一步需要读取多个独立文件时优先在一次调用中传 paths，最多 10 项，不要拆成多个并行 read。源码使用 /source，日志使用 /logs，工作文件使用 /workspace，Skill 使用 /skills。必须使用这些虚拟路径；日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
+        description = "读取虚拟文件系统中的一个或多个文本文件，也可列出目录。只允许 /source、/logs 和 /workspace；Skill 目录不属于通用虚拟文件系统。日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
     ) {
         putJsonObject("path") {
             put("type", "string")
@@ -687,7 +704,7 @@ class MainToolRegistry(
 
     private fun execCommand() = tool(
         name = TOOL_EXEC,
-        description = "在 App 自身 UID 沙箱中执行一次性程序。使用 cwd 和 argv；所有文件路径必须为 /source、/logs、/workspace 或 /skills 下的绝对虚拟路径，运行时会统一解析。无 shell、无环境变量、无管道语法；删除工作区内容必须改用 workspace_delete。",
+        description = "在 App 自身 UID 沙箱中执行一次性程序。使用 cwd 和 argv；文件路径只允许 /source、/logs 或 /workspace。无 shell、无环境变量、无管道语法；不能访问 Skill 目录。",
         required = listOf("argv"),
     ) {
         putJsonObject("argv") {
@@ -702,7 +719,7 @@ class MainToolRegistry(
         }
         putJsonObject("cwd") {
             put("type", "string")
-            put("description", "虚拟工作目录，默认 /workspace；只能是 /source、/logs、/workspace 或 /skills 下的绝对虚拟路径")
+            put("description", "虚拟工作目录，默认 /workspace；只能是 /source、/logs 或 /workspace 下的绝对虚拟路径")
         }
     }
 
@@ -790,7 +807,9 @@ class MainToolRegistry(
         const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
         const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
         const val TOOL_SKILL_REGISTER = "skill_register"
-        const val TOOL_REQUEST_DEEP_REASONING = "request_deep_reasoning"
+        const val TOOL_SKILL_USE = "skill_use"
+        const val TOOL_SKILL_CREATE = "skill_create"
+        const val TOOL_SKILL_EDIT = "skill_edit"
         const val TOOL_AGENT_SLEEP = "agent_sleep"
         const val TOOL_VOICE_REPLY = "voice_reply"
         const val TOOL_SING_SONG = "sing_song"
@@ -799,6 +818,15 @@ class MainToolRegistry(
         const val TOOL_HUB_DISPATCH_TASK = "hub_dispatch_task"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
 
+        val NATIVE_TOOL_NAMES = setOf(
+            TOOL_MEMORY_CREATE, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
+            TOOL_LOCATION_REVERSE_GEOCODE, TOOL_WEATHER_CURRENT, TOOL_WEB_SEARCH,
+            TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_EXEC, TOOL_HTTP_REQUEST,
+            TOOL_CODE_GRAPH_SEARCH, TOOL_CODE_GRAPH_EXPLAIN, TOOL_SKILL_REGISTER,
+            TOOL_SKILL_USE, TOOL_AGENT_SLEEP,
+            TOOL_VOICE_REPLY, TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,
+            TOOL_HUB_DISPATCH_TASK,
+        )
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48
 
         private val PARALLEL_SAFE_TOOL_NAMES = setOf(

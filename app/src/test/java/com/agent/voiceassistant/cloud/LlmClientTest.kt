@@ -30,6 +30,18 @@ class LlmClientTest {
     }
 
     @Test
+    fun `deepseek payload enables native thinking and json object output`() {
+        val request = request().copy(responseFormat = CloudSpeechClient.ResponseFormat.JSON_OBJECT)
+        val payload = client(LlmProviderMode.OPENAI_COMPATIBLE, "deepseek-v4-flash").buildChatPayload(request)
+
+        assertEquals("enabled", payload.getValue("thinking").jsonObject.getValue("type").jsonPrimitive.content)
+        assertEquals(
+            "json_object",
+            payload.getValue("response_format").jsonObject.getValue("type").jsonPrimitive.content,
+        )
+    }
+
+    @Test
     fun `image input uses openai multimodal content array`() {
         val request = CloudSpeechClient.ChatRequest(
             messages = listOf(
@@ -80,11 +92,11 @@ class LlmClientTest {
         maxCompletionTokens = 512,
     )
 
-    private fun client(mode: LlmProviderMode) = OpenAiCompatibleLlmClient(
+    private fun client(mode: LlmProviderMode, model: String = "test-model") = OpenAiCompatibleLlmClient(
         LLMConfig(
             apiKey = "test",
             baseUrl = "https://example.com/v1",
-            modelName = "test-model",
+            modelName = model,
             providerMode = mode,
         ),
     )

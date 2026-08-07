@@ -54,6 +54,23 @@ class ChatStreamAccumulatorTest {
     }
 
     @Test
+    fun `captures token usage and finish evidence`() {
+        val accumulator = ChatStreamAccumulator()
+        accumulator.accept(
+            json.parseToJsonElement(
+                """{"choices":[{"index":0,"delta":{"content":"完成"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11000,"completion_tokens":321,"total_tokens":11321,"completion_tokens_details":{"reasoning_tokens":200}}}""",
+            ).jsonObject,
+        )
+
+        val completion = accumulator.complete()
+
+        assertEquals(11_000L, completion.usage?.promptTokens)
+        assertEquals(321L, completion.usage?.completionTokens)
+        assertEquals(200L, completion.usage?.reasoningTokens)
+        assertTrue(completion.streamDiagnostics.receivedFinishEvent)
+    }
+
+    @Test
     fun `payload explicitly disables thinking for fast turns`() {
         val client = CloudSpeechClient(
             LLMConfig(
