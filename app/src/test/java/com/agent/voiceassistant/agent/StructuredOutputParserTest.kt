@@ -94,6 +94,34 @@ class StructuredOutputParserTest {
     }
 
     @Test
+    fun `finds json tool payload range and preserves surrounding working text`() {
+        val raw = """
+            <working>
+            intent=L
+            next=tool_call
+            </working>
+            {"name":"read","arguments":{"path":"/logs/app.log"}}
+        """.trimIndent()
+
+        val matches = StructuredOutputParser.findBodyToolCallMatches(raw)
+
+        assertEquals(1, matches.size)
+        assertEquals("read", matches.single().call.name)
+        assertEquals(
+            "<working>\nintent=L\nnext=tool_call\n</working>",
+            StructuredOutputParser.withoutBodyToolPayloads(raw, matches),
+        )
+    }
+
+    @Test
+    fun `ordinary json has no executable payload range`() {
+        val raw = "结论如下：{\"status\":\"ok\",\"count\":2}"
+
+        assertTrue(StructuredOutputParser.findBodyToolCallMatches(raw).isEmpty())
+        assertEquals(raw, StructuredOutputParser.withoutBodyToolPayloads(raw, emptyList()))
+    }
+
+    @Test
     fun `parses json tool call after natural language prefix`() {
         val raw = "让我先查一下最近的日志。 {\"name\":\"read\",\"arguments\":{\"path\":\"/logs\"}}"
 

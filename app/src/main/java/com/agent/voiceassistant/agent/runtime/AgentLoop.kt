@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.agent.runtime
 
 import com.agent.voiceassistant.agent.StructuredOutputParser
+import com.agent.voiceassistant.agent.BodyToolCall
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
@@ -25,6 +26,12 @@ class AgentLoop(
         val allowReasoningEscalation: Boolean,
         val automaticReasoningToolThreshold: Int = DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD,
         val activeToolBudgetMs: Long = DEFAULT_ACTIVE_TOOL_BUDGET_MS,
+        val enableBodyToolAdapter: Boolean = false,
+        val enableModelFormatRepair: Boolean = true,
+        val enableEmptyFinalRetry: Boolean = true,
+        val enableStreamIntegrityRetry: Boolean = true,
+        val enableActiveToolBudget: Boolean = true,
+        val enableForcedFinalSummary: Boolean = true,
         val monotonicNowMs: () -> Long = { System.nanoTime() / 1_000_000L },
         val initialBusinessToolCallCount: Int = 0,
         val initialActiveElapsedMs: Long = 0,
@@ -70,6 +77,8 @@ class AgentLoop(
         fun toolDefinitions(allowReasoningEscalation: Boolean): List<CloudSpeechClient.ToolDefinition>
         fun isToolAllowed(call: CloudSpeechClient.ToolCall, nativeToolNames: Set<String>): Boolean =
             call.name in nativeToolNames
+        fun adaptBodyToolCall(call: BodyToolCall, callId: String): CloudSpeechClient.ToolCall? =
+            CloudSpeechClient.ToolCall(callId, call.name, call.arguments.toString())
         suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String = ""
 
         suspend fun modelTurn(
@@ -204,15 +213,15 @@ class AgentLoop(
                             when (streamEvent) {
                                 is CloudSpeechClient.ChatStreamEvent.ContentDelta -> {
                                     resumeActiveBudget()
-                                    eventSink(AgentEvent.ContentDelta(turnId, streamEvent.text))
+                                    eventSink(AgentEvent.ContentDelta(turnId, streamEvent.text, modelCall = modelCall))
                                 }
                                 is CloudSpeechClient.ChatStreamEvent.ReasoningDelta -> {
                                     resumeActiveBudget()
-                                    eventSink(AgentEvent.ReasoningDelta(turnId, streamEvent.text))
+                                    eventSink(AgentEvent.ReasoningDelta(turnId, streamEvent.text, modelCall = modelCall))
                                 }
                                 is CloudSpeechClient.ChatStreamEvent.ToolCallDelta -> {
                                     resumeActiveBudget()
-                                    eventSink(AgentEvent.ToolCallDetected(turnId, streamEvent.name.orEmpty()))
+                                    eventSink(AgentEvent.ToolCallDetected(turnId, streamEvent.name.orEmpty(), modelCall))
                                 }
                                 is CloudSpeechClient.ChatStreamEvent.Finished -> Unit
                             }
@@ -224,7 +233,7 @@ class AgentLoop(
                         val brokenStream = diagnostics.protocolObserved && (
                             !diagnostics.hasNormalEnd || diagnostics.malformedEventCount > 0
                             )
-                        if (diagnostics.protocolObserved &&
+                        if (config.enableStreamIntegrityRetry && diagnostics.protocolObserved &&
                             (blank || truncated || brokenStream) &&
                             integrityRetry < MAX_STREAM_INTEGRITY_RETRIES
                         ) {
@@ -284,7 +293,7 @@ class AgentLoop(
                 val estimatedPromptTokens = workingMessages.sumOf {
                     it.content.orEmpty().length + it.reasoningContent.orEmpty().length
                 }.toLong() / 3L
-                val assistant = runtime.normalizeAssistant(completion.message).copy(
+                var assistant = runtime.normalizeAssistant(completion.message).copy(
                     responseMetadata = CloudSpeechClient.ResponseMetadata(
                         modelId = completion.modelId,
                         promptTokens = usage?.promptTokens ?: estimatedPromptTokens,
@@ -297,6 +306,25 @@ class AgentLoop(
                             completion.streamDiagnostics.malformedEventCount == 0,
                     ),
                 )
+                if (config.enableBodyToolAdapter && assistant.toolCalls.isEmpty()) {
+                    val availableNames = tools.mapTo(mutableSetOf()) { it.name }
+                    val matches = StructuredOutputParser.findBodyToolCallMatches(assistant.content.orEmpty())
+                    val adapted = matches.mapIndexedNotNull { index, match ->
+                        runtime.adaptBodyToolCall(match.call, "body-${turnId.take(8)}-$modelCall-$index")
+                            ?.takeIf { runtime.isToolAllowed(it, availableNames) }
+                            ?.let { match to it }
+                    }
+                    if (adapted.isNotEmpty()) {
+                        assistant = assistant.copy(
+                            content = StructuredOutputParser.withoutBodyToolPayloads(
+                                assistant.content.orEmpty(),
+                                adapted.map { it.first },
+                            ),
+                            toolCalls = adapted.map { it.second },
+                        )
+                    }
+                }
+                eventSink(AgentEvent.ModelResponseFinished(turnId, assistant, modelCall))
                 return streamed to assistant
             }
 
@@ -310,7 +338,7 @@ class AgentLoop(
             ): Outcome.Completed {
                 val finalText = assistant.content.orEmpty().trim()
                 if (finalText.isBlank()) {
-                    if (emptyFinalRetriesRemaining > 0) {
+                    if (config.enableEmptyFinalRetry && emptyFinalRetriesRemaining > 0) {
                         val attempt = MAX_EMPTY_FINAL_RETRIES - emptyFinalRetriesRemaining + 1
                         eventSink(
                             AgentEvent.FinalResponseRetry(
@@ -338,10 +366,11 @@ class AgentLoop(
                     }
                     return finishLocalFailure("这次没有生成可用回复，请再试一次。")
                 }
-                val invalidFinal = assistant.toolCalls.isNotEmpty() ||
-                    StructuredOutputParser.containsToolProtocol(finalText)
+                val invalidFinal = assistant.toolCalls.isNotEmpty() || (
+                    config.enableModelFormatRepair && StructuredOutputParser.containsToolProtocol(finalText)
+                    )
                 if (invalidFinal) {
-                    if (allowFormatRepair) {
+                    if (config.enableModelFormatRepair && allowFormatRepair) {
                         workingMessages += CloudSpeechClient.LlmMessage(
                             role = "system",
                             content = buildFinalFormatRepairInstruction(),
@@ -388,6 +417,9 @@ class AgentLoop(
             }
 
             suspend fun forceFinalSummary(reason: String): Outcome.Completed {
+                if (!config.enableForcedFinalSummary) {
+                    return finishLocalFailure("本回合未完成：$reason。")
+                }
                 workingMessages += CloudSpeechClient.LlmMessage(
                     role = "system",
                     content = buildString {
@@ -523,7 +555,7 @@ class AgentLoop(
                     businessToolCallCount = projectedBusinessToolCallCount,
                 )
                 val pendingTools = assistant.toolCalls.map { call ->
-                    val overActiveBudget = activeBudgetStarted &&
+                    val overActiveBudget = config.enableActiveToolBudget && activeBudgetStarted &&
                         currentActiveElapsedMs() >= config.activeToolBudgetMs &&
                         !runtime.isDelegation(call)
                     val blockedReason = when {

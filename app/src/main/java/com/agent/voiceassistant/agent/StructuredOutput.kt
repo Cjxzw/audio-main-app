@@ -24,6 +24,12 @@ data class BodyToolCall(
     val arguments: JsonObject,
 )
 
+data class BodyToolCallMatch(
+    val call: BodyToolCall,
+    val startIndex: Int,
+    val endIndexExclusive: Int,
+)
+
 internal class BodyToolCallTooLargeException : IllegalStateException(
     "正文伪工具调用超过保护上限，已停止继续接收",
 )
@@ -125,8 +131,37 @@ object StructuredOutputParser {
             .distinctBy { "${it.name}:${it.arguments}" }
     }
 
+    /** Finds complete JSON tool payloads while retaining their exact source ranges. */
+    fun findBodyToolCallMatches(raw: String): List<BodyToolCallMatch> {
+        val matches = mutableListOf<BodyToolCallMatch>()
+        jsonObjectRanges(raw).forEach { range ->
+            val source = raw.substring(range.first, range.last + 1)
+            val call = parseJsonToolCalls(source).singleOrNull() ?: return@forEach
+            matches += BodyToolCallMatch(call, range.first, range.last + 1)
+        }
+        return matches
+    }
+
+    fun withoutBodyToolPayloads(raw: String, matches: List<BodyToolCallMatch>): String {
+        if (matches.isEmpty()) return raw
+        val hidden = matches.sortedBy { it.startIndex }
+        return buildString(raw.length) {
+            var cursor = 0
+            hidden.forEach { match ->
+                if (match.startIndex < cursor) return@forEach
+                append(raw, cursor, match.startIndex)
+                cursor = match.endIndexExclusive
+            }
+            append(raw, cursor, raw.length)
+        }.trim()
+    }
+
     private fun extractJsonObjects(raw: String): List<String> {
-        val candidates = mutableListOf<String>()
+        return jsonObjectRanges(raw).map { raw.substring(it.first, it.last + 1) }
+    }
+
+    private fun jsonObjectRanges(raw: String): List<IntRange> {
+        val ranges = mutableListOf<IntRange>()
         var start = 0
         while (start < raw.length) {
             val opening = raw.indexOf('{', start)
@@ -156,13 +191,13 @@ object StructuredOutputParser {
                 }
             }
             if (end >= 0) {
-                candidates += raw.substring(opening, end + 1)
+                ranges += opening..end
                 start = end + 1
             } else {
                 start = opening + 1
             }
         }
-        return candidates
+        return ranges
     }
 
     fun parse(raw: String): AgentOutput {

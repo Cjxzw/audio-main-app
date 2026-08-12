@@ -155,13 +155,13 @@ class RuleStore(context: Context) {
         file.writeText(json.encodeToString(state))
     }
 
-    private companion object {
+    companion object {
         private const val MAX_RULES = 64
         private const val MAX_TITLE_CHARS = 80
         private const val MAX_BODY_CHARS = 8_000
         private const val MAX_TOTAL_BODY_CHARS = 16_000
         private const val MAX_CHANGE_HISTORY = 128
-        private const val BUILTIN_DIAGNOSTIC_RULE_ID = "builtin-diagnostic-rule"
+        const val BUILTIN_DIAGNOSTIC_RULE_ID = "builtin-diagnostic-rule"
         private val BUILTIN_DIAGNOSTIC_RULE = """
             当用户讨论本 App 的异常、Bug、报错、卡顿、日志、源码或行为不符合预期时，自行判断是否需要诊断。
             需要多步取证、读取日志或源码、或结论存在不确定性时，优先调用相关原生工具；若工作量较大或需要专门能力，则委派给 Hub 路由表中的合适执行器。

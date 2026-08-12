@@ -132,6 +132,7 @@ class ConversationStore(context: Context) {
         attachments: List<StoredAttachment> = emptyList(),
         reasoningText: String? = null,
         responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
+        llmVisible: Boolean? = null,
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -157,6 +158,7 @@ class ConversationStore(context: Context) {
             promptTokensEstimated = responseMetadata?.promptTokensEstimated,
             finishReason = responseMetadata?.finishReason,
             streamComplete = responseMetadata?.streamComplete,
+            llmVisible = llmVisible,
         )
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -220,6 +222,7 @@ class ConversationStore(context: Context) {
         streamState: ChatStreamState? = null,
         reasoningText: String? = null,
         responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
+        llmVisible: Boolean? = null,
     ): StoredMessage? {
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -239,6 +242,7 @@ class ConversationStore(context: Context) {
                 promptTokensEstimated = responseMetadata?.promptTokensEstimated ?: session.messages[index].promptTokensEstimated,
                 finishReason = responseMetadata?.finishReason ?: session.messages[index].finishReason,
                 streamComplete = responseMetadata?.streamComplete ?: session.messages[index].streamComplete,
+                llmVisible = llmVisible ?: session.messages[index].llmVisible,
             )
             session.messages[index] = updated
             session.updatedAt = timestamp
@@ -584,7 +588,10 @@ class ConversationStore(context: Context) {
      * The canonical rule bodies remain owned by [RuleStore]; this ledger exists only to make
      * the request prefix stable for providers that reuse prompt KV caches.
      */
-    fun ruleContext(ruleStore: RuleStore): String = synchronized(lock) {
+    fun ruleContext(
+        ruleStore: RuleStore,
+        excludedRuleIds: Set<String> = emptySet(),
+    ): String = synchronized(lock) {
         val session = currentSessionLocked()
         val current = ruleStore.snapshot()
         var ledger = session.ruleLedger
@@ -622,7 +629,7 @@ class ConversationStore(context: Context) {
                 persistLocked()
             }
         }
-        renderRuleLedger(requireNotNull(ledger))
+        renderRuleLedger(requireNotNull(ledger), excludedRuleIds)
     }
 
     fun sessionContextSnapshot(skillSummary: String): String = synchronized(lock) {
@@ -854,17 +861,20 @@ private fun newConversation(id: String): ConversationSession {
     )
 }
 
-internal fun renderRuleLedger(ledger: ConversationRuleLedger): String = buildString {
+internal fun renderRuleLedger(
+    ledger: ConversationRuleLedger,
+    excludedRuleIds: Set<String> = emptySet(),
+): String = buildString {
     appendLine("全局用户规则基线（版本 ${ledger.baselineRevision}）：")
     if (ledger.baselineRules.isEmpty()) {
         appendLine("（当前没有规则）")
     } else {
-        ledger.baselineRules.forEach { rule ->
+        ledger.baselineRules.filterNot { it.id in excludedRuleIds }.forEach { rule ->
             appendLine("[规则 ${rule.id}｜${rule.title}｜v${rule.version}]")
             appendLine(rule.body)
         }
     }
-    ledger.patches.forEach { change ->
+    ledger.patches.filterNot { it.rule.id in excludedRuleIds }.forEach { change ->
         appendLine()
         appendLine("规则增量更新（版本 ${change.revision}）：")
         appendLine("操作：${change.operation.name}；规则：${change.rule.id}｜${change.rule.title}｜v${change.rule.version}")

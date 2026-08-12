@@ -59,12 +59,14 @@ sealed interface AgentEvent {
         override val turnId: String,
         val text: String,
         val userVisible: Boolean = true,
+        val modelCall: Int = 0,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
     data class ToolCallDetected(
         override val turnId: String,
         val toolName: String,
+        val modelCall: Int = 0,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
@@ -79,6 +81,7 @@ sealed interface AgentEvent {
     data class ReasoningDelta(
         override val turnId: String,
         val text: String,
+        val modelCall: Int = 0,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 
@@ -114,6 +117,14 @@ sealed interface AgentEvent {
     data class MessageFinished(
         override val turnId: String,
         val message: CloudSpeechClient.LlmMessage,
+        val modelCall: Int = 0,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
+
+    data class ModelResponseFinished(
+        override val turnId: String,
+        val message: CloudSpeechClient.LlmMessage,
+        val modelCall: Int,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
 

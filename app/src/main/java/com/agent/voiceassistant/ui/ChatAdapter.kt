@@ -9,6 +9,7 @@ import android.widget.TextView
 import android.text.method.ScrollingMovementMethod
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
+import com.agent.voiceassistant.ExperimentConfig
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
@@ -253,6 +254,12 @@ class ChatAdapter(
 
         private fun bindText(msg: ChatMessage, requestedDetailsExpanded: Boolean) {
             if (msg.role == BOT) {
+                if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+                    tvText.visibility = View.VISIBLE
+                    llDetails.visibility = View.GONE
+                    tvText.text = msg.text
+                    return
+                }
                 val extraction = ReplyDetailPolicy.extract(msg.text)
                 tvText.visibility = if (extraction.speakableText.isBlank()) View.GONE else View.VISIBLE
                 if (extraction.speakableText.isNotBlank()) {

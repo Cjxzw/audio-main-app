@@ -10,18 +10,19 @@ class LLMConfigTest {
         val prompt = buildMainSystemPrompt()
 
         assertTrue(prompt.contains("“喊我”（Hanwo）"))
-        assertTrue(prompt.contains("轻量级私人主 Agent"))
+        assertTrue(prompt.contains("轻量级私人 Main Agent"))
         assertFalse(prompt.contains("本回合思考策略"))
         assertFalse(prompt.contains("当前时间"))
         assertFalse(prompt.contains("当前是快速模式"))
         assertTrue(prompt.contains("agent_sleep"))
-        assertTrue(prompt.contains("用户只是讨论、引用或询问这些词语时不得调用"))
-        assertTrue(prompt.contains("<DETAILS>...</DETAILS>"))
+        assertFalse(prompt.contains("回复时的原则"))
+        assertFalse(prompt.contains("<DETAILS>...</DETAILS>"))
+        assertFalse(prompt.contains("准确的分辨出用户的意图"))
         assertTrue(prompt.contains("<device_context>"))
         assertTrue(prompt.contains("<multimodal_transcript>"))
         assertTrue(prompt.contains("hub_dispatch_task"))
         assertTrue(prompt.contains("subagent"))
-        assertTrue(prompt.contains("复杂工作委派"))
+        assertTrue(prompt.contains("Main、Hub 与执行 Agent"))
     }
 
     @Test
@@ -34,7 +35,7 @@ class LLMConfigTest {
         )
 
         assertTrue(content.contains("当前网络：WiFi"))
-        assertTrue(content.contains("request_deep_reasoning"))
+        assertFalse(content.contains("request_deep_reasoning"))
         assertTrue(content.endsWith("<user_input>\n你好\n</user_input>"))
     }
 }

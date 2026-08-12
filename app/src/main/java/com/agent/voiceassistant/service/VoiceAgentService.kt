@@ -24,6 +24,7 @@ import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import com.agent.voiceassistant.MainActivity
 import com.agent.voiceassistant.R
+import com.agent.voiceassistant.ExperimentConfig
 import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
 import com.agent.voiceassistant.agent.LongDetailsPolicy
@@ -33,6 +34,7 @@ import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.agent.VoiceReplyLengthGate
 import com.agent.voiceassistant.agent.buildCurrentTurnUserContent
 import com.agent.voiceassistant.agent.buildMainSystemPrompt
+import com.agent.voiceassistant.agent.BodyToolCall
 import com.agent.voiceassistant.agent.runtime.AgentEvent
 import com.agent.voiceassistant.agent.runtime.AgentLoop
 import com.agent.voiceassistant.agent.runtime.ActiveTurnCheckpointStore
@@ -1003,7 +1005,8 @@ class VoiceAgentService : Service() {
             requestNewConversation(
                 userText,
                 greet = true,
-                speakReplies = AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies),
+                speakReplies = ExperimentConfig.ENABLE_TTS &&
+                    AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies),
             )
             return
         }
@@ -1028,7 +1031,8 @@ class VoiceAgentService : Service() {
             updateNotification("正在回应...")
             return
         }
-        val speakReplies = AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies)
+        val speakReplies = ExperimentConfig.ENABLE_TTS &&
+            AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies)
         turnMutex.withLock {
             activeTextTurnSilent = source == "text" && !speakReplies
             try {
@@ -1079,11 +1083,15 @@ class VoiceAgentService : Service() {
 
                 speechInterruptedForUrgentReport.set(false)
                 val metricsTracker = TurnMetricsTracker()
-                val intentRouting = startIntentRouting(
-                    userText = userText,
-                    currentUserMessageId = currentUserMessage.id,
-                    attachments = attachments,
-                )
+                val intentRouting = if (ExperimentConfig.ENABLE_INTENT_ROUTING) {
+                    startIntentRouting(
+                        userText = userText,
+                        currentUserMessageId = currentUserMessage.id,
+                        attachments = attachments,
+                    )
+                } else {
+                    null
+                }
                 val outcome = runAgentLoop(
                     llmClient = llmClient,
                     speechClient = client,
@@ -1096,10 +1104,10 @@ class VoiceAgentService : Service() {
                         attachments = attachments,
                         visualTranscript = visualTranscript,
                     ),
-                    initialThinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
                     allowReasoningEscalation = false,
-                    voiceReplySummaryEnabled = speakReplies,
+                    voiceReplySummaryEnabled = ExperimentConfig.ENABLE_FINAL_REFINEMENT && speakReplies,
                     metricsTracker = metricsTracker,
                     intentRouting = intentRouting,
                     checkpointContext = TurnCheckpointContext(
@@ -1193,7 +1201,10 @@ class VoiceAgentService : Service() {
                                 MainToolRegistry.Profile.STANDALONE
                             },
                             allowReasoningEscalation = allowReasoningEscalation,
-                        )
+                        ).filterNot { definition ->
+                            !ExperimentConfig.ENABLE_TTS &&
+                                definition.name == MainToolRegistry.TOOL_VOICE_REPLY
+                        }
                     } else {
                         emptyList()
                     }
@@ -1244,7 +1255,33 @@ class VoiceAgentService : Service() {
                 }
 
                 override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) =
-                    normalizeLegacyMessage(message)
+                    if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) message else normalizeLegacyMessage(message)
+
+                override fun adaptBodyToolCall(
+                    call: BodyToolCall,
+                    callId: String,
+                ): CloudSpeechClient.ToolCall? {
+                    val name = when (call.name) {
+                        "weather", "weather.get_current" -> MainToolRegistry.TOOL_WEATHER_CURRENT
+                        "delegate", "dispatch_task" -> MainToolRegistry.TOOL_HUB_DISPATCH_TASK
+                        else -> call.name
+                    }
+                    val arguments = if (
+                        name == MainToolRegistry.TOOL_WEATHER_CURRENT &&
+                        call.arguments["city"] != null &&
+                        call.arguments["location"] == null
+                    ) {
+                        kotlinx.serialization.json.JsonObject(
+                            call.arguments.filterKeys { it != "city" } +
+                                ("location" to requireNotNull(call.arguments["city"])),
+                        )
+                    } else {
+                        call.arguments
+                    }
+                    return name.takeIf(toolRegistry::isNativeTool)?.let {
+                        CloudSpeechClient.ToolCall(callId, it, arguments.toString())
+                    }
+                }
 
                 override fun isTerminalPresentation(call: CloudSpeechClient.ToolCall) =
                     toolRegistry.isTerminalPresentation(call)
@@ -1388,6 +1425,7 @@ class VoiceAgentService : Service() {
                     calls: List<CloudSpeechClient.ToolCall>,
                     businessToolCallCount: Int,
                 ): ToolGateDecision {
+                    if (!ExperimentConfig.ENABLE_INTENT_ROUTING) return ToolGateDecision()
                     if (intentRouteConsumed) return ToolGateDecision()
                     val localCalls = calls.filter { call ->
                         !toolRegistry.isAgentSleep(call) &&
@@ -1449,9 +1487,15 @@ class VoiceAgentService : Service() {
                     } else {
                         VoiceReplyPresentation(displayText = rawText, speechText = rawText)
                     }
-                    val displayText = normalizeFinalAssistantText(presentation.displayText)
+                    val displayText = if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+                        presentation.displayText
+                    } else {
+                        normalizeFinalAssistantText(presentation.displayText)
+                    }
                     finalizedAssistantForContext = message.copy(content = displayText)
-                    finishAssistantDraft(turnId, displayText, message.responseMetadata)
+                    if (!ExperimentConfig.SHOW_RAW_MODEL_TEXT || message.responseMetadata == null) {
+                        finishAssistantDraft(turnId, displayText, message.responseMetadata)
+                    }
                     emitLog("助手: ${presentation.speechText.take(MAX_LOG_PREVIEW_CHARS)}")
                     if (!streamedSpeech || voiceReplyGate != null) {
                         awaitReasoningFeedback()
@@ -1500,6 +1544,12 @@ class VoiceAgentService : Service() {
                     initialBusinessToolCallCount = checkpointContext?.resumed?.businessToolCallCount ?: 0,
                     initialActiveElapsedMs = checkpointContext?.resumed?.activeElapsedMs ?: 0,
                     initialActiveBudgetStarted = checkpointContext?.resumed?.activeBudgetStarted ?: false,
+                    enableBodyToolAdapter = ExperimentConfig.ENABLE_BODY_TOOL_ADAPTER,
+                    enableModelFormatRepair = ExperimentConfig.ENABLE_MODEL_FORMAT_REPAIR,
+                    enableEmptyFinalRetry = ExperimentConfig.ENABLE_EMPTY_FINAL_RETRY,
+                    enableStreamIntegrityRetry = ExperimentConfig.ENABLE_STREAM_INTEGRITY_RETRY,
+                    enableActiveToolBudget = ExperimentConfig.ENABLE_ACTIVE_TOOL_BUDGET,
+                    enableForcedFinalSummary = ExperimentConfig.ENABLE_FORCED_FINAL_SUMMARY,
                     beforeSpeech = beforeSpeech,
                     onContextFinalized = { turnId, context ->
                         val replacement = finalizedAssistantForContext
@@ -1596,16 +1646,17 @@ class VoiceAgentService : Service() {
             activeSourceTurnId = snapshot.turnId
             activeTextTurnSilent = snapshot.source == "text" && !snapshot.speakReplies
             try {
-                val speech = if (snapshot.speakReplies) ensureSpeechClient() else null
+                val restoredSpeakReplies = ExperimentConfig.ENABLE_TTS && snapshot.speakReplies
+                val speech = if (restoredSpeakReplies) ensureSpeechClient() else null
                 runAgentLoop(
                     llmClient = createLlmClient(),
                     speechClient = speech,
-                    speakReplies = snapshot.speakReplies && speech != null,
+                    speakReplies = restoredSpeakReplies && speech != null,
                     messages = decoded,
-                    initialThinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
                     allowReasoningEscalation = false,
-                    voiceReplySummaryEnabled = snapshot.speakReplies,
+                    voiceReplySummaryEnabled = ExperimentConfig.ENABLE_FINAL_REFINEMENT && restoredSpeakReplies,
                     checkpointContext = TurnCheckpointContext(
                         conversationId = snapshot.conversationId,
                         source = snapshot.source,
@@ -1712,7 +1763,7 @@ class VoiceAgentService : Service() {
                 "turn=${event.turnId} chars=${event.finalText.length}",
             )
             is AgentEvent.AgentFailed -> {
-                interruptAssistantDraft(event.turnId)
+                interruptAssistantDrafts(event.turnId)
                 DiagLog.w(
                     "agent.loop.failed",
                     "turn=${event.turnId} error=${event.error}",
@@ -1729,7 +1780,6 @@ class VoiceAgentService : Service() {
                     }
                 }
                 if (persistentCalls.isNotEmpty()) {
-                    suppressAssistantDraft(event.turnId)
                     store.addLlmMessage(
                         event.message.copy(
                             reasoningContent = null,
@@ -1739,7 +1789,6 @@ class VoiceAgentService : Service() {
                 }
             }
             is AgentEvent.ToolCallRejected -> {
-                suppressAssistantDraft(event.turnId)
                 DiagLog.w(
                     "agent.tool.rejected",
                     "turn=${event.turnId} id=${event.toolCallId.take(80)} " +
@@ -1748,14 +1797,20 @@ class VoiceAgentService : Service() {
                 )
             }
             is AgentEvent.MessageStarted -> {
-                val existing = assistantDrafts[event.turnId]
-                if (existing == null) {
-                    assistantDrafts[event.turnId] = AssistantDraft()
+                if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+                    assistantDrafts[draftKey(event.turnId, event.modelCall)] = AssistantDraft(
+                        modelCall = event.modelCall,
+                    )
                 } else {
-                    existing.text.setLength(0)
-                    existing.released = false
-                    existing.suppressed = false
-                    existing.persistedLength = 0
+                    val existing = assistantDrafts[event.turnId]
+                    if (existing == null) {
+                        assistantDrafts[event.turnId] = AssistantDraft()
+                    } else {
+                        existing.text.setLength(0)
+                        existing.released = false
+                        existing.suppressed = false
+                        existing.persistedLength = 0
+                    }
                 }
             }
             is AgentEvent.FinalResponseRetry -> DiagLog.w(
@@ -1763,18 +1818,22 @@ class VoiceAgentService : Service() {
                 "turn=${event.turnId} attempt=${event.attempt}/${event.maxRetries} reason=blank_final",
             )
             is AgentEvent.ContentDelta -> if (event.userVisible) {
-                appendAssistantDraft(event.turnId, event.text)
+                appendAssistantDraft(event.turnId, event.text, event.modelCall)
             }
-            is AgentEvent.ToolCallDetected -> suppressAssistantDraft(event.turnId)
-            is AgentEvent.AgentFinished -> assistantDrafts.remove(event.turnId)
-            is AgentEvent.ReasoningDelta -> appendAssistantReasoning(event.turnId, event.text)
+            is AgentEvent.ToolCallDetected -> Unit
+            is AgentEvent.ModelResponseFinished -> if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+                finishModelObservation(event.turnId, event.modelCall, event.message)
+            }
+            is AgentEvent.AgentFinished -> removeAssistantDrafts(event.turnId)
+            is AgentEvent.ReasoningDelta -> appendAssistantReasoning(event.turnId, event.text, event.modelCall)
             is AgentEvent.ToolProgress -> Unit
         }
     }
 
-    private fun appendAssistantReasoning(turnId: String, delta: String) {
+    private fun appendAssistantReasoning(turnId: String, delta: String, modelCall: Int = 0) {
         if (delta.isEmpty()) return
-        val draft = assistantDrafts.computeIfAbsent(turnId) { AssistantDraft() }
+        val key = draftKey(turnId, modelCall)
+        val draft = assistantDrafts.computeIfAbsent(key) { AssistantDraft(modelCall = modelCall) }
         draft.reasoning.append(delta)
         val reasoning = draft.reasoning.toString()
         if (draft.messageId == null) {
@@ -1783,6 +1842,7 @@ class VoiceAgentService : Service() {
                 content = draft.text.toString(),
                 streamState = ChatStreamState.STREAMING,
                 reasoningText = reasoning,
+                llmVisible = if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) false else null,
             )
             draft.messageId = stored.id
             draft.timestamp = stored.timestamp
@@ -1803,26 +1863,35 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun appendAssistantDraft(turnId: String, delta: String) {
+    private fun appendAssistantDraft(turnId: String, delta: String, modelCall: Int = 0) {
         if (delta.isEmpty()) return
-        val draft = assistantDrafts.computeIfAbsent(turnId) { AssistantDraft() }
+        val key = draftKey(turnId, modelCall)
+        val draft = assistantDrafts.computeIfAbsent(key) { AssistantDraft(modelCall = modelCall) }
         if (draft.suppressed) return
         draft.text.append(delta)
-        if (StructuredOutputParser.containsPotentialToolProtocol(draft.text.toString())) {
+        if (!ExperimentConfig.SHOW_RAW_MODEL_TEXT &&
+            StructuredOutputParser.containsPotentialToolProtocol(draft.text.toString())
+        ) {
             suppressAssistantDraft(turnId)
             return
         }
-        if (!draft.released) {
+        if (!ExperimentConfig.SHOW_RAW_MODEL_TEXT && !draft.released) {
             val first = draft.text.firstOrNull { !it.isWhitespace() } ?: return
             if (first == '{' || first == '[' || first == '<') return
             draft.released = true
         }
-        val text = draft.text.toString()
+        val text = if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+            streamingObservationText(draft.text.toString())
+        } else {
+            draft.text.toString()
+        }
+        if (text.isBlank()) return
         if (draft.messageId == null) {
             val stored = store.addMessage(
                 role = "assistant",
                 content = text,
                 streamState = ChatStreamState.STREAMING,
+                llmVisible = if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) false else null,
             )
             draft.messageId = stored.id
             draft.timestamp = stored.timestamp
@@ -1840,6 +1909,56 @@ class VoiceAgentService : Service() {
             draft.lastEmittedAt = now
             EventBus.emitChatMessage(draft.toChatMessage(text, ChatStreamState.STREAMING))
         }
+    }
+
+    private fun finishModelObservation(
+        turnId: String,
+        modelCall: Int,
+        message: CloudSpeechClient.LlmMessage,
+    ) {
+        val draft = assistantDrafts.remove(draftKey(turnId, modelCall)) ?: return
+        val text = message.content.orEmpty().trim()
+        val messageId = draft.messageId
+        val llmVisible = message.toolCalls.isEmpty()
+        if (text.isBlank()) {
+            messageId?.let(::discardStoredDraft)
+            return
+        }
+        if (messageId == null) {
+            val stored = store.addMessage(
+                role = "assistant",
+                content = text,
+                streamState = ChatStreamState.COMPLETED,
+                reasoningText = draft.reasoning.toString().takeIf(String::isNotBlank),
+                responseMetadata = message.responseMetadata,
+                llmVisible = llmVisible,
+            )
+            EventBus.emitChatMessage(
+                ChatMessage(
+                    role = ChatRole.BOT,
+                    text = text,
+                    timestamp = stored.timestamp,
+                    messageId = stored.id,
+                    streamState = ChatStreamState.COMPLETED,
+                    reasoningText = draft.reasoning.toString().takeIf(String::isNotBlank),
+                ),
+            )
+            return
+        }
+        store.updateMessage(
+            messageId,
+            text,
+            streamState = ChatStreamState.COMPLETED,
+            reasoningText = draft.reasoning.toString().takeIf(String::isNotBlank),
+            responseMetadata = message.responseMetadata,
+            llmVisible = llmVisible,
+        )
+        EventBus.emitChatMessage(draft.toChatMessage(text, ChatStreamState.COMPLETED, message.responseMetadata))
+    }
+
+    private fun streamingObservationText(raw: String): String {
+        val jsonStart = raw.indexOf('{')
+        return if (jsonStart >= 0) raw.substring(0, jsonStart).trimEnd() else raw
     }
 
     private fun finishAssistantDraft(
@@ -1900,8 +2019,13 @@ class VoiceAgentService : Service() {
         return result.content
     }
 
-    private fun interruptAssistantDraft(turnId: String) {
-        val draft = assistantDrafts.remove(turnId) ?: return
+    private fun interruptAssistantDrafts(turnId: String) {
+        val keys = assistantDrafts.keys.filter { it == turnId || it.startsWith("$turnId:") }
+        keys.forEach { key -> interruptAssistantDraft(key) }
+    }
+
+    private fun interruptAssistantDraft(key: String) {
+        val draft = assistantDrafts.remove(key) ?: return
         val messageId = draft.messageId ?: return
         val text = draft.text.toString().trim()
         if (text.isBlank()) {
@@ -1911,6 +2035,15 @@ class VoiceAgentService : Service() {
         store.updateMessage(messageId, text, streamState = ChatStreamState.INTERRUPTED)
         EventBus.emitChatMessage(draft.toChatMessage(text, ChatStreamState.INTERRUPTED))
     }
+
+    private fun removeAssistantDrafts(turnId: String) {
+        assistantDrafts.keys
+            .filter { it == turnId || it.startsWith("$turnId:") }
+            .forEach(assistantDrafts::remove)
+    }
+
+    private fun draftKey(turnId: String, modelCall: Int): String =
+        if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) "$turnId:$modelCall" else turnId
 
     private fun discardAssistantDraft(turnId: String) {
         val messageId = assistantDrafts.remove(turnId)?.messageId ?: return
@@ -1938,6 +2071,7 @@ class VoiceAgentService : Service() {
         var suppressed: Boolean = false,
         var persistedLength: Int = 0,
         var lastEmittedAt: Long = 0L,
+        val modelCall: Int = 0,
     ) {
         fun toChatMessage(
             content: String,
@@ -1972,7 +2106,13 @@ class VoiceAgentService : Service() {
             )
         }
         val title = "${toolRegistry.displayName(call.name)}"
-        emitLog("调用工具：$title args=${call.arguments.take(300)}")
+        emitLog(
+            if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+                "调用工具：$title"
+            } else {
+                "调用工具：$title args=${call.arguments.take(300)}"
+            },
+        )
 
         val execution = toolRegistry.execute(call)
         val result = execution.result
@@ -2039,6 +2179,7 @@ class VoiceAgentService : Service() {
     }
 
     private fun compactToolLabel(call: CloudSpeechClient.ToolCall, displayName: String): String {
+        if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) return "🔧 $displayName"
         val summary = toolRegistry.displaySummary(call)
         return if (summary.isNullOrBlank()) "🔧 $displayName" else "🔧 $displayName · $summary"
     }
@@ -2536,7 +2677,16 @@ class VoiceAgentService : Service() {
             append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
             append(executionEnv.credentialProfileSummary())
             append("\n\n全局用户规则：\n")
-            append(store.ruleContext(ruleStore))
+            append(
+                store.ruleContext(
+                    ruleStore,
+                    excludedRuleIds = if (ExperimentConfig.INCLUDE_BUILTIN_DIAGNOSTIC_RULE) {
+                        emptySet()
+                    } else {
+                        setOf(RuleStore.BUILTIN_DIAGNOSTIC_RULE_ID)
+                    },
+                ),
+            )
             append("\n\n跨会话长期记忆：\n")
             append(store.contextSummary())
             if (hubFacts != null) {
@@ -2645,6 +2795,7 @@ class VoiceAgentService : Service() {
         text: String,
         onAudioStarted: () -> Unit = {},
     ) {
+        if (!ExperimentConfig.ENABLE_TTS) return
         val sentenceBuffer = SpeechSegmenter()
         val sentences = buildList {
             addAll(sentenceBuffer.feed(text))
@@ -3045,6 +3196,7 @@ class VoiceAgentService : Service() {
     }
 
     private suspend fun playFullTtsSentence(client: CloudSpeechClient, sentence: String) {
+        if (!ExperimentConfig.ENABLE_TTS) return
         if (sentence.isBlank()) return
         if (ENABLE_STREAMING_TTS) {
             Timber.i("TTS full fallback for chars=${sentence.length}")

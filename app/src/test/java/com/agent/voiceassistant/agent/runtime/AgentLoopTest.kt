@@ -168,6 +168,55 @@ class AgentLoopTest {
     }
 
     @Test
+    fun `body json tool call executes while working text remains observable`() = runBlocking {
+        val raw = """
+            <thinking>
+            intent=L
+            next=tool_call
+            </thinking>
+            {"name":"read","arguments":{"path":"/source/a.kt"}}
+        """.trimIndent()
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(content = raw),
+                    message(content = "<thinking>tool_result=sufficient</thinking>\n<answer>完成</answer>"),
+                ),
+            ),
+        )
+        val events = mutableListOf<AgentEvent>()
+        val experimentConfig = experimentConfig()
+
+        val outcome = AgentLoop(runtime, events::add).run(experimentConfig)
+
+        assertEquals(
+            AgentLoop.Outcome.Completed(
+                "<thinking>tool_result=sufficient</thinking>\n<answer>完成</answer>",
+                true,
+            ),
+            outcome,
+        )
+        assertEquals(1, runtime.executedCalls.size)
+        val observed = events.filterIsInstance<AgentEvent.ModelResponseFinished>()
+        assertEquals(2, observed.size)
+        assertEquals("<thinking>\nintent=L\nnext=tool_call\n</thinking>", observed.first().message.content)
+        assertEquals("read", observed.first().message.toolCalls.single().name)
+    }
+
+    @Test
+    fun `unregistered body json remains ordinary visible output`() = runBlocking {
+        val raw = "<working>next=answer</working>\n{\"name\":\"unknown_tool\",\"arguments\":{}}"
+        val runtime = FakeRuntime(responses = ArrayDeque(listOf(message(content = raw))))
+        val events = mutableListOf<AgentEvent>()
+
+        val outcome = AgentLoop(runtime, events::add).run(experimentConfig())
+
+        assertEquals(AgentLoop.Outcome.Completed(raw, true), outcome)
+        assertTrue(runtime.executedCalls.isEmpty())
+        assertEquals(raw, events.filterIsInstance<AgentEvent.ModelResponseFinished>().single().message.content)
+    }
+
+    @Test
     fun `finalized context includes tool exchange and final assistant`() = runBlocking {
         val call = CloudSpeechClient.ToolCall("call-1", "read", "{\"path\":\"/source/a.kt\"}")
         val runtime = FakeRuntime(
@@ -606,6 +655,15 @@ class AgentLoopTest {
         allowReasoningEscalation = true,
         onContextFinalized = onContextFinalized,
         onTurnCompleted = onTurnCompleted,
+    )
+
+    private fun experimentConfig() = config().copy(
+        enableBodyToolAdapter = true,
+        enableModelFormatRepair = false,
+        enableEmptyFinalRetry = false,
+        enableStreamIntegrityRetry = false,
+        enableActiveToolBudget = false,
+        enableForcedFinalSummary = false,
     )
 
     private fun message(
