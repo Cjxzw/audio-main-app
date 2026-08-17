@@ -32,6 +32,7 @@ class AgentLoop(
         val enableStreamIntegrityRetry: Boolean = true,
         val enableActiveToolBudget: Boolean = true,
         val enableForcedFinalSummary: Boolean = true,
+        val enableFinalResponseFormatRepair: Boolean = false,
         val monotonicNowMs: () -> Long = { System.nanoTime() / 1_000_000L },
         val initialBusinessToolCallCount: Int = 0,
         val initialActiveElapsedMs: Long = 0,
@@ -88,6 +89,11 @@ class AgentLoop(
         ): ModelTurn
 
         fun normalizeAssistant(message: CloudSpeechClient.LlmMessage): CloudSpeechClient.LlmMessage
+        fun hasUsableFinalResponse(message: CloudSpeechClient.LlmMessage): Boolean =
+            !message.content.isNullOrBlank()
+
+        fun finalResponseFormatRepairInstruction(): String =
+            "上一条回复格式不完整，无法提取给用户的正文。请重新返回完整格式，并确保 <answer>...</answer> 中包含最终回复正文；不要解释本次修正。"
         fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean = false
         suspend fun executeTerminalPresentation(call: CloudSpeechClient.ToolCall): TerminalExecution =
             TerminalExecution(
@@ -338,6 +344,24 @@ class AgentLoop(
             ): Outcome.Completed {
                 val finalText = assistant.content.orEmpty().trim()
                 if (finalText.isBlank()) {
+                    if (config.enableFinalResponseFormatRepair && allowFormatRepair) {
+                        workingMessages += CloudSpeechClient.LlmMessage(
+                            role = "system",
+                            content = runtime.finalResponseFormatRepairInstruction(),
+                        )
+                        val (repairedStreamed, repairedAssistant) = requestModel(
+                            tools = emptyList(),
+                            maxCompletionTokens = retryMaxCompletionTokens,
+                        )
+                        return completeAssistant(
+                            streamed = repairedStreamed,
+                            assistant = repairedAssistant,
+                            allowFormatRepair = false,
+                            emitFinishedOnSuccess = emitFinishedOnSuccess,
+                            emptyFinalRetriesRemaining = emptyFinalRetriesRemaining,
+                            retryMaxCompletionTokens = retryMaxCompletionTokens,
+                        )
+                    }
                     if (config.enableEmptyFinalRetry && emptyFinalRetriesRemaining > 0) {
                         val attempt = MAX_EMPTY_FINAL_RETRIES - emptyFinalRetriesRemaining + 1
                         eventSink(
@@ -391,6 +415,28 @@ class AgentLoop(
                     workingMessages += CloudSpeechClient.LlmMessage("system", buildFinalFormatRepairInstruction())
                     val (retryStreamed, retryAssistant) = requestModel(runtime.toolDefinitions(config.allowReasoningEscalation))
                     return completeAssistant(retryStreamed, retryAssistant, allowFormatRepair = false)
+                }
+                if (!runtime.hasUsableFinalResponse(assistant)) {
+                    if (config.enableFinalResponseFormatRepair && allowFormatRepair) {
+                        workingMessages += assistant.copy(responseMetadata = null)
+                        workingMessages += CloudSpeechClient.LlmMessage(
+                            role = "system",
+                            content = runtime.finalResponseFormatRepairInstruction(),
+                        )
+                        val (repairedStreamed, repairedAssistant) = requestModel(
+                            tools = emptyList(),
+                            maxCompletionTokens = retryMaxCompletionTokens,
+                        )
+                        return completeAssistant(
+                            streamed = repairedStreamed,
+                            assistant = repairedAssistant,
+                            allowFormatRepair = false,
+                            emitFinishedOnSuccess = emitFinishedOnSuccess,
+                            emptyFinalRetriesRemaining = emptyFinalRetriesRemaining,
+                            retryMaxCompletionTokens = retryMaxCompletionTokens,
+                        )
+                    }
+                    return finishLocalFailure("这次回复格式不完整，请再试一次。")
                 }
                 if (emitFinishedOnSuccess) {
                     eventSink(AgentEvent.MessageFinished(turnId, assistant))

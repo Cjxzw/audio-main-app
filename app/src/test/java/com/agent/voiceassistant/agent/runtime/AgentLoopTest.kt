@@ -1,5 +1,6 @@
 package com.agent.voiceassistant.agent.runtime
 
+import com.agent.voiceassistant.agent.ExperimentalReplyParser
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -214,6 +215,30 @@ class AgentLoopTest {
         assertEquals(AgentLoop.Outcome.Completed(raw, true), outcome)
         assertTrue(runtime.executedCalls.isEmpty())
         assertEquals(raw, events.filterIsInstance<AgentEvent.ModelResponseFinished>().single().message.content)
+    }
+
+    @Test
+    fun `unusable structured final response is repaired once without tools`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(
+                listOf(
+                    message(content = "<thinking>还没有形成正文</thinking>"),
+                    message(content = "<answer>最终回答</answer>"),
+                ),
+            ),
+            finalResponseUsable = { response ->
+                ExperimentalReplyParser.parse(response.content.orEmpty()).hasUsableAnswer
+            },
+        )
+
+        val outcome = AgentLoop(runtime).run(
+            experimentConfig().copy(enableFinalResponseFormatRepair = true),
+        )
+
+        assertEquals(AgentLoop.Outcome.Completed("<answer>最终回答</answer>", true), outcome)
+        assertEquals(2, runtime.requests.size)
+        assertTrue(runtime.requests.last().tools.isEmpty())
+        assertTrue(runtime.requests.last().messages.last().content.orEmpty().contains("<answer>"))
     }
 
     @Test
@@ -682,6 +707,9 @@ class AgentLoopTest {
         private val parallelToolNames: Set<String> = emptySet(),
         private val toolDelayMs: Long = 0,
         private val terminalToolNames: Set<String> = emptySet(),
+        private val finalResponseUsable: (CloudSpeechClient.LlmMessage) -> Boolean = {
+            !it.content.isNullOrBlank()
+        },
     ) : AgentLoop.Runtime {
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
@@ -734,6 +762,9 @@ class AgentLoopTest {
         }
 
         override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) = message
+
+        override fun hasUsableFinalResponse(message: CloudSpeechClient.LlmMessage) =
+            finalResponseUsable(message)
 
         override fun isTerminalPresentation(call: CloudSpeechClient.ToolCall) =
             call.name in terminalToolNames

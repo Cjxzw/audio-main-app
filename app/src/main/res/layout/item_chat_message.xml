@@ -51,17 +51,13 @@
                 android:src="@drawable/ic_chevron_down_24" />
         </LinearLayout>
 
-        <TextView
-            android:id="@+id/tvReasoning"
+        <LinearLayout
+            android:id="@+id/llReasoningContent"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:paddingHorizontal="12dp"
+            android:orientation="vertical"
             android:paddingBottom="10dp"
-            android:scrollbars="vertical"
-            android:overScrollMode="ifContentScrolls"
-            android:textColor="@color/text_secondary"
-            android:textIsSelectable="true"
-            android:textSize="13sp" />
+            android:visibility="gone" />
     </LinearLayout>
 
     <TextView

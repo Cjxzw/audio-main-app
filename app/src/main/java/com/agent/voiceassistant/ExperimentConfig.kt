@@ -4,8 +4,11 @@ package com.agent.voiceassistant
 object ExperimentConfig {
     const val ENABLE_INTENT_ROUTING = false
     const val ENABLE_FINAL_REFINEMENT = false
-    const val ENABLE_TTS = false
+    const val ENABLE_TTS = true
+    const val ENABLE_PERSONALIZED_TTS_TOOL = false
     const val SHOW_RAW_MODEL_TEXT = true
+    const val ENABLE_STRUCTURED_REPLY_PRESENTATION = true
+    const val ENABLE_FINAL_RESPONSE_FORMAT_REPAIR = true
     const val ENABLE_BODY_TOOL_ADAPTER = true
     const val ENABLE_MODEL_FORMAT_REPAIR = false
     const val ENABLE_EMPTY_FINAL_RETRY = false

@@ -12,6 +12,15 @@ enum class ChatPresentation { STANDARD, PERSONALIZED_VOICE }
 
 enum class ChatStreamState { STREAMING, COMPLETED, INTERRUPTED }
 
+enum class ReasoningItemKind { MARKDOWN, TOOL }
+
+data class ReasoningDisplayItem(
+    val kind: ReasoningItemKind,
+    val text: String,
+    val toolCallId: String? = null,
+    val toolStatus: ToolDisplayStatus? = null,
+)
+
 data class ChatMessage(
     val role: ChatRole,
     val text: String,
@@ -22,6 +31,7 @@ data class ChatMessage(
     val presentation: ChatPresentation = ChatPresentation.STANDARD,
     val streamState: ChatStreamState? = null,
     val reasoningText: String? = null,
+    val reasoningItems: List<ReasoningDisplayItem> = emptyList(),
     val modelId: String? = null,
     val promptTokens: Long? = null,
     val contextWindowTokens: Long? = null,

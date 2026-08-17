@@ -29,6 +29,7 @@ import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
 import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
+import com.agent.voiceassistant.agent.ExperimentalReplyParser
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.agent.VoiceReplyLengthGate
@@ -99,6 +100,8 @@ import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
 import com.agent.voiceassistant.ui.ChatStreamState
 import com.agent.voiceassistant.ui.ToolDisplayStatus
+import com.agent.voiceassistant.ui.ReasoningDisplayItem
+import com.agent.voiceassistant.ui.ReasoningItemKind
 import com.agent.voiceassistant.workspace.WorkspaceRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -375,6 +378,7 @@ class VoiceAgentService : Service() {
     private val backgroundLlmTasks = Channel<BackgroundLlmTask>(Channel.UNLIMITED)
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
     private val assistantDrafts = ConcurrentHashMap<String, AssistantDraft>()
+    private val turnPresentationDrafts = ConcurrentHashMap<String, TurnPresentationDraft>()
     private val thinkingFeedbackLock = Any()
     private val speechInterruptedForUrgentReport = AtomicBoolean(false)
     private val newConversationInProgress = AtomicBoolean(false)
@@ -1202,7 +1206,7 @@ class VoiceAgentService : Service() {
                             },
                             allowReasoningEscalation = allowReasoningEscalation,
                         ).filterNot { definition ->
-                            !ExperimentConfig.ENABLE_TTS &&
+                            !ExperimentConfig.ENABLE_PERSONALIZED_TTS_TOOL &&
                                 definition.name == MainToolRegistry.TOOL_VOICE_REPLY
                         }
                     } else {
@@ -1256,6 +1260,13 @@ class VoiceAgentService : Service() {
 
                 override fun normalizeAssistant(message: CloudSpeechClient.LlmMessage) =
                     if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) message else normalizeLegacyMessage(message)
+
+                override fun hasUsableFinalResponse(message: CloudSpeechClient.LlmMessage): Boolean =
+                    if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                        ExperimentalReplyParser.parse(message.content.orEmpty()).hasUsableAnswer
+                    } else {
+                        !message.content.isNullOrBlank()
+                    }
 
                 override fun adaptBodyToolCall(
                     call: BodyToolCall,
@@ -1482,6 +1493,31 @@ class VoiceAgentService : Service() {
                     streamedSpeech: Boolean,
                 ): Boolean {
                     val rawText = message.content.orEmpty().trim()
+                    if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                        val parsed = ExperimentalReplyParser.parse(rawText)
+                        val displayText = composeExperimentalDisplay(parsed.answer, parsed.details)
+                        finalizedAssistantForContext = message.copy(content = displayText)
+                        finishTurnPresentation(turnId, parsed, rawText, message.responseMetadata)
+                        emitLog("助手: ${parsed.answer.take(MAX_LOG_PREVIEW_CHARS)}")
+                        awaitReasoningFeedback()
+                        if (speakReplies && speechClient != null && parsed.answer.isNotBlank()) {
+                            try {
+                                beforeSpeech()
+                                speakAssistantText(
+                                    speechClient,
+                                    optimizeSpokenReply(parsed.answer),
+                                    onAudioStarted = { metricsTracker?.markAudioStarted() },
+                                )
+                                return true
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Throwable) {
+                                Timber.w(error, "Final answer TTS failed after response persisted")
+                                runCatching { earcons.error() }
+                            }
+                        }
+                        return false
+                    }
                     val presentation = if (voiceReplyGate != null) {
                         prepareVoiceReplyPresentation(llmClient, rawText)
                     } else {
@@ -1550,6 +1586,7 @@ class VoiceAgentService : Service() {
                     enableStreamIntegrityRetry = ExperimentConfig.ENABLE_STREAM_INTEGRITY_RETRY,
                     enableActiveToolBudget = ExperimentConfig.ENABLE_ACTIVE_TOOL_BUDGET,
                     enableForcedFinalSummary = ExperimentConfig.ENABLE_FORCED_FINAL_SUMMARY,
+                    enableFinalResponseFormatRepair = ExperimentConfig.ENABLE_FINAL_RESPONSE_FORMAT_REPAIR,
                     beforeSpeech = beforeSpeech,
                     onContextFinalized = { turnId, context ->
                         val replacement = finalizedAssistantForContext
@@ -1735,7 +1772,11 @@ class VoiceAgentService : Service() {
                     "agent.tool.started",
                     "turn=${event.turnId} id=${event.call.id} name=${event.call.name}",
                 )
-                startToolStatus(event.call, event.displayName)
+                if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                    startTurnToolStatus(event.turnId, event.call, event.displayName)
+                } else {
+                    startToolStatus(event.call, event.displayName)
+                }
             }
             is AgentEvent.ParallelToolsStarted -> DiagLog.i(
                 "agent.tools.parallel",
@@ -1746,7 +1787,11 @@ class VoiceAgentService : Service() {
                     "agent.tool.finished",
                     "turn=${event.turnId} id=${event.call.id} success=${event.success} blocked=${event.blocked}",
                 )
-                finishToolStatus(event.call, event.success && !event.blocked)
+                if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                    finishTurnToolStatus(event.turnId, event.call, event.success && !event.blocked)
+                } else {
+                    finishToolStatus(event.call, event.success && !event.blocked)
+                }
                 if (!toolRegistry.isReasoningEscalation(event.call)) {
                     when {
                         event.call.name == MainToolRegistry.TOOL_SKILL_USE -> store.recordEphemeralToolResult(
@@ -1763,7 +1808,11 @@ class VoiceAgentService : Service() {
                 "turn=${event.turnId} chars=${event.finalText.length}",
             )
             is AgentEvent.AgentFailed -> {
-                interruptAssistantDrafts(event.turnId)
+                if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                    interruptTurnPresentation(event.turnId)
+                } else {
+                    interruptAssistantDrafts(event.turnId)
+                }
                 DiagLog.w(
                     "agent.loop.failed",
                     "turn=${event.turnId} error=${event.error}",
@@ -1797,7 +1846,9 @@ class VoiceAgentService : Service() {
                 )
             }
             is AgentEvent.MessageStarted -> {
-                if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
+                if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                    startTurnModelCall(event.turnId, event.modelCall)
+                } else if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
                     assistantDrafts[draftKey(event.turnId, event.modelCall)] = AssistantDraft(
                         modelCall = event.modelCall,
                     )
@@ -1818,15 +1869,256 @@ class VoiceAgentService : Service() {
                 "turn=${event.turnId} attempt=${event.attempt}/${event.maxRetries} reason=blank_final",
             )
             is AgentEvent.ContentDelta -> if (event.userVisible) {
-                appendAssistantDraft(event.turnId, event.text, event.modelCall)
+                if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                    appendTurnContent(event.turnId, event.text, event.modelCall)
+                } else {
+                    appendAssistantDraft(event.turnId, event.text, event.modelCall)
+                }
             }
             is AgentEvent.ToolCallDetected -> Unit
-            is AgentEvent.ModelResponseFinished -> if (ExperimentConfig.SHOW_RAW_MODEL_TEXT) {
-                finishModelObservation(event.turnId, event.modelCall, event.message)
+            is AgentEvent.ModelResponseFinished -> when {
+                ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION ->
+                    finishTurnModelCall(event.turnId, event.modelCall, event.message)
+                ExperimentConfig.SHOW_RAW_MODEL_TEXT ->
+                    finishModelObservation(event.turnId, event.modelCall, event.message)
+                else -> Unit
             }
-            is AgentEvent.AgentFinished -> removeAssistantDrafts(event.turnId)
-            is AgentEvent.ReasoningDelta -> appendAssistantReasoning(event.turnId, event.text, event.modelCall)
+            is AgentEvent.AgentFinished -> {
+                turnPresentationDrafts.remove(event.turnId)
+                removeAssistantDrafts(event.turnId)
+            }
+            is AgentEvent.ReasoningDelta -> if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                appendTurnNativeReasoning(event.turnId, event.text, event.modelCall)
+            } else {
+                appendAssistantReasoning(event.turnId, event.text, event.modelCall)
+            }
             is AgentEvent.ToolProgress -> Unit
+        }
+    }
+
+    private fun startTurnModelCall(turnId: String, modelCall: Int) {
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            draft.modelCall = modelCall
+            draft.currentRaw.setLength(0)
+            draft.currentNativeReasoning.setLength(0)
+            draft.answer = ""
+            draft.details = ""
+        }
+    }
+
+    private fun appendTurnContent(turnId: String, delta: String, modelCall: Int) {
+        if (delta.isEmpty()) return
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            if (draft.modelCall != modelCall) startTurnModelCall(turnId, modelCall)
+            draft.currentRaw.append(delta)
+            emitTurnPresentation(draft, streaming = true)
+        }
+    }
+
+    private fun appendTurnNativeReasoning(turnId: String, delta: String, modelCall: Int) {
+        if (delta.isEmpty()) return
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            if (draft.modelCall != modelCall) startTurnModelCall(turnId, modelCall)
+            draft.currentNativeReasoning.append(delta)
+            emitTurnPresentation(draft, streaming = true)
+        }
+    }
+
+    private fun finishTurnModelCall(
+        turnId: String,
+        modelCall: Int,
+        message: CloudSpeechClient.LlmMessage,
+    ) {
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            draft.modelCall = modelCall
+            val parsed = ExperimentalReplyParser.parse(message.content.orEmpty())
+            draft.addMarkdown(draft.currentNativeReasoning.toString())
+            draft.addMarkdown(parsed.thinking)
+            if (message.toolCalls.isNotEmpty()) {
+                // Any pre-tool prose remains observable, but it cannot become the final answer.
+                draft.addMarkdown(parsed.answer)
+                draft.addMarkdown(parsed.details)
+                draft.answer = ""
+                draft.details = ""
+            } else {
+                draft.answer = parsed.answer
+                draft.details = parsed.details
+                draft.metadata = message.responseMetadata
+            }
+            draft.currentRaw.setLength(0)
+            draft.currentNativeReasoning.setLength(0)
+            emitTurnPresentation(draft, streaming = true)
+        }
+    }
+
+    private fun startTurnToolStatus(
+        turnId: String,
+        call: CloudSpeechClient.ToolCall,
+        displayName: String,
+    ) {
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            draft.items += ReasoningDisplayItem(
+                kind = ReasoningItemKind.TOOL,
+                text = compactToolLabel(call, displayName),
+                toolCallId = call.id,
+                toolStatus = ToolDisplayStatus.RUNNING,
+            )
+            emitTurnPresentation(draft, streaming = true, forcePersist = true)
+        }
+    }
+
+    private fun finishTurnToolStatus(turnId: String, call: CloudSpeechClient.ToolCall, success: Boolean) {
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            val status = if (success) ToolDisplayStatus.SUCCEEDED else ToolDisplayStatus.FAILED
+            val index = draft.items.indexOfLast { it.kind == ReasoningItemKind.TOOL && it.toolCallId == call.id }
+            val updated = ReasoningDisplayItem(
+                kind = ReasoningItemKind.TOOL,
+                text = compactToolLabel(call, toolRegistry.displayName(call.name)),
+                toolCallId = call.id,
+                toolStatus = status,
+            )
+            if (index >= 0) draft.items[index] = updated else draft.items += updated
+            emitTurnPresentation(draft, streaming = true, forcePersist = true)
+        }
+    }
+
+    private fun finishTurnPresentation(
+        turnId: String,
+        parsed: ExperimentalReplyParser.Result,
+        rawText: String,
+        metadata: CloudSpeechClient.ResponseMetadata?,
+    ) {
+        val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
+        synchronized(draft) {
+            draft.answer = parsed.answer
+            draft.details = parsed.details
+            draft.metadata = metadata
+            emitTurnPresentation(draft, streaming = false, forcePersist = true)
+            draft.messageId?.let { store.setLlmContent(it, rawText) }
+        }
+    }
+
+    private fun interruptTurnPresentation(turnId: String) {
+        val draft = turnPresentationDrafts[turnId] ?: return
+        synchronized(draft) {
+            val parsed = ExperimentalReplyParser.parse(draft.currentRaw.toString())
+            draft.addMarkdown(draft.currentNativeReasoning.toString())
+            draft.addMarkdown(parsed.thinking)
+            if (draft.answer.isBlank()) draft.answer = parsed.answer
+            if (draft.details.isBlank()) draft.details = parsed.details
+            emitTurnPresentation(draft, streaming = false, forcePersist = true, interrupted = true)
+        }
+    }
+
+    private fun emitTurnPresentation(
+        draft: TurnPresentationDraft,
+        streaming: Boolean,
+        forcePersist: Boolean = false,
+        interrupted: Boolean = false,
+    ) {
+        val current = ExperimentalReplyParser.parseStreaming(draft.currentRaw.toString())
+        val previewItems = buildList {
+            addAll(draft.items)
+            draft.currentNativeReasoning.toString().trim().takeIf(String::isNotBlank)?.let {
+                add(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, it))
+            }
+            current.thinking.takeIf(String::isNotBlank)?.let {
+                add(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, it))
+            }
+        }
+        val answer = if (draft.currentRaw.isNotEmpty()) current.answer else draft.answer
+        val details = if (draft.currentRaw.isNotEmpty()) current.details else draft.details
+        val displayText = composeExperimentalDisplay(answer, details)
+        if (displayText.isBlank() && previewItems.isEmpty()) return
+        val state = when {
+            interrupted -> ChatStreamState.INTERRUPTED
+            streaming -> ChatStreamState.STREAMING
+            else -> ChatStreamState.COMPLETED
+        }
+        val now = SystemClock.elapsedRealtime()
+        val shouldPersist = forcePersist || draft.messageId == null ||
+            now - draft.lastPersistedAt >= DRAFT_UI_INTERVAL_MS ||
+            displayText.length - draft.persistedLength >= DRAFT_PERSIST_CHARS
+        if (draft.messageId == null) {
+            val stored = store.addMessage(
+                role = "assistant",
+                content = displayText,
+                streamState = state,
+                reasoningItems = previewItems,
+                responseMetadata = draft.metadata,
+                llmVisible = !streaming,
+            )
+            draft.messageId = stored.id
+            draft.timestamp = stored.timestamp
+            draft.lastPersistedAt = now
+            draft.persistedLength = displayText.length
+        } else if (shouldPersist) {
+            store.updateMessage(
+                messageId = requireNotNull(draft.messageId),
+                content = displayText,
+                streamState = state,
+                reasoningItems = previewItems,
+                responseMetadata = draft.metadata,
+                llmVisible = !streaming,
+            )
+            draft.lastPersistedAt = now
+            draft.persistedLength = displayText.length
+        }
+        if (draft.lastEmittedAt == 0L || forcePersist || now - draft.lastEmittedAt >= DRAFT_UI_INTERVAL_MS) {
+            draft.lastEmittedAt = now
+            EventBus.emitChatMessage(
+                ChatMessage(
+                    role = ChatRole.BOT,
+                    text = displayText,
+                    timestamp = draft.timestamp,
+                    messageId = draft.messageId,
+                    streamState = state,
+                    reasoningItems = previewItems,
+                    modelId = draft.metadata?.modelId,
+                    promptTokens = draft.metadata?.promptTokens,
+                    contextWindowTokens = draft.metadata?.contextWindowTokens,
+                    promptTokensEstimated = draft.metadata?.promptTokensEstimated == true,
+                ),
+            )
+        }
+    }
+
+    private fun composeExperimentalDisplay(answer: String, details: String): String = buildString {
+        append(answer.trim())
+        if (details.isNotBlank()) {
+            if (isNotEmpty()) append("\n\n")
+            append(ReplyDetailPolicy.OPEN_TAG).append('\n')
+            append(details.trim()).append('\n')
+            append(ReplyDetailPolicy.CLOSE_TAG)
+        }
+    }
+
+    private data class TurnPresentationDraft(
+        val items: MutableList<ReasoningDisplayItem> = mutableListOf(),
+        val currentRaw: StringBuilder = StringBuilder(),
+        val currentNativeReasoning: StringBuilder = StringBuilder(),
+        var answer: String = "",
+        var details: String = "",
+        var messageId: String? = null,
+        var timestamp: Long = System.currentTimeMillis(),
+        var modelCall: Int = 0,
+        var metadata: CloudSpeechClient.ResponseMetadata? = null,
+        var persistedLength: Int = 0,
+        var lastPersistedAt: Long = 0L,
+        var lastEmittedAt: Long = 0L,
+    ) {
+        fun addMarkdown(text: String) {
+            val normalized = text.trim()
+            if (normalized.isBlank()) return
+            val last = items.lastOrNull()
+            if (last?.kind == ReasoningItemKind.MARKDOWN && last.text == normalized) return
+            items += ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, normalized)
         }
     }
 
@@ -2363,6 +2655,7 @@ class VoiceAgentService : Service() {
     }
 
     private fun shouldStreamDirectSpeech(request: CloudSpeechClient.ChatRequest): Boolean {
+        if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) return false
         // Deep reasoning and post-tool final answers are still user-visible text.
         // Reasoning deltas and native tool calls are parsed separately and never enter this path.
         val latestUserText = request.messages.lastOrNull { it.role == "user" }?.content.orEmpty()

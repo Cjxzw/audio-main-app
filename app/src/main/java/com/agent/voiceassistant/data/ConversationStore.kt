@@ -8,6 +8,8 @@ import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
 import com.agent.voiceassistant.ui.ChatStreamState
+import com.agent.voiceassistant.ui.ReasoningDisplayItem
+import com.agent.voiceassistant.ui.ReasoningItemKind
 import com.agent.voiceassistant.ui.ToolDisplayStatus
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -131,6 +133,7 @@ class ConversationStore(context: Context) {
         streamState: ChatStreamState? = null,
         attachments: List<StoredAttachment> = emptyList(),
         reasoningText: String? = null,
+        reasoningItems: List<ReasoningDisplayItem> = emptyList(),
         responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
         llmVisible: Boolean? = null,
     ): StoredMessage {
@@ -150,6 +153,7 @@ class ConversationStore(context: Context) {
             streamState = streamState?.name,
             attachments = attachments,
             reasoningText = reasoningText,
+            reasoningItems = reasoningItems.map(ReasoningDisplayItem::toStored),
             modelId = responseMetadata?.modelId,
             promptTokens = responseMetadata?.promptTokens,
             completionTokens = responseMetadata?.completionTokens,
@@ -221,6 +225,7 @@ class ConversationStore(context: Context) {
         toolStatus: ToolDisplayStatus? = null,
         streamState: ChatStreamState? = null,
         reasoningText: String? = null,
+        reasoningItems: List<ReasoningDisplayItem>? = null,
         responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
         llmVisible: Boolean? = null,
     ): StoredMessage? {
@@ -234,6 +239,8 @@ class ConversationStore(context: Context) {
                 toolStatus = toolStatus?.name ?: session.messages[index].toolStatus,
                 streamState = streamState?.name ?: session.messages[index].streamState,
                 reasoningText = reasoningText ?: session.messages[index].reasoningText,
+                reasoningItems = reasoningItems?.map(ReasoningDisplayItem::toStored)
+                    ?: session.messages[index].reasoningItems,
                 modelId = responseMetadata?.modelId ?: session.messages[index].modelId,
                 promptTokens = responseMetadata?.promptTokens ?: session.messages[index].promptTokens,
                 completionTokens = responseMetadata?.completionTokens ?: session.messages[index].completionTokens,
@@ -786,6 +793,7 @@ class ConversationStore(context: Context) {
                 runCatching { ChatStreamState.valueOf(stored) }.getOrNull()
             },
             reasoningText = reasoningText,
+            reasoningItems = reasoningItems.map(StoredReasoningDisplayItem::toUi),
             modelId = modelId,
             promptTokens = promptTokens,
             contextWindowTokens = contextWindowTokens,
@@ -1034,6 +1042,7 @@ data class StoredMessage(
     val streamState: String? = null,
     val attachments: List<StoredAttachment> = emptyList(),
     val reasoningText: String? = null,
+    val reasoningItems: List<StoredReasoningDisplayItem> = emptyList(),
     val modelId: String? = null,
     val promptTokens: Long? = null,
     val completionTokens: Long? = null,
@@ -1042,6 +1051,28 @@ data class StoredMessage(
     val promptTokensEstimated: Boolean? = null,
     val finishReason: String? = null,
     val streamComplete: Boolean? = null,
+)
+
+@Serializable
+data class StoredReasoningDisplayItem(
+    val kind: String,
+    val text: String,
+    val toolCallId: String? = null,
+    val toolStatus: String? = null,
+)
+
+private fun ReasoningDisplayItem.toStored() = StoredReasoningDisplayItem(
+    kind = kind.name,
+    text = text,
+    toolCallId = toolCallId,
+    toolStatus = toolStatus?.name,
+)
+
+private fun StoredReasoningDisplayItem.toUi() = ReasoningDisplayItem(
+    kind = runCatching { ReasoningItemKind.valueOf(kind) }.getOrDefault(ReasoningItemKind.MARKDOWN),
+    text = text,
+    toolCallId = toolCallId,
+    toolStatus = toolStatus?.let { runCatching { ToolDisplayStatus.valueOf(it) }.getOrNull() },
 )
 
 @Serializable
