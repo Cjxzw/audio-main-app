@@ -74,6 +74,21 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
             addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_realtime)
+                summary = RealtimePipelineRepository(requireContext()).activePipeline().let { pipeline ->
+                    if (pipeline == VoicePipeline.STEPFUN_REALTIME) {
+                        getString(R.string.settings_realtime_active_summary)
+                    } else {
+                        getString(R.string.settings_realtime_summary)
+                    }
+                }
+                setIcon(R.drawable.ic_volume_24)
+                setOnPreferenceClickListener {
+                    (activity as SettingsActivity).open(StepFunRealtimeSettingsFragment(), getString(R.string.settings_realtime))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_custom_llm)
                 summary = getString(R.string.settings_models_summary)
                 setIcon(R.drawable.ic_model_24)
@@ -128,6 +143,95 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
         }
+    }
+}
+
+class StepFunRealtimeSettingsFragment : PreferenceFragmentCompat() {
+    private lateinit var repository: RealtimePipelineRepository
+
+    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        repository = RealtimePipelineRepository(requireContext())
+        rebuild()
+    }
+
+    private fun rebuild() {
+        val config = repository.stepFunConfig()
+        preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            addPreference(ListPreference(requireContext()).apply {
+                key = "voice_pipeline"
+                title = getString(R.string.settings_realtime_pipeline)
+                entries = arrayOf(getString(R.string.settings_realtime_pipeline_mimo), getString(R.string.settings_realtime_pipeline_stepfun))
+                entryValues = arrayOf(VoicePipeline.MIMO_STANDARD.name, VoicePipeline.STEPFUN_REALTIME.name)
+                value = repository.activePipeline().name
+                summary = entry
+                setOnPreferenceChangeListener { preference, selected ->
+                    val pipeline = runCatching { VoicePipeline.valueOf(selected.toString()) }.getOrNull()
+                        ?: return@setOnPreferenceChangeListener false
+                    if (pipeline == VoicePipeline.STEPFUN_REALTIME && !repository.hasStepFunKey()) {
+                        Toast.makeText(requireContext(), getString(R.string.settings_realtime_key_missing), Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    repository.setActivePipeline(pipeline)
+                    preference.summary = entries[entryValues.indexOf(selected.toString())]
+                    true
+                }
+            })
+            addPreference(EditTextPreference(requireContext()).apply {
+                key = "stepfun_realtime_api_key"
+                isPersistent = false
+                title = getString(R.string.settings_realtime_key)
+                summary = if (repository.hasStepFunKey()) getString(R.string.settings_realtime_key_configured) else getString(R.string.settings_realtime_key_missing)
+                bindLightDialogInput { field ->
+                    field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    field.setSingleLine(true)
+                }
+                setOnPreferenceChangeListener { _, value ->
+                    runCatching { repository.saveStepFunConfig(config, value.toString()) }
+                        .onSuccess { rebuild() }
+                        .onFailure { Toast.makeText(requireContext(), it.message, Toast.LENGTH_LONG).show() }
+                    false
+                }
+            })
+            addPreference(EditTextPreference(requireContext()).apply {
+                key = "stepfun_realtime_model"
+                title = getString(R.string.settings_realtime_model)
+                summary = config.modelId
+                text = config.modelId
+                setOnPreferenceChangeListener { preference, value ->
+                    save(config.copy(modelId = value.toString()))
+                    preference.summary = value.toString().trim()
+                    true
+                }
+            })
+            addPreference(EditTextPreference(requireContext()).apply {
+                key = "stepfun_realtime_voice"
+                title = getString(R.string.settings_realtime_voice)
+                summary = config.voice
+                text = config.voice
+                setOnPreferenceChangeListener { preference, value ->
+                    save(config.copy(voice = value.toString()))
+                    preference.summary = value.toString().trim()
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_realtime_clear)
+                isEnabled = repository.hasStepFunKey()
+                setOnPreferenceClickListener {
+                    repository.clearStepFunKey()
+                    if (repository.activePipeline() == VoicePipeline.STEPFUN_REALTIME) {
+                        repository.setActivePipeline(VoicePipeline.MIMO_STANDARD)
+                    }
+                    rebuild()
+                    true
+                }
+            })
+        }
+    }
+
+    private fun save(config: StepFunRealtimeConfig) {
+        runCatching { repository.saveStepFunConfig(config) }
+            .onFailure { Toast.makeText(requireContext(), it.message, Toast.LENGTH_LONG).show() }
     }
 }
 

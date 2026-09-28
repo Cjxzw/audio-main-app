@@ -54,8 +54,12 @@ class ConversationStore(context: Context) {
     val currentConversationId: String
         get() = synchronized(lock) { state.currentConversationId }
 
-    fun conversationSummaries(): List<ConversationSummary> = synchronized(lock) {
-        state.sessions.sortedByDescending { it.updatedAt }.map { session ->
+    fun conversationSummaries(domain: ConversationDomain? = null): List<ConversationSummary> = synchronized(lock) {
+        state.sessions
+            .asSequence()
+            .filter { domain == null || it.domain == domain }
+            .sortedByDescending { it.updatedAt }
+            .map { session ->
             ConversationSummary(
                 id = session.id,
                 title = session.title.ifBlank { defaultConversationTitle(session.createdAt) },
@@ -68,7 +72,8 @@ class ConversationStore(context: Context) {
                 current = session.id == state.currentConversationId,
                 memoryCompressedAt = session.memoryCompressedAt,
             )
-        }
+            }
+            .toList()
     }
 
     fun currentConversationSummary(): ConversationSummary = synchronized(lock) {
@@ -178,8 +183,12 @@ class ConversationStore(context: Context) {
         role: String,
         content: String,
         timestamp: Long = System.currentTimeMillis(),
+        toolCallId: String? = null,
+        toolStatus: ToolDisplayStatus? = null,
         presentation: ChatPresentation = ChatPresentation.STANDARD,
         streamState: ChatStreamState? = null,
+        reasoningItems: List<ReasoningDisplayItem> = emptyList(),
+        llmVisible: Boolean? = null,
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -191,8 +200,12 @@ class ConversationStore(context: Context) {
             role = normalizedRole,
             content = content,
             timestamp = timestamp,
+            toolCallId = toolCallId,
+            toolStatus = toolStatus?.name,
             presentation = presentation.name,
             streamState = streamState?.name,
+            reasoningItems = reasoningItems.map(ReasoningDisplayItem::toStored),
+            llmVisible = llmVisible,
         )
         synchronized(lock) {
             val session = state.sessions.firstOrNull { it.id == conversationId }
@@ -207,6 +220,132 @@ class ConversationStore(context: Context) {
             persistLocked()
         }
         return message
+    }
+
+    fun updateMessageInConversation(
+        conversationId: String,
+        messageId: String,
+        content: String,
+        timestamp: Long = System.currentTimeMillis(),
+        toolStatus: ToolDisplayStatus? = null,
+        streamState: ChatStreamState? = null,
+        reasoningItems: List<ReasoningDisplayItem>? = null,
+        llmVisible: Boolean? = null,
+    ): StoredMessage? = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized null
+        val index = session.messages.indexOfFirst { it.id == messageId }
+        if (index < 0) return@synchronized null
+        val previous = session.messages[index]
+        val updated = previous.copy(
+            content = content,
+            timestamp = timestamp,
+            toolStatus = toolStatus?.name ?: previous.toolStatus,
+            streamState = streamState?.name ?: previous.streamState,
+            reasoningItems = reasoningItems?.map(ReasoningDisplayItem::toStored) ?: previous.reasoningItems,
+            llmVisible = llmVisible ?: previous.llmVisible,
+        )
+        session.messages[index] = updated
+        session.updatedAt = timestamp
+        persistLocked()
+        updated
+    }
+
+    fun addToolResultToConversation(
+        conversationId: String,
+        turnId: String,
+        call: CloudSpeechClient.ToolCall,
+        result: CloudSpeechClient.LlmMessage,
+        success: Boolean,
+        timestamp: Long = System.currentTimeMillis(),
+    ): StoredMessage {
+        val rawContent = recordToolTrace(turnId, call, result, success, timestamp)
+        return addLlmMessageToConversation(
+            conversationId,
+            result.copy(content = ToolHistoryPolicy.compact(rawContent, turnId, call.id)),
+            timestamp,
+        )
+    }
+
+    private fun addLlmMessageToConversation(
+        conversationId: String,
+        message: CloudSpeechClient.LlmMessage,
+        timestamp: Long,
+    ): StoredMessage {
+        message.toolCalls.forEach(ToolCallSafety::requireValid)
+        val stored = StoredMessage(
+            id = UUID.randomUUID().toString(),
+            role = message.role,
+            content = message.content.orEmpty(),
+            timestamp = timestamp,
+            toolCalls = message.toolCalls.map { StoredToolCall(it.id, it.name, it.arguments) },
+            toolCallId = message.toolCallId,
+            llmVisible = true,
+        )
+        synchronized(lock) {
+            state.sessions.firstOrNull { it.id == conversationId }?.let { session ->
+                session.messages.add(stored)
+                session.updatedAt = timestamp
+                persistLocked()
+            }
+        }
+        return stored
+    }
+
+    fun createDetachedConversation(domain: ConversationDomain): ConversationSession = synchronized(lock) {
+        val now = System.currentTimeMillis()
+        newConversation(UUID.randomUUID().toString(), domain).also {
+            it.updatedAt = now
+            state.sessions.add(it)
+            persistLocked()
+        }
+    }
+
+    fun conversationProjection(
+        conversationId: String,
+        keyword: String = "",
+        recentTurns: Int = 8,
+    ): String = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId }
+            ?: return@synchronized "主会话暂无记录。"
+        val query = keyword.trim()
+        val visible = session.messages.filter { message ->
+            when (message.role) {
+                "user", "assistant" -> message.content.isNotBlank() &&
+                    (query.isBlank() || message.content.contains(query, ignoreCase = true))
+                "tool" -> true
+                else -> false
+            }
+        }
+        val selected = if (query.isBlank()) visible.takeLast((recentTurns.coerceIn(1, 20) * 2)) else visible.takeLast(30)
+        if (selected.isEmpty()) return@synchronized "没有找到匹配的主会话正文。"
+        buildString {
+            appendLine("主会话正文与工具进度（不含思考内容）：")
+            selected.forEach { message ->
+                when {
+                    message.toolCalls.isNotEmpty() -> appendLine("[工具调用] ${message.toolCalls.joinToString { it.name }}")
+                    message.toolCallId != null -> appendLine("[工具结果/${message.toolStatus ?: "unknown"}] ${message.content.take(320)}")
+                    message.role == "user" -> appendLine("用户：${message.content.take(600)}")
+                    message.role == "assistant" && message.streamState != ChatStreamState.STREAMING.name -> appendLine("助手：${message.content.take(900)}")
+                }
+            }
+        }.trim()
+    }
+
+    fun appendPendingContextNote(conversationId: String, note: String) = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized
+        val normalized = note.trim().takeIf { it.isNotBlank() } ?: return@synchronized
+        session.pendingContextNotes += normalized
+        session.updatedAt = System.currentTimeMillis()
+        persistLocked()
+    }
+
+    fun consumePendingContextNotes(conversationId: String = currentConversationId): List<String> = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized emptyList()
+        if (session.pendingContextNotes.isEmpty()) return@synchronized emptyList()
+        val notes = session.pendingContextNotes.toList()
+        session.pendingContextNotes.clear()
+        persistLocked()
+        notes
     }
 
     fun setLlmContent(messageId: String, content: String) = synchronized(lock) {
@@ -390,13 +529,33 @@ class ConversationStore(context: Context) {
         }.joinToString("\n\n").ifBlank { "当前会话尚未加载常驻 Skill。" }
     }
 
-    fun startNewConversation(reason: String = "用户开启新话题"): ConversationSession {
+    val currentConversationDomain: ConversationDomain
+        get() = synchronized(lock) { currentSessionLocked().domain }
+
+    /** Switches the active local conversation domain without copying messages or context. */
+    fun activateConversationDomain(domain: ConversationDomain): ConversationSession = synchronized(lock) {
+        val current = currentSessionLocked()
+        if (current.domain == domain) return@synchronized current
+        val replacement = state.sessions
+            .filter { it.domain == domain }
+            .maxByOrNull { it.updatedAt }
+            ?: newConversation(UUID.randomUUID().toString(), domain).also(state.sessions::add)
+        state.currentConversationId = replacement.id
+        persistLocked()
+        replacement
+    }
+
+    fun startNewConversation(
+        reason: String = "用户开启新话题",
+        domain: ConversationDomain = currentConversationDomain,
+    ): ConversationSession {
         val now = System.currentTimeMillis()
         val session = ConversationSession(
             id = UUID.randomUUID().toString(),
             title = defaultConversationTitle(now),
             createdAt = now,
             updatedAt = now,
+            domain = domain,
         )
         synchronized(lock) {
             state.currentConversationId = session.id
@@ -424,6 +583,7 @@ class ConversationStore(context: Context) {
     }
 
     fun deleteConversation(id: String): Boolean = synchronized(lock) {
+        val deletedDomain = state.sessions.firstOrNull { it.id == id }?.domain ?: return@synchronized false
         if (!state.sessions.removeAll { it.id == id }) return@synchronized false
         if (state.sessions.isEmpty()) {
             val now = System.currentTimeMillis()
@@ -432,11 +592,16 @@ class ConversationStore(context: Context) {
                 title = defaultConversationTitle(now),
                 createdAt = now,
                 updatedAt = now,
+                domain = deletedDomain,
             )
             state.sessions.add(replacement)
             state.currentConversationId = replacement.id
         } else if (state.currentConversationId == id) {
-            state.currentConversationId = state.sessions.maxBy { it.updatedAt }.id
+            state.currentConversationId = state.sessions
+                .filter { it.domain == deletedDomain }
+                .maxByOrNull { it.updatedAt }
+                ?.id
+                ?: newConversation(UUID.randomUUID().toString(), deletedDomain).also(state.sessions::add).id
         }
         persistLocked()
         true
@@ -586,8 +751,8 @@ class ConversationStore(context: Context) {
 
     fun lastLocation(): StoredLocation? = synchronized(lock) { state.lastLocation }
 
-    fun contextSummary(): String = synchronized(lock) {
-        memorySummaryLocked()
+    fun contextSummary(excludedMemoryIds: Set<String> = emptySet()): String = synchronized(lock) {
+        memorySummaryLocked(excludedMemoryIds)
     }
 
     /**
@@ -651,8 +816,8 @@ class ConversationStore(context: Context) {
         snapshot
     }
 
-    private fun memorySummaryLocked(): String {
-        val enabled = state.memories.filter { it.enabled }
+    private fun memorySummaryLocked(excludedMemoryIds: Set<String> = emptySet()): String {
+        val enabled = state.memories.filter { it.enabled && it.id !in excludedMemoryIds }
             .sortedWith(
                 compareByDescending<StoredMemory> { !it.autoGenerated }
                     .thenByDescending { it.occurrenceCount }
@@ -713,6 +878,12 @@ class ConversationStore(context: Context) {
             loaded.sessions.forEach { session ->
                 if (session.title.isBlank()) session.title = defaultConversationTitle(session.createdAt)
                 session.contextSnapshot = null
+                if (session.domain == ConversationDomain.STANDARD && session.messages.any { message ->
+                        message.modelId?.startsWith("stepaudio-") == true
+                    }
+                ) {
+                    session.domain = ConversationDomain.REALTIME
+                }
             }
         }
     }
@@ -859,13 +1030,17 @@ internal fun quarantineMalformedToolHistory(session: ConversationSession): Int {
 private fun defaultConversationTitle(timestamp: Long): String =
     SimpleDateFormat("yyyy年M月d日 HH:mm", Locale.CHINA).format(Date(timestamp))
 
-private fun newConversation(id: String): ConversationSession {
+private fun newConversation(
+    id: String,
+    domain: ConversationDomain = ConversationDomain.STANDARD,
+): ConversationSession {
     val now = System.currentTimeMillis()
     return ConversationSession(
         id = id,
         title = defaultConversationTitle(now),
         createdAt = now,
         updatedAt = now,
+        domain = domain,
     )
 }
 
@@ -965,14 +1140,22 @@ data class StoreState(
 )
 
 @Serializable
+enum class ConversationDomain {
+    STANDARD,
+    REALTIME,
+}
+
+@Serializable
 data class ConversationSession(
     val id: String,
     var title: String = "",
     val createdAt: Long = System.currentTimeMillis(),
     var updatedAt: Long = System.currentTimeMillis(),
+    var domain: ConversationDomain = ConversationDomain.STANDARD,
     val messages: MutableList<StoredMessage> = mutableListOf(),
     var contextSnapshot: String? = null,
     var memoryCompressedAt: Long? = null,
+    val pendingContextNotes: MutableList<String> = mutableListOf(),
     var ruleLedger: ConversationRuleLedger? = null,
     val skillSnapshots: MutableList<StoredSkillSnapshot> = mutableListOf(),
 )

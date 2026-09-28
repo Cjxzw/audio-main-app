@@ -35,6 +35,7 @@ class MainToolRegistry(
         STANDALONE,
         CONNECTED,
         DIAGNOSTIC,
+        REALTIME,
     }
 
     data class Execution(
@@ -50,7 +51,11 @@ class MainToolRegistry(
     fun definitions(
         profile: Profile = Profile.STANDALONE,
         allowReasoningEscalation: Boolean,
-    ): List<CloudSpeechClient.ToolDefinition> = listOf(
+    ): List<CloudSpeechClient.ToolDefinition> {
+        if (profile == Profile.REALTIME) {
+            return listOf(mainConversationQuery(), memorySearch(), delegateToMain())
+        }
+        return listOf(
         memoryCreate(),
         memorySearch(),
         locationRefresh(),
@@ -72,7 +77,8 @@ class MainToolRegistry(
         cancelTask(),
         agentSleep(),
         hubDispatchTask(),
-    )
+        )
+    }
 
     fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean = false
 
@@ -346,6 +352,8 @@ class MainToolRegistry(
         TOOL_TASK_STATUS -> "查询任务"
         TOOL_CANCEL_TASK -> "取消任务"
         TOOL_HUB_DISPATCH_TASK -> "下发远程任务"
+        TOOL_MAIN_CONVERSATION_QUERY -> "查询主会话"
+        TOOL_DELEGATE_TO_MAIN -> "转交主会话"
         TOOL_PROTOCOL_REPAIR -> "修正工具调用格式"
         else -> toolName
     }
@@ -377,6 +385,8 @@ class MainToolRegistry(
             TOOL_SKILL_REGISTER -> payload.text("name")
             TOOL_SING_SONG -> payload.text("title") ?: "未命名歌曲"
             TOOL_TASK_STATUS, TOOL_CANCEL_TASK -> payload.text("task_id")
+            TOOL_MAIN_CONVERSATION_QUERY -> payload.text("keyword") ?: "最近对话"
+            TOOL_DELEGATE_TO_MAIN -> payload.text("content")
             else -> null
         }
         return value
@@ -476,6 +486,32 @@ class MainToolRegistry(
             put("type", "integer")
             put("minimum", 1)
             put("maximum", 10)
+        }
+    }
+
+    private fun mainConversationQuery() = tool(
+        name = TOOL_MAIN_CONVERSATION_QUERY,
+        description = "查询主会话最近正文和任务进度。只返回用户正文、助手最终正文以及简要工具调用/结果，不返回思考内容或工具原始参数。需要理解主会话后台任务时使用。",
+    ) {
+        putJsonObject("keyword") {
+            put("type", "string")
+            put("description", "可选关键词；为空时查询最近几轮")
+        }
+        putJsonObject("recent_turns") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("maximum", 10)
+        }
+    }
+
+    private fun delegateToMain() = tool(
+        name = TOOL_DELEGATE_TO_MAIN,
+        description = "把一段用户意图插入主会话，交由主会话在下一次文本回合处理。主会话忙碌时不会排队，会直接返回繁忙。不能直接委派到远端。",
+        required = listOf("content"),
+    ) {
+        putJsonObject("content") {
+            put("type", "string")
+            put("description", "要插入主会话的完整内容")
         }
     }
 
@@ -817,6 +853,8 @@ class MainToolRegistry(
         const val TOOL_CANCEL_TASK = "cancel_task"
         const val TOOL_HUB_DISPATCH_TASK = "hub_dispatch_task"
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
+        const val TOOL_MAIN_CONVERSATION_QUERY = "main_conversation_query"
+        const val TOOL_DELEGATE_TO_MAIN = "delegate_to_main"
 
         val NATIVE_TOOL_NAMES = setOf(
             TOOL_MEMORY_CREATE, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
@@ -826,6 +864,7 @@ class MainToolRegistry(
             TOOL_SKILL_USE, TOOL_AGENT_SLEEP,
             TOOL_VOICE_REPLY, TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,
             TOOL_HUB_DISPATCH_TASK,
+            TOOL_MAIN_CONVERSATION_QUERY, TOOL_DELEGATE_TO_MAIN,
         )
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48
 

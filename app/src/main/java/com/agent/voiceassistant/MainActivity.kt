@@ -31,6 +31,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.data.ConversationSummary
+import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.databinding.ActivityMainBinding
 import com.agent.voiceassistant.databinding.PageHomeBinding
 import com.agent.voiceassistant.databinding.PageTasksBinding
@@ -494,7 +495,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startAgentService() {
         appendLog("正在启动 Agent…")
-        VoiceAgentService.start(this)
+        VoiceAgentService.startRealtime(this)
         setVoiceControlActive(true)
     }
 
@@ -597,7 +598,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun toggleVoiceSession() {
         if (agentListening) {
-            VoiceAgentService.stop(this)
+            VoiceAgentService.stopRealtime(this)
             setVoiceControlActive(false)
         } else {
             ensurePermissionsAndStart()
@@ -639,7 +640,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshConversations() {
         if (!::conversationAdapter.isInitialized) return
-        val conversations = store.conversationSummaries()
+        val conversations = store.conversationSummaries(ConversationDomain.STANDARD)
         conversationAdapter.submitList(conversations)
     }
 

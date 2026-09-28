@@ -1,8 +1,10 @@
 package com.agent.voiceassistant.service
 
 import android.Manifest
-import android.app.ActivityManager
 import android.content.Context
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.app.ActivityManager
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
@@ -34,6 +36,12 @@ class DeviceContextProvider(
             appendLine("当前输入：${if (inputSource == "text") "文字" else if (inputSource == "voice") "语音" else inputSource}")
             appendLine("文本回合静音：${if (inputSource == "text" && speechPreferences.muteTextReplies) "开启" else "关闭"}")
             appendLine("网络：$network")
+            pressureNotice()?.let { notice ->
+                appendLine("<runtime_pressure>")
+                appendLine(notice)
+                appendLine("这是资源风险提示，不是硬性限制。请尽快完成当前任务，或在合适时委派到远端；不要凭空声称任务已完成。")
+                appendLine("</runtime_pressure>")
+            }
             appendLine("当前聊天模型：${profile.modelId}")
             appendLine("当前模型支持图片：${yesNo(profile.supportsImages)}")
             appendLine("默认多模态模型可用：${yesNo(capabilities.defaultLlmAvailable())}")
@@ -44,6 +52,27 @@ class DeviceContextProvider(
             appendLine("说明：设备元信息只用于理解运行环境和兼容性；实际权限与能力以本回合提供的工具为准。")
             append("</device_context>")
         }
+    }
+
+    private fun pressureNotice(): String? {
+        val battery = appContext.getSystemService(BatteryManager::class.java)
+        val power = appContext.getSystemService(PowerManager::class.java)
+        val activity = appContext.getSystemService(ActivityManager::class.java)
+        val level = battery?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        val charging = battery?.getIntProperty(BatteryManager.BATTERY_PROPERTY_STATUS)?.let {
+            it == BatteryManager.BATTERY_STATUS_CHARGING || it == BatteryManager.BATTERY_STATUS_FULL
+        } == true
+        val memory = ActivityManager.MemoryInfo().also { activity?.getMemoryInfo(it) }
+        val memoryPressure = memory.lowMemory || (memory.availMem > 0L && memory.availMem.toDouble() / memory.totalMem < 0.12)
+        val thermalPressure = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
+            ((power?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE) >= PowerManager.THERMAL_STATUS_SEVERE)
+        val reasons = buildList {
+            if (level in 0..15 && !charging) add("电量偏低（${level}%）")
+            if (memoryPressure) add("可用内存偏低")
+            if (power?.isPowerSaveMode == true) add("系统省电模式已开启")
+            if (thermalPressure) add("设备温度压力偏高")
+        }
+        return reasons.takeIf { it.isNotEmpty() }?.joinToString("；")
     }
 
     private fun buildStableContext(): String = buildString {

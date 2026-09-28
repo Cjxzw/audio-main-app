@@ -241,6 +241,16 @@ def build_parser() -> argparse.ArgumentParser:
     key_clear = key_actions.add_parser("clear", help="清除 MiMo Key")
     key_clear.add_argument("--confirm", action="store_true", required=True)
 
+    realtime = commands.add_parser("realtime", help="StepFun Realtime 语音管线")
+    realtime_actions = realtime.add_subparsers(dest="action", required=True)
+    realtime_set = realtime_actions.add_parser("set", help="从 stdin 写入 StepFun Key 并启用 Realtime")
+    realtime_set.add_argument("--model", default="stepaudio-3-realtime-preview")
+    realtime_set.add_argument("--voice", default="qingchunshaonv")
+    realtime_set.add_argument("--api-key-stdin", action="store_true", help="从 stdin 更新 StepFun Key；默认保留现有 Key")
+    realtime_set.add_argument("--no-activate", action="store_true")
+    realtime_clear = realtime_actions.add_parser("clear", help="清除 StepFun Realtime Key")
+    realtime_clear.add_argument("--confirm", action="store_true", required=True)
+
     provider = commands.add_parser("provider", help="LLM 供应商")
     provider_actions = provider.add_subparsers(dest="action", required=True)
     provider_actions.add_parser("list", help="列出供应商")
@@ -288,6 +298,17 @@ def bridge_command(args: argparse.Namespace) -> tuple[str, dict[str, object], fl
         if args.action == "set":
             return "key.set", {"api_key": read_secret_from_stdin("MiMo Key")}, None
         return "key.clear", {"confirm": args.confirm}, None
+    if args.group == "realtime":
+        if args.action == "set":
+            arguments: dict[str, object] = {
+                "model": args.model,
+                "voice": args.voice,
+                "activate": not args.no_activate,
+            }
+            if args.api_key_stdin:
+                arguments["api_key"] = read_secret_from_stdin("StepFun API Key")
+            return "realtime.set", arguments, None
+        return "realtime.clear", {"confirm": args.confirm}, None
     if args.group == "provider":
         if args.action == "list":
             return "provider.list", {}, None

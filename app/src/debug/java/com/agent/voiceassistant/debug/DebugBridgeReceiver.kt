@@ -12,6 +12,9 @@ import com.agent.voiceassistant.settings.AppCapabilityResolver
 import com.agent.voiceassistant.settings.LlmProviderProfile
 import com.agent.voiceassistant.settings.LlmProviderRepository
 import com.agent.voiceassistant.settings.MimoApiRepository
+import com.agent.voiceassistant.settings.RealtimePipelineRepository
+import com.agent.voiceassistant.settings.StepFunRealtimeConfig
+import com.agent.voiceassistant.settings.VoicePipeline
 import com.agent.voiceassistant.ui.ChatRole
 import com.agent.voiceassistant.ui.ChatStreamState
 import java.io.File
@@ -72,6 +75,8 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         "config.show" -> success(request, "config", "配置状态已读取", startedAt, config(context))
         "key.set" -> setMimoKey(context, request, startedAt)
         "key.clear" -> clearMimoKey(context, request, startedAt)
+        "realtime.set" -> setRealtime(context, request, startedAt)
+        "realtime.clear" -> clearRealtime(context, request, startedAt)
         "provider.list" -> success(
             request,
             "providers",
@@ -122,12 +127,22 @@ class DebugBridgeReceiver : BroadcastReceiver() {
     private fun config(context: Context): JsonObject {
         val mimo = MimoApiRepository(context)
         val repositories = LlmProviderRepository(context)
+        val realtime = RealtimePipelineRepository(context)
         return buildJsonObject {
             put("mimo_key_configured", mimo.hasValidKey())
             put("mimo_key_type", mimo.keyType()?.name?.lowercase())
             put("mimo_key_fingerprint", mimo.apiKey().takeIf(String::isNotBlank)?.let(::fingerprint))
             put("active_provider_id", repositories.activeProfile().id)
             put("providers", providers(context))
+            put("voice_pipeline", realtime.activePipeline().name.lowercase())
+            putJsonObject("stepfun_realtime") {
+                val config = realtime.stepFunConfig()
+                put("key_configured", realtime.hasStepFunKey())
+                put("key_fingerprint", realtime.stepFunApiKey().takeIf(String::isNotBlank)?.let(::fingerprint))
+                put("model", config.modelId)
+                put("voice", config.voice)
+                put("server_vad", config.serverVadEnabled)
+            }
         }
     }
 
@@ -159,6 +174,54 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         require(request.arguments.boolean("confirm") == true) { "清除 Key 必须确认" }
         MimoApiRepository(context).clearKey()
         return success(request, "key_cleared", "MiMo Key 已清除", startedAt)
+    }
+
+    private fun setRealtime(
+        context: Context,
+        request: DebugBridgeRequest,
+        startedAt: Long,
+    ): JsonObject {
+        val args = request.arguments
+        val repository = RealtimePipelineRepository(context)
+        val existing = repository.stepFunConfig()
+        val apiKey = args.string("api_key")
+        repository.saveStepFunConfig(
+            config = StepFunRealtimeConfig(
+                modelId = args.string("model") ?: existing.modelId,
+                voice = args.string("voice") ?: existing.voice,
+                serverVadEnabled = true,
+                vadSilenceDurationMs = existing.vadSilenceDurationMs,
+            ),
+            apiKey = apiKey,
+        )
+        if (args.boolean("activate") != false) repository.setActivePipeline(VoicePipeline.STEPFUN_REALTIME)
+        val saved = repository.stepFunConfig()
+        return success(
+            request,
+            "realtime_configured",
+            "StepFun Realtime 已写入加密存储${if (repository.activePipeline() == VoicePipeline.STEPFUN_REALTIME) "并启用" else ""}",
+            startedAt,
+            buildJsonObject {
+                put("active", repository.activePipeline() == VoicePipeline.STEPFUN_REALTIME)
+                put("model", saved.modelId)
+                put("voice", saved.voice)
+                put("key_fingerprint", fingerprint(repository.stepFunApiKey()))
+            },
+        )
+    }
+
+    private fun clearRealtime(
+        context: Context,
+        request: DebugBridgeRequest,
+        startedAt: Long,
+    ): JsonObject {
+        require(request.arguments.boolean("confirm") == true) { "清除 StepFun Key 必须确认" }
+        val repository = RealtimePipelineRepository(context)
+        repository.clearStepFunKey()
+        if (repository.activePipeline() == VoicePipeline.STEPFUN_REALTIME) {
+            repository.setActivePipeline(VoicePipeline.MIMO_STANDARD)
+        }
+        return success(request, "realtime_cleared", "StepFun Realtime Key 已清除", startedAt)
     }
 
     private fun setProvider(

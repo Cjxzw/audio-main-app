@@ -68,6 +68,7 @@ import com.agent.voiceassistant.cloud.VoiceReplyDirectiveParser
 import com.agent.voiceassistant.cloud.VoiceReplyMode
 import com.agent.voiceassistant.cloud.VoiceReplyOptions
 import com.agent.voiceassistant.data.ConversationStore
+import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.data.ConversationCompressionSource
 import com.agent.voiceassistant.data.ToolHistoryPolicy
 import com.agent.voiceassistant.data.ConversationMemoryCompactor
@@ -79,6 +80,7 @@ import com.agent.voiceassistant.reflection.TurnMetrics
 import com.agent.voiceassistant.reflection.TurnMetricsTracker
 import com.agent.voiceassistant.settings.LlmProviderRepository
 import com.agent.voiceassistant.settings.LlmProviderProfile
+import com.agent.voiceassistant.settings.RealtimePipelineRepository
 import com.agent.voiceassistant.settings.SpeechPreferences
 import com.agent.voiceassistant.settings.AppCapabilityResolver
 import com.agent.voiceassistant.tools.LocalToolExecutor
@@ -231,6 +233,8 @@ class VoiceAgentService : Service() {
         const val ACTION_STOP = "com.agent.voiceassistant.STOP"
         const val ACTION_WAKE = "com.agent.voiceassistant.WAKE"
         const val ACTION_SLEEP = "com.agent.voiceassistant.SLEEP"
+        const val ACTION_REALTIME_START = "com.agent.voiceassistant.REALTIME_START"
+        const val ACTION_REALTIME_STOP = "com.agent.voiceassistant.REALTIME_STOP"
         const val ACTION_TEXT_INPUT = "com.agent.voiceassistant.TEXT_INPUT"
         const val ACTION_NEW_CONVERSATION = "com.agent.voiceassistant.NEW_CONVERSATION"
         const val ACTION_SWITCH_CONVERSATION = "com.agent.voiceassistant.SWITCH_CONVERSATION"
@@ -269,6 +273,15 @@ class VoiceAgentService : Service() {
             DiagLog.i("api.stop", "ctx=${ctx.javaClass.simpleName}")
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_SLEEP)
             ctx.startService(intent)
+        }
+
+        fun startRealtime(ctx: Context) {
+            val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_REALTIME_START)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent) else ctx.startService(intent)
+        }
+
+        fun stopRealtime(ctx: Context) {
+            ctx.startService(Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_REALTIME_STOP))
         }
 
         fun wake(ctx: Context) {
@@ -357,6 +370,7 @@ class VoiceAgentService : Service() {
     private lateinit var store: ConversationStore
     private lateinit var ruleStore: RuleStore
     private lateinit var llmProviderRepository: LlmProviderRepository
+    private lateinit var realtimePipelineRepository: RealtimePipelineRepository
     private lateinit var speechPreferences: SpeechPreferences
     private lateinit var capabilityResolver: AppCapabilityResolver
     private lateinit var locationProvider: LocationProvider
@@ -382,9 +396,14 @@ class VoiceAgentService : Service() {
     private val thinkingFeedbackLock = Any()
     private val speechInterruptedForUrgentReport = AtomicBoolean(false)
     private val newConversationInProgress = AtomicBoolean(false)
+    private val mainTurnActive = AtomicBoolean(false)
     private val lastNewConversationRequestAt = AtomicLong(0L)
     private val checkpointRecoveryStarted = AtomicBoolean(false)
     private var checkpointWriteJob: Job? = null
+    private var stepFunRealtimePipeline: StepFunRealtimePipeline? = null
+    @Volatile private var realtimeActive = false
+    private var mainConversationId: String = ""
+    private var realtimeConversationId: String = ""
     private var lastThinkingFeedbackAudio: Int? = null
     @Volatile private var activeSourceTurnId: String = ""
     @Volatile private var activeTextTurnSilent: Boolean = false
@@ -427,8 +446,14 @@ class VoiceAgentService : Service() {
         super.onCreate()
         DiagLog.i("service.create", "pid=${android.os.Process.myPid()}", showInUi = true)
         store = ConversationStore(this)
+        mainConversationId = if (store.currentConversationDomain == ConversationDomain.REALTIME) {
+            store.activateConversationDomain(ConversationDomain.STANDARD).id
+        } else {
+            store.currentConversationId
+        }
         ruleStore = RuleStore(this)
         llmProviderRepository = LlmProviderRepository(this)
+        realtimePipelineRepository = RealtimePipelineRepository(this)
         activeTurnCheckpointStore = ActiveTurnCheckpointStore(this)
         speechPreferences = SpeechPreferences(this)
         capabilityResolver = AppCapabilityResolver(this)
@@ -503,14 +528,26 @@ class VoiceAgentService : Service() {
                 sleepAgent()
                 serviceScope.launch { recoverActiveTurnIfNeeded() }
             }
-            ACTION_START, ACTION_WAKE -> wakeAgent()
+            ACTION_START, ACTION_WAKE -> startRealtimeSession()
             ACTION_SLEEP -> sleepAgent()
+            ACTION_REALTIME_START -> startRealtimeSession()
+            ACTION_REALTIME_STOP -> stopRealtimeSession()
             ACTION_TEXT_INPUT -> {
                 ensureForegroundForCurrentState()
                 val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
                 val attachments = intent.getStringArrayListExtra(EXTRA_ATTACHMENTS).orEmpty()
                 if (text.isNotBlank()) {
-                    serviceScope.launch { processUserText(text.trim(), source = "text", attachments = attachments) }
+                    serviceScope.launch {
+                        if (realtimeActive) {
+                            if (attachments.isNotEmpty()) {
+                                fail("StepFun Realtime 当前不支持附件输入；请移除附件后重试")
+                            } else {
+                                processRealtimeTextInput(text)
+                            }
+                        } else {
+                            processUserText(text.trim(), source = "text", attachments = attachments)
+                        }
+                    }
                 }
             }
             ACTION_NEW_CONVERSATION -> {
@@ -794,7 +831,7 @@ class VoiceAgentService : Service() {
 
     private fun wakeAgent() {
         DiagLog.i("agent.wake.begin", "dormant=$dormant loop=${loopJob?.isActive == true}", showInUi = true)
-        if (loopJob?.isActive == true && !dormant) return
+        if ((loopJob?.isActive == true || stepFunRealtimePipeline?.isStarted == true) && !dormant) return
         locationProvider.refreshInBackground("agent_wake")
         val foregroundReady = runCatching {
             ensureForeground("唤醒中...", microphoneActive = true)
@@ -1009,8 +1046,7 @@ class VoiceAgentService : Service() {
             requestNewConversation(
                 userText,
                 greet = true,
-                speakReplies = ExperimentConfig.ENABLE_TTS &&
-                    AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies),
+                speakReplies = false,
             )
             return
         }
@@ -1035,13 +1071,13 @@ class VoiceAgentService : Service() {
             updateNotification("正在回应...")
             return
         }
-        val speakReplies = ExperimentConfig.ENABLE_TTS &&
-            AudioFeedbackPolicy.allowAutomaticFeedback(source, speechPreferences.muteTextReplies)
+        val speakReplies = false
+        mainTurnActive.set(true)
         turnMutex.withLock {
             activeTextTurnSilent = source == "text" && !speakReplies
             try {
                 if (handleLocalConversationCommand(userText)) return
-                val client = ensureSpeechClient()
+                val client: CloudSpeechClient? = null
                 val displayText = buildString {
                     append(userText)
                     if (attachments.isNotEmpty()) {
@@ -1108,7 +1144,7 @@ class VoiceAgentService : Service() {
                         attachments = attachments,
                         visualTranscript = visualTranscript,
                     ),
-                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
                     allowReasoningEscalation = false,
                     voiceReplySummaryEnabled = ExperimentConfig.ENABLE_FINAL_REFINEMENT && speakReplies,
@@ -1144,8 +1180,139 @@ class VoiceAgentService : Service() {
                 updateNotification("回合尚未完成")
             } finally {
                 activeTextTurnSilent = false
+                mainTurnActive.set(false)
             }
         }
+    }
+
+    private suspend fun processRealtimeTextInput(rawText: String) {
+        val text = rawText.trim()
+        if (text.isBlank()) return
+        if (!realtimePipelineRepository.hasStepFunKey()) {
+            fail("请先在设置中配置 StepFun API Key，才能使用 Realtime 文本输入")
+            return
+        }
+        if (!realtimeActive) {
+            EventBus.emitUserNotice("Realtime 尚未开启")
+            return
+        }
+        try {
+            ensureRealtimePipeline(captureAudio = !dormant).submitText(text)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            invalidateRealtimePipeline("文本发送失败：${error.message ?: error.javaClass.simpleName}")
+            // A disconnect can race with a user submission. Rebuild once instead of crashing.
+            runCatching { ensureRealtimePipeline(captureAudio = !dormant).submitText(text) }
+                .onFailure { retryError -> invalidateRealtimePipeline("重连失败：${retryError.message ?: retryError.javaClass.simpleName}") }
+        }
+    }
+
+    private suspend fun ensureRealtimePipeline(captureAudio: Boolean): StepFunRealtimePipeline {
+        val existing = stepFunRealtimePipeline
+        if (existing?.isStarted == true) {
+            if (captureAudio) existing.startAudioCapture()
+            return existing
+        }
+        existing?.stop()
+        stepFunRealtimePipeline = null
+        if (realtimeConversationId.isBlank()) {
+            realtimeConversationId = store.createDetachedConversation(ConversationDomain.REALTIME).id
+        }
+        val routes = routeManager ?: AudioRouteManager(this).also { routeManager = it }
+        emitLog(routes.configureForVoiceSession())
+        val created = createStepFunRealtimePipeline(routes)
+        stepFunRealtimePipeline = created
+        return try {
+            created.start(captureAudio)
+            created
+        } catch (error: Throwable) {
+            created.stop()
+            if (stepFunRealtimePipeline === created) stepFunRealtimePipeline = null
+            throw error
+        }
+    }
+
+    private fun invalidateRealtimePipeline(reason: String) {
+        stepFunRealtimePipeline?.stop()
+        stepFunRealtimePipeline = null
+        EventBus.emitVolume(0f)
+        emitLog("Realtime 会话已失效，下一次输入将自动重连：$reason")
+        if (!dormant) {
+            serviceScope.launch {
+                delay(750)
+                if (!dormant && realtimeActive && stepFunRealtimePipeline == null) startRealtimeSession()
+            }
+        }
+    }
+
+    private fun createStepFunRealtimePipeline(routes: AudioRouteManager): StepFunRealtimePipeline =
+        StepFunRealtimePipeline(
+            scope = serviceScope,
+            store = store,
+            routes = routes,
+            settings = realtimePipelineRepository,
+            tools = toolRegistry,
+            conversationId = realtimeConversationId,
+            queryMainConversation = { keyword, turns -> store.conversationProjection(mainConversationId, keyword, turns) },
+            delegateToMain = ::delegateRealtimeToMain,
+            onSessionFinished = { transcript -> finishRealtimeSession(transcript) },
+            instructions = {
+                buildMainSystemPrompt() + "\n\n当前通过 StepFun Realtime 进行全双工语音会话。直接输出适合朗读的自然语言纯文本。不得输出 Markdown：不要使用标题符号、星号加粗、下划线、反引号、列表符号、编号列表、链接语法、表格或代码块；需要列举时用完整句子依次说明。不得输出 <working>、<answer>、<thinking>、<details> 或其他自定义 XML 标签。思考、工具调用和语音由 Realtime 原生事件承载。"
+            },
+            onLog = ::emitLog,
+            onDisconnected = { message ->
+                DiagLog.w("realtime.disconnected", message, showInUi = true)
+                invalidateRealtimePipeline(message)
+            },
+            onSleepRequested = { sleepAgent() },
+        )
+
+    private suspend fun delegateRealtimeToMain(content: String): String {
+        val normalized = content.trim()
+        if (normalized.isBlank()) return "转交失败：内容为空。"
+        if (mainTurnActive.get() || agentHarness.state.value != MainAgentHarness.State.IDLE) {
+            return "主会话繁忙，请稍后再试。"
+        }
+        val stored = store.addMessageToConversation(mainConversationId, "user", "[Realtime 转交] $normalized")
+        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, stored.content, stored.timestamp, stored.id))
+        return "已插入主会话，主会话空闲时会在下一次文本回合处理。"
+    }
+
+    private fun finishRealtimeSession(transcript: String) {
+        val note = "Realtime 语音通话（${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA).format(java.util.Date())}）记录：\n$transcript"
+        store.appendPendingContextNote(mainConversationId, note)
+    }
+
+    private fun startRealtimeSession() {
+        if (realtimeActive && stepFunRealtimePipeline?.isStarted == true) return
+        if (!realtimePipelineRepository.hasStepFunKey()) {
+            fail("请先在设置中配置 StepFun API Key，才能启用 Realtime 语音管线")
+            return
+        }
+        realtimeActive = true
+        dormant = false
+        ensureForeground("Realtime 聆听中...", microphoneActive = true)
+        serviceScope.launch {
+            runCatching {
+                ensureRealtimePipeline(captureAudio = true)
+                _state.value = State.LISTENING
+                emitState(ServiceState.LISTENING)
+                MainMediaLibraryService.publishState(this@VoiceAgentService, active = true, status = "Realtime 聆听中")
+                updateNotification("Realtime 聆听中...")
+            }.onFailure { invalidateRealtimePipeline("启动失败：${it.message ?: it.javaClass.simpleName}") }
+        }
+    }
+
+    private fun stopRealtimeSession() {
+        realtimeActive = false
+        stepFunRealtimePipeline?.stop()
+        stepFunRealtimePipeline = null
+        realtimeConversationId = ""
+        val routes = routeManager
+        routeManager = null
+        EventBus.emitVolume(0f)
+        updateNotification(if (dormant) "休眠中，等待唤醒" else "主会话就绪")
+        serviceScope.launch { runCatching { routes?.release() } }
     }
 
     private suspend fun runAgentLoop(
@@ -1205,10 +1372,7 @@ class VoiceAgentService : Service() {
                                 MainToolRegistry.Profile.STANDALONE
                             },
                             allowReasoningEscalation = allowReasoningEscalation,
-                        ).filterNot { definition ->
-                            !ExperimentConfig.ENABLE_PERSONALIZED_TTS_TOOL &&
-                                definition.name == MainToolRegistry.TOOL_VOICE_REPLY
-                        }
+                        ).filterNot { definition -> definition.name == MainToolRegistry.TOOL_VOICE_REPLY }
                     } else {
                         emptyList()
                     }
@@ -2282,6 +2446,7 @@ class VoiceAgentService : Service() {
                     promptTokensEstimated = responseMetadata?.promptTokensEstimated == true,
                 ),
             )
+            stepFunRealtimePipeline?.injectMainAssistantReply(finalText)
             return
         }
         store.updateMessage(
@@ -2294,6 +2459,7 @@ class VoiceAgentService : Service() {
         EventBus.emitChatMessage(
             draft.toChatMessage(finalText, ChatStreamState.COMPLETED, responseMetadata),
         )
+        stepFunRealtimePipeline?.injectMainAssistantReply(finalText)
     }
 
     private fun normalizeFinalAssistantText(text: String): String {
@@ -2961,9 +3127,17 @@ class VoiceAgentService : Service() {
     private fun buildRuntimeSystemContext(
         source: String,
         hubFacts: com.agent.voiceassistant.hub.HubFacts?,
+        excludedRuleIds: Set<String> = emptySet(),
+        excludedMemoryIds: Set<String> = emptySet(),
     ): String {
         val runtimeContext = buildString {
             appendLine(deviceContextProvider.build(source, currentNetworkLabel()))
+            store.consumePendingContextNotes(mainConversationId).takeIf { it.isNotEmpty() }?.let { notes ->
+                appendLine()
+                appendLine("<realtime_session_digest>")
+                notes.forEach { appendLine(it) }
+                appendLine("</realtime_session_digest>")
+            }
             appendLine()
             append("Agent 虚拟文件系统：\n")
             append(executionEnv.virtualRootSummary())
@@ -2973,7 +3147,7 @@ class VoiceAgentService : Service() {
             append(
                 store.ruleContext(
                     ruleStore,
-                    excludedRuleIds = if (ExperimentConfig.INCLUDE_BUILTIN_DIAGNOSTIC_RULE) {
+                    excludedRuleIds = excludedRuleIds + if (ExperimentConfig.INCLUDE_BUILTIN_DIAGNOSTIC_RULE) {
                         emptySet()
                     } else {
                         setOf(RuleStore.BUILTIN_DIAGNOSTIC_RULE_ID)
@@ -2981,7 +3155,7 @@ class VoiceAgentService : Service() {
                 ),
             )
             append("\n\n跨会话长期记忆：\n")
-            append(store.contextSummary())
+            append(store.contextSummary(excludedMemoryIds))
             if (hubFacts != null) {
                 append("\n\n枢卫 Hub 可派遣 Agent 路由表（已排除当前 Main，facts 只读）：\n")
                 val facts = hubFacts
@@ -3151,7 +3325,10 @@ class VoiceAgentService : Service() {
         val memorySource = store.conversationForCompression(previousConversationId)
         val memorySnapshot = memorySource?.let { buildBackgroundSnapshot(previousConversationId) }
         val memoryProvider = llmProviderRepository.activeProfile()
-        store.startNewConversation(reason = text)
+        store.startNewConversation(
+            reason = text,
+            domain = ConversationDomain.STANDARD,
+        ).also { mainConversationId = it.id }
         locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
         EventBus.emitConversationUpdate()
@@ -3221,7 +3398,10 @@ class VoiceAgentService : Service() {
         EventBus.emitConversationBusy(true)
         return try {
             abortActiveTurnForConversationChange("开启新会话")
-            turnMutex.withLock { createNewConversation(text, greet, speakReplies) }
+            val created = turnMutex.withLock {
+                createNewConversation(text, greet = greet, speakReplies = speakReplies)
+            }
+            created
         } finally {
             newConversationInProgress.set(false)
             EventBus.emitConversationBusy(false)
@@ -3260,12 +3440,14 @@ class VoiceAgentService : Service() {
         return CloudSpeechClient(capabilityResolver.speechConfig()).also { speechClient = it }
     }
 
-    private fun switchConversation(id: String) {
-        if (id.isBlank()) return
-        if (!store.switchConversation(id)) return
+    private fun switchConversation(id: String): Boolean {
+        if (id.isBlank()) return false
+        if (!store.switchConversation(id)) return false
+        if (store.currentConversationDomain == ConversationDomain.STANDARD) mainConversationId = id
         EventBus.emitChatReset(store.recentChatMessages())
         EventBus.emitConversationUpdate()
         emitLog("已切换会话")
+        return true
     }
 
     private fun abortActiveTurnForConversationChange(reason: String) {
@@ -4133,12 +4315,13 @@ class VoiceAgentService : Service() {
         keepForeground: Boolean = true,
         cancelConversationLoop: Boolean = true,
     ) {
+        if (realtimeActive || stepFunRealtimePipeline != null) stopRealtimeSession()
         DiagLog.i(
             "agent.sleep.begin",
             "keepForeground=$keepForeground dormant=$dormant loop=${loopJob?.isActive == true} recorder=${recorder != null}",
             showInUi = true,
         )
-        if (dormant && loopJob == null && recorder == null) {
+        if (dormant && loopJob == null && recorder == null && stepFunRealtimePipeline == null) {
             if (keepForeground) ensureDormantForeground()
             DiagLog.i("agent.sleep.noop", "already_dormant", showInUi = true)
             return
@@ -4150,6 +4333,8 @@ class VoiceAgentService : Service() {
         )
         if (cancelConversationLoop && !unfinishedTurn) loopJob?.cancel()
         if (!unfinishedTurn) loopJob = null
+        stepFunRealtimePipeline?.stop()
+        stepFunRealtimePipeline = null
         recorder?.stop()
         recorder = null
         player?.let { releasePlayer(it) }

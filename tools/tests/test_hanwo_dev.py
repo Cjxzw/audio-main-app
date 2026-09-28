@@ -75,6 +75,20 @@ alias-two device product:p model:m device:d
         with mock.patch.object(hanwo_dev.sys, "stdin", io.StringIO("tp-secret\n")):
             self.assertEqual("tp-secret", hanwo_dev.read_secret_from_stdin("Key"))
 
+    def test_realtime_set_uses_stdin_key_and_enables_pipeline(self):
+        parser = hanwo_dev.build_parser()
+        args = parser.parse_args(["realtime", "set", "--model", "step-audio-2-mini", "--voice", "wenrounansheng", "--api-key-stdin"])
+
+        with mock.patch.object(hanwo_dev.sys, "stdin", io.StringIO("step-secret\n")):
+            command, arguments, timeout = hanwo_dev.bridge_command(args)
+
+        self.assertEqual("realtime.set", command)
+        self.assertEqual("step-secret", arguments["api_key"])
+        self.assertEqual("step-audio-2-mini", arguments["model"])
+        self.assertEqual("wenrounansheng", arguments["voice"])
+        self.assertTrue(arguments["activate"])
+        self.assertIsNone(timeout)
+
     def test_provider_delete_requires_confirmation_flag(self):
         parser = hanwo_dev.build_parser()
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
