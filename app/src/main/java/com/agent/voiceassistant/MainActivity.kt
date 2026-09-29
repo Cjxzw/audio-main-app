@@ -497,6 +497,7 @@ class MainActivity : AppCompatActivity() {
         appendLog("正在启动 Agent…")
         VoiceAgentService.startRealtime(this)
         setVoiceControlActive(true)
+        startActivity(Intent(this, RealtimeActivity::class.java))
     }
 
     private fun observeEventBus() {
@@ -512,6 +513,7 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             EventBus.chatMessages.collectLatest { msg ->
+                if (msg.conversationId != null) return@collectLatest
                 val inserted = chatAdapter.addMessage(msg)
                 if (chatTailFollowEnabled) scheduleChatTailFollow()
                 if (inserted) refreshConversations()

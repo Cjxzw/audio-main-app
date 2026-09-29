@@ -1273,9 +1273,8 @@ class VoiceAgentService : Service() {
         if (mainTurnActive.get() || agentHarness.state.value != MainAgentHarness.State.IDLE) {
             return "主会话繁忙，请稍后再试。"
         }
-        val stored = store.addMessageToConversation(mainConversationId, "user", "[Realtime 转交] $normalized")
-        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, stored.content, stored.timestamp, stored.id))
-        return "已插入主会话，主会话空闲时会在下一次文本回合处理。"
+        processUserText("[Realtime 转交] $normalized", source = "realtime-delegate")
+        return "主会话已完成处理，结果已回灌到当前实时对话。"
     }
 
     private fun finishRealtimeSession(transcript: String) {

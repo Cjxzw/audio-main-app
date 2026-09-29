@@ -36,6 +36,7 @@ data class ChatMessage(
     val promptTokens: Long? = null,
     val contextWindowTokens: Long? = null,
     val promptTokensEstimated: Boolean = false,
+    val conversationId: String? = null,
 ) {
     val timeStr: String
         get() = SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(Date(timestamp))

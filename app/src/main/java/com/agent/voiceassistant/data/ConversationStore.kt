@@ -97,6 +97,18 @@ class ConversationStore(context: Context) {
             .map { it.toChatMessage() }
     }
 
+    fun latestConversationId(domain: ConversationDomain): String? = synchronized(lock) {
+        state.sessions.filter { it.domain == domain }.maxByOrNull { it.updatedAt }?.id
+    }
+
+    fun recentChatMessagesForConversation(conversationId: String, limit: Int = 500): List<ChatMessage> = synchronized(lock) {
+        state.sessions.firstOrNull { it.id == conversationId }?.messages
+            ?.filter { it.chatVisible != false }
+            ?.takeLast(limit)
+            ?.map { it.toChatMessage(conversationId) }
+            .orEmpty()
+    }
+
     fun llmHistory(excludeMessageId: String? = null): List<CloudSpeechClient.LlmMessage> = synchronized(lock) {
         llmHistoryLocked(currentSessionLocked(), excludeMessageId)
     }
@@ -930,7 +942,7 @@ class ConversationStore(context: Context) {
     private fun String.safeFilePart(): String =
         replace(Regex("[^A-Za-z0-9._-]"), "_").take(120).ifBlank { "unknown" }
 
-    private fun StoredMessage.toChatMessage(): ChatMessage {
+    private fun StoredMessage.toChatMessage(conversationId: String? = null): ChatMessage {
         val role = when (role) {
             "assistant" -> ChatRole.BOT
             "system", "tool" -> ChatRole.SYSTEM
@@ -968,6 +980,7 @@ class ConversationStore(context: Context) {
             modelId = modelId,
             promptTokens = promptTokens,
             contextWindowTokens = contextWindowTokens,
+            conversationId = conversationId,
             promptTokensEstimated = promptTokensEstimated == true,
         )
     }

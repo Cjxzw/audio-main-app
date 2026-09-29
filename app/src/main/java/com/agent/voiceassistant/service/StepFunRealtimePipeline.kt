@@ -121,7 +121,7 @@ class StepFunRealtimePipeline(
         val normalized = text.trim()
         if (normalized.isBlank()) return
         val stored = store.addMessageToConversation(conversationId, "user", normalized)
-        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, normalized, stored.timestamp, stored.id))
+        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, normalized, stored.timestamp, stored.id, conversationId = conversationId))
         try {
             client.sendText(normalized)
         } catch (error: Throwable) {
@@ -227,6 +227,7 @@ class StepFunRealtimePipeline(
     }
 
     private fun beginUserTranscriptTurn() {
+        if (userDraft?.completed == false) return
         transcriptFallbackJob?.cancel()
         transcriptFallbackJob = null
         userDraft?.takeIf { !it.completed && it.text.isNotBlank() }?.let { interrupted ->
@@ -319,6 +320,7 @@ class StepFunRealtimePipeline(
                 timestamp = draft.timestamp,
                 messageId = draft.messageId,
                 streamState = state,
+                conversationId = conversationId,
             ),
         )
     }
@@ -377,6 +379,7 @@ class StepFunRealtimePipeline(
                 streamState = state,
                 reasoningItems = items,
                 modelId = settings.stepFunConfig().modelId,
+                conversationId = conversationId,
             ),
         )
     }
@@ -429,6 +432,7 @@ class StepFunRealtimePipeline(
                     messageId = status.id,
                     toolCallId = call.id,
                     toolStatus = ToolDisplayStatus.RUNNING,
+                    conversationId = conversationId,
                 ),
             )
             pendingToolCount += 1
@@ -482,7 +486,7 @@ class StepFunRealtimePipeline(
         val text = tools.displaySummary(call) ?: tools.displayName(call.name)
         store.updateMessageInConversation(conversationId, messageId, text, toolStatus = state)
         EventBus.emitChatMessage(
-            ChatMessage(ChatRole.SYSTEM, text, messageId = messageId, toolCallId = call.id, toolStatus = state),
+            ChatMessage(ChatRole.SYSTEM, text, messageId = messageId, toolCallId = call.id, toolStatus = state, conversationId = conversationId),
         )
     }
 
