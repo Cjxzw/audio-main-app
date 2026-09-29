@@ -31,6 +31,7 @@ import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * The StepFun realtime path intentionally does not use AgentLoop. It owns a persistent WebSocket
@@ -73,7 +74,9 @@ class StepFunRealtimePipeline(
     private var awaitingToolFollowUp = false
     private var toolFollowUpRetryCount = 0
     private var toolFollowUpRetryJob: Job? = null
-    private var stopping = false
+    @Volatile private var stopping = false
+    private val sessionGeneration = AtomicLong(0L)
+    private val sessionBoundaryLock = Any()
     private var acceptingVoiceTranscripts = false
     private val disconnectReported = AtomicBoolean(false)
     private val sessionFinishedNotified = AtomicBoolean(false)
@@ -84,13 +87,14 @@ class StepFunRealtimePipeline(
 
     suspend fun start(captureAudio: Boolean = true) {
         check(eventsJob == null && captureJob == null) { "Realtime 管线已经启动" }
+        sessionGeneration.incrementAndGet()
+        stopping = false
         val config = settings.stepFunConfig()
         val apiKey = settings.stepFunApiKey()
         disconnectReported.set(false)
         sessionFinishedNotified.set(false)
         client.connect(apiKey, config)
         client.updateSession(config, instructions(), realtimeToolDefinitions())
-        stopping = false
         eventsJob = scope.launch {
             client.events.collect(::handleEvent)
         }
@@ -128,11 +132,23 @@ class StepFunRealtimePipeline(
     }
 
     fun stop() {
+        val staleToolStatusIds = synchronized(sessionBoundaryLock) {
+            stopping = true
+            sessionGeneration.incrementAndGet()
+            pendingToolOutputs.clear()
+            pendingToolCount = 0
+            awaitingToolFollowUp = false
+            responseDone = false
+            toolStatusMessageIds.values.toList().also { toolStatusMessageIds.clear() }
+        }
+        staleToolStatusIds.forEach { messageId ->
+            store.deleteMessage(messageId)
+            EventBus.emitChatRemoval(messageId)
+        }
         if (sessionFinishedNotified.compareAndSet(false, true)) {
             val transcript = store.conversationProjection(conversationId, recentTurns = 50)
             if (transcript.isNotBlank()) onSessionFinished(transcript)
         }
-        stopping = true
         acceptingVoiceTranscripts = false
         recorder.stop()
         captureJob?.cancel()
@@ -179,7 +195,7 @@ class StepFunRealtimePipeline(
                     .onFailure { error -> onLog("Realtime 音频入队失败：${error.message ?: error.javaClass.simpleName}") }
             }
             StepFunRealtimeProtocol.Event.AudioDone -> player.finishResponseAudio()
-            is StepFunRealtimeProtocol.Event.FunctionArgumentsDone -> executeTool(event)
+            is StepFunRealtimeProtocol.Event.FunctionArgumentsDone -> executeTool(event, sessionGeneration.get())
             StepFunRealtimeProtocol.Event.ResponseCreated -> {
                 toolFollowUpRetryJob?.cancel()
                 toolFollowUpRetryJob = null
@@ -383,7 +399,8 @@ class StepFunRealtimePipeline(
         onLog("用户已打断当前回复")
     }
 
-    private fun executeTool(event: StepFunRealtimeProtocol.Event.FunctionArgumentsDone) {
+    private fun executeTool(event: StepFunRealtimeProtocol.Event.FunctionArgumentsDone, generation: Long) {
+        if (!isSessionCurrent(generation)) return
         if (event.callId.isBlank() || event.name.isBlank()) {
             onLog("Realtime 工具调用缺少标识")
             return
@@ -393,26 +410,29 @@ class StepFunRealtimePipeline(
             onSleepRequested()
             return
         }
-        val status = store.addMessageToConversation(
-            conversationId = conversationId,
-            role = "system",
-            content = tools.displaySummary(call) ?: tools.displayName(call.name),
-            toolCallId = call.id,
-            toolStatus = ToolDisplayStatus.RUNNING,
-            llmVisible = false,
-        )
-        toolStatusMessageIds[call.id] = status.id
-        EventBus.emitChatMessage(
-            ChatMessage(
-                role = ChatRole.SYSTEM,
-                text = status.content,
-                timestamp = status.timestamp,
-                messageId = status.id,
+        synchronized(sessionBoundaryLock) {
+            if (!isSessionCurrent(generation)) return
+            val status = store.addMessageToConversation(
+                conversationId = conversationId,
+                role = "system",
+                content = tools.displaySummary(call) ?: tools.displayName(call.name),
                 toolCallId = call.id,
                 toolStatus = ToolDisplayStatus.RUNNING,
-            ),
-        )
-        pendingToolCount += 1
+                llmVisible = false,
+            )
+            toolStatusMessageIds[call.id] = status.id
+            EventBus.emitChatMessage(
+                ChatMessage(
+                    role = ChatRole.SYSTEM,
+                    text = status.content,
+                    timestamp = status.timestamp,
+                    messageId = status.id,
+                    toolCallId = call.id,
+                    toolStatus = ToolDisplayStatus.RUNNING,
+                ),
+            )
+            pendingToolCount += 1
+        }
         scope.launch {
             val output = runCatching {
                 val result = when (call.name) {
@@ -432,20 +452,26 @@ class StepFunRealtimePipeline(
                         ToolOutput(call.id, execution.result.contextText, execution.result.success)
                     }
                 }
-                store.addToolResultToConversation(
-                    conversationId = conversationId,
-                    turnId = "realtime-${UUID.randomUUID()}",
-                    call = call,
-                    result = CloudSpeechClient.LlmMessage(role = "tool", content = result.content, toolCallId = call.id),
-                    success = result.success,
-                )
+                synchronized(sessionBoundaryLock) {
+                    if (!isSessionCurrent(generation)) return@runCatching result
+                    store.addToolResultToConversation(
+                        conversationId = conversationId,
+                        turnId = "realtime-${UUID.randomUUID()}",
+                        call = call,
+                        result = CloudSpeechClient.LlmMessage(role = "tool", content = result.content, toolCallId = call.id),
+                        success = result.success,
+                    )
+                }
                 result
             }.getOrElse { error ->
                 ToolOutput(call.id, "工具执行失败：${error.message ?: error.javaClass.simpleName}", false)
             }
-            finishToolStatus(call, output.success)
-            synchronized(pendingToolOutputs) { pendingToolOutputs += output.callId to output.content }
-            pendingToolCount -= 1
+            synchronized(sessionBoundaryLock) {
+                if (!isSessionCurrent(generation)) return@launch
+                finishToolStatus(call, output.success)
+                pendingToolOutputs += output.callId to output.content
+                pendingToolCount -= 1
+            }
             flushToolOutputsWhenPlaybackDrains()
         }
     }
@@ -462,10 +488,13 @@ class StepFunRealtimePipeline(
 
     private fun flushToolOutputsWhenPlaybackDrains() {
         if (!responseDone || pendingToolCount != 0) return
+        val generation = sessionGeneration.get()
         scope.launch {
             // Keep a short guard after response.done so tool follow-up cannot overlap spoken filler.
             delay(150)
-            val outputs = synchronized(pendingToolOutputs) {
+            if (!isSessionCurrent(generation)) return@launch
+            val outputs = synchronized(sessionBoundaryLock) {
+                if (!isSessionCurrent(generation)) return@launch
                 val copy = pendingToolOutputs.toList()
                 pendingToolOutputs.clear()
                 copy
@@ -475,13 +504,18 @@ class StepFunRealtimePipeline(
             awaitingToolFollowUp = true
             toolFollowUpRetryCount = 0
             runCatching {
+                if (!isSessionCurrent(generation)) return@runCatching
                 outputs.forEach { (callId, content) -> client.sendFunctionOutput(callId, content) }
+                if (!isSessionCurrent(generation)) return@runCatching
                 client.createResponse()
             }.onFailure { error ->
                 notifyDisconnected("工具结果发送失败：${error.message ?: error.javaClass.simpleName}")
             }
         }
     }
+
+    private fun isSessionCurrent(generation: Long): Boolean =
+        !stopping && sessionGeneration.get() == generation
 
     private fun scheduleToolFollowUpRetry() {
         if (!awaitingToolFollowUp || toolFollowUpRetryJob?.isActive == true) return

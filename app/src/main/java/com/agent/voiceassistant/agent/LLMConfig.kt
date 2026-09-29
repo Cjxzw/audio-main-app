@@ -14,7 +14,7 @@ data class LLMConfig(
     val providerMode: LlmProviderMode = LlmProviderMode.MIMO,
 ) {
     companion object {
-        fun mimo(apiKey: String, baseUrl: String, modelName: String = "mimo-v2.5"): LLMConfig = LLMConfig(
+        fun mimo(apiKey: String, baseUrl: String, modelName: String = "mimo-v2.6-pro"): LLMConfig = LLMConfig(
             apiKey = apiKey,
             baseUrl = baseUrl,
             modelName = modelName,

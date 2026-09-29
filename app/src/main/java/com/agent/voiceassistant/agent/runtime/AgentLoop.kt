@@ -745,7 +745,7 @@ class AgentLoop(
         const val MAX_STREAM_INTEGRITY_RETRIES = 1
 
         fun contextWindowFor(modelId: String?): Long? = when (modelId) {
-            "mimo-v2.5-pro" -> 1_000_000L
+            "mimo-v2.5-pro", "mimo-v2.6-pro" -> 1_000_000L
             else -> null
         }
         private const val MAX_CONSECUTIVE_TOOL_FAILURE_ROUNDS = 3

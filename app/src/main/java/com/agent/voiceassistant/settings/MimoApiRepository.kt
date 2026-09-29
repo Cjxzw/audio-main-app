@@ -46,7 +46,7 @@ class MimoApiRepository(context: Context) {
     }
 
     companion object {
-        const val DEFAULT_MODEL = "mimo-v2.5"
+        const val DEFAULT_MODEL = "mimo-v2.6-pro"
         private const val SECRET_NAME = "mimo.api_key"
 
         fun detectKeyType(value: String): MimoKeyType? = when {
