@@ -61,6 +61,12 @@ object EventBus {
     )
     val conversationBusy: SharedFlow<Boolean> = _conversationBusy.asSharedFlow()
 
+    private val _agentRunning = MutableSharedFlow<Boolean>(
+        replay = 1,
+        extraBufferCapacity = 8,
+    )
+    val agentRunning: SharedFlow<Boolean> = _agentRunning.asSharedFlow()
+
     private val _userNotices = MutableSharedFlow<String>(
         replay = 0,
         extraBufferCapacity = 16,
@@ -101,6 +107,10 @@ object EventBus {
 
     fun emitConversationBusy(busy: Boolean) {
         _conversationBusy.tryEmit(busy)
+    }
+
+    fun emitAgentRunning(running: Boolean) {
+        _agentRunning.tryEmit(running)
     }
 
     fun emitUserNotice(message: String) {

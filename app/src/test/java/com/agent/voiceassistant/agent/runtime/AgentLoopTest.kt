@@ -556,7 +556,7 @@ class AgentLoopTest {
         assertEquals(AgentLoop.Outcome.Completed("连续三次读取失败，我先停止重试", true), outcome)
         assertEquals(4, runtime.requests.size)
         assertTrue(runtime.requests.last().tools.isEmpty())
-        assertEquals(256, runtime.requests.last().maxCompletionTokens)
+        assertEquals(1024, runtime.requests.last().maxCompletionTokens)
     }
 
     @Test

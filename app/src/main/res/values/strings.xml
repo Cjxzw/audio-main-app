@@ -12,9 +12,10 @@
     <string name="chat_details_label">详细内容</string>
     <string name="chat_details_expand">展开详细内容</string>
     <string name="chat_details_collapse">收起详细内容</string>
-    <string name="chat_reasoning_label">思考内容</string>
-    <string name="chat_reasoning_expand">展开思考内容</string>
-    <string name="chat_reasoning_collapse">收起思考内容</string>
+    <string name="chat_reasoning_label">过程</string>
+    <string name="chat_reasoning_expand">展开过程</string>
+    <string name="chat_reasoning_collapse">收起过程</string>
+    <string name="btn_stop_agent">停止当前任务</string>
     <string name="voice_start">开始语音会话</string>
     <string name="voice_stop">结束语音会话</string>
     <string name="voice_level">语音输入音量</string>

@@ -29,7 +29,6 @@ import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LocalConversationCommandPolicy
 import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
-import com.agent.voiceassistant.agent.ExperimentalReplyParser
 import com.agent.voiceassistant.agent.StructuredOutputParser
 import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.agent.VoiceReplyLengthGate
@@ -72,6 +71,7 @@ import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.data.ConversationCompressionSource
 import com.agent.voiceassistant.data.ToolHistoryPolicy
 import com.agent.voiceassistant.data.ConversationMemoryCompactor
+import com.agent.voiceassistant.data.RealtimeSessionCompactor
 import com.agent.voiceassistant.data.RuleStore
 import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
@@ -171,7 +171,7 @@ class VoiceAgentService : Service() {
         private const val NEW_CONVERSATION_DEBOUNCE_MS = 1_500L
         private const val TTS_FADE_MS = 18
         private const val TTS_FINAL_SILENCE_MS = 90
-        private const val DEEP_MAX_TOOL_ROUNDS = 10
+        private const val DEEP_MAX_TOOL_ROUNDS = 100
         private const val FAST_MAX_COMPLETION_TOKENS = 1_024
         private const val DEEP_MAX_COMPLETION_TOKENS = 4_096
         private const val INTENT_ROUTE_TOOL_GATE = 3
@@ -242,6 +242,7 @@ class VoiceAgentService : Service() {
         const val ACTION_DELETE_CONVERSATION = "com.agent.voiceassistant.DELETE_CONVERSATION"
         const val ACTION_COMPACT_CONVERSATION = "com.agent.voiceassistant.COMPACT_CONVERSATION"
         const val ACTION_CANCEL_TASK = "com.agent.voiceassistant.CANCEL_TASK"
+        const val ACTION_CANCEL_AGENT = "com.agent.voiceassistant.CANCEL_AGENT"
         const val EXTRA_OPEN_TASKS = "open_tasks"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_ATTACHMENTS = "attachments"
@@ -345,6 +346,8 @@ class VoiceAgentService : Service() {
         fun cancelTask(ctx: Context, id: String) =
             sendServiceAction(ctx, ACTION_CANCEL_TASK) { putExtra(EXTRA_TASK_ID, id) }
 
+        fun cancelAgent(ctx: Context) = sendServiceAction(ctx, ACTION_CANCEL_AGENT)
+
         private fun sendServiceAction(ctx: Context, action: String, configure: Intent.() -> Unit = {}) {
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(action).apply(configure)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent) else ctx.startService(intent)
@@ -386,6 +389,7 @@ class VoiceAgentService : Service() {
     private lateinit var activeTurnCheckpointStore: ActiveTurnCheckpointStore
     private val agentHarness = MainAgentHarness()
     private val memoryCompactor = ConversationMemoryCompactor()
+    private val realtimeSessionCompactor = RealtimeSessionCompactor()
     private lateinit var earcons: EarconPlayer
     private var dormant = true
     private val turnMutex = Mutex()
@@ -393,6 +397,7 @@ class VoiceAgentService : Service() {
     private val toolStatusMessageIds = ConcurrentHashMap<String, String>()
     private val assistantDrafts = ConcurrentHashMap<String, AssistantDraft>()
     private val turnPresentationDrafts = ConcurrentHashMap<String, TurnPresentationDraft>()
+    private val interruptedPresentationMessageIds = ConcurrentHashMap.newKeySet<String>()
     private val thinkingFeedbackLock = Any()
     private val speechInterruptedForUrgentReport = AtomicBoolean(false)
     private val newConversationInProgress = AtomicBoolean(false)
@@ -406,6 +411,7 @@ class VoiceAgentService : Service() {
     private var realtimeConversationId: String = ""
     private var lastThinkingFeedbackAudio: Int? = null
     @Volatile private var activeSourceTurnId: String = ""
+    @Volatile private var activeLoopTurnId: String = ""
     @Volatile private var activeTextTurnSilent: Boolean = false
 
     private data class TurnCheckpointContext(
@@ -429,6 +435,16 @@ class VoiceAgentService : Service() {
             val source: ConversationCompressionSource,
         ) : BackgroundLlmTask {
             override val purpose: String = "memory_compaction"
+        }
+
+        data class RealtimeDigest(
+            override val taskId: String,
+            override val provider: LlmProviderProfile,
+            val conversationId: String,
+            val transcript: String,
+            override val snapshot: List<CloudSpeechClient.LlmMessage> = emptyList(),
+        ) : BackgroundLlmTask {
+            override val purpose: String = "realtime_digest"
         }
 
     }
@@ -601,6 +617,10 @@ class VoiceAgentService : Service() {
                 ensureForegroundForCurrentState()
                 val id = intent.getStringExtra(EXTRA_TASK_ID).orEmpty()
                 serviceScope.launch { taskCoordinator.cancel(id) }
+            }
+            ACTION_CANCEL_AGENT -> {
+                ensureForegroundForCurrentState()
+                serviceScope.launch { cancelActiveAgent() }
             }
             ACTION_STOP -> {
                 hardStopAgent(keepForeground = false)
@@ -1071,6 +1091,12 @@ class VoiceAgentService : Service() {
             updateNotification("正在回应...")
             return
         }
+        if (mainTurnActive.get() || agentHarness.state.value != MainAgentHarness.State.IDLE) {
+            val busy = "主会话正在处理上一项任务，请稍后再试。"
+            EventBus.emitUserNotice(busy)
+            emitLog(busy)
+            return
+        }
         val speakReplies = false
         mainTurnActive.set(true)
         turnMutex.withLock {
@@ -1274,12 +1300,25 @@ class VoiceAgentService : Service() {
             return "主会话繁忙，请稍后再试。"
         }
         processUserText("[Realtime 转交] $normalized", source = "realtime-delegate")
-        return "主会话已完成处理，结果已回灌到当前实时对话。"
+        return "已转交主会话处理，完成后会把最新正文回灌到当前实时对话。"
     }
 
     private fun finishRealtimeSession(transcript: String) {
-        val note = "Realtime 语音通话（${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA).format(java.util.Date())}）记录：\n$transcript"
-        store.appendPendingContextNote(mainConversationId, note)
+        val normalized = transcript.trim()
+        if (normalized.isBlank()) return
+        val conversationId = mainConversationId
+        enqueueBackgroundTask(
+            BackgroundLlmTask.RealtimeDigest(
+                taskId = UUID.randomUUID().toString(),
+                provider = llmProviderRepository.activeProfile(),
+                conversationId = conversationId,
+                transcript = normalized,
+            ),
+        )
+        DiagLog.i(
+            "realtime.digest.queued",
+            "conversation=$conversationId transcriptChars=${normalized.length}",
+        )
     }
 
     private fun startRealtimeSession() {
@@ -1429,7 +1468,7 @@ class VoiceAgentService : Service() {
 
                 override fun hasUsableFinalResponse(message: CloudSpeechClient.LlmMessage): Boolean =
                     if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
-                        ExperimentalReplyParser.parse(message.content.orEmpty()).hasUsableAnswer
+                        !message.content.isNullOrBlank()
                     } else {
                         !message.content.isNullOrBlank()
                     }
@@ -1660,18 +1699,16 @@ class VoiceAgentService : Service() {
                 ): Boolean {
                     val rawText = message.content.orEmpty().trim()
                     if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
-                        val parsed = ExperimentalReplyParser.parse(rawText)
-                        val displayText = composeExperimentalDisplay(parsed.answer, parsed.details)
-                        finalizedAssistantForContext = message.copy(content = displayText)
-                        finishTurnPresentation(turnId, parsed, rawText, message.responseMetadata)
-                        emitLog("助手: ${parsed.answer.take(MAX_LOG_PREVIEW_CHARS)}")
+                        finalizedAssistantForContext = message.copy(content = rawText)
+                        finishTurnPresentation(turnId, rawText, rawText, message.responseMetadata)
+                        emitLog("助手: ${rawText.take(MAX_LOG_PREVIEW_CHARS)}")
                         awaitReasoningFeedback()
-                        if (speakReplies && speechClient != null && parsed.answer.isNotBlank()) {
+                        if (speakReplies && speechClient != null && rawText.isNotBlank()) {
                             try {
                                 beforeSpeech()
                                 speakAssistantText(
                                     speechClient,
-                                    optimizeSpokenReply(parsed.answer),
+                                    optimizeSpokenReply(rawText),
                                     onAudioStarted = { metricsTracker?.markAudioStarted() },
                                 )
                                 return true
@@ -1856,7 +1893,7 @@ class VoiceAgentService : Service() {
                     speechClient = speech,
                     speakReplies = restoredSpeakReplies && speech != null,
                     messages = decoded,
-                    initialThinkingMode = CloudSpeechClient.ThinkingMode.DISABLED,
+                    initialThinkingMode = CloudSpeechClient.ThinkingMode.ENABLED,
                     maxToolRounds = DEEP_MAX_TOOL_ROUNDS,
                     allowReasoningEscalation = false,
                     voiceReplySummaryEnabled = ExperimentConfig.ENABLE_FINAL_REFINEMENT && restoredSpeakReplies,
@@ -1903,7 +1940,11 @@ class VoiceAgentService : Service() {
 
     private fun onAgentEvent(event: AgentEvent) {
         when (event) {
-            is AgentEvent.AgentStarted -> DiagLog.i("agent.loop.started", "turn=${event.turnId}")
+            is AgentEvent.AgentStarted -> {
+                activeLoopTurnId = event.turnId
+                EventBus.emitAgentRunning(true)
+                DiagLog.i("agent.loop.started", "turn=${event.turnId}")
+            }
             is AgentEvent.TurnStarted -> DiagLog.i(
                 "agent.turn.started",
                 "turn=${event.turnId} thinking=${event.thinkingMode}",
@@ -1974,6 +2015,8 @@ class VoiceAgentService : Service() {
                 "turn=${event.turnId} chars=${event.finalText.length}",
             )
             is AgentEvent.AgentFailed -> {
+                activeLoopTurnId = ""
+                EventBus.emitAgentRunning(false)
                 if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
                     interruptTurnPresentation(event.turnId)
                 } else {
@@ -1983,6 +2026,16 @@ class VoiceAgentService : Service() {
                     "agent.loop.failed",
                     "turn=${event.turnId} error=${event.error}",
                 )
+            }
+            is AgentEvent.AgentInterrupted -> {
+                activeLoopTurnId = ""
+                EventBus.emitAgentRunning(false)
+                if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
+                    interruptTurnPresentation(event.turnId)
+                } else {
+                    interruptAssistantDrafts(event.turnId)
+                }
+                DiagLog.w("agent.loop.interrupted", "turn=${event.turnId} reason=${event.reason}", showInUi = true)
             }
             is AgentEvent.MessageFinished -> {
                 val persistentCalls = if (event.message.toolCalls.any(toolRegistry::isTerminalPresentation)) {
@@ -2050,8 +2103,11 @@ class VoiceAgentService : Service() {
                 else -> Unit
             }
             is AgentEvent.AgentFinished -> {
+                activeLoopTurnId = ""
+                EventBus.emitAgentRunning(false)
                 turnPresentationDrafts.remove(event.turnId)
                 removeAssistantDrafts(event.turnId)
+                cleanupInterruptedPresentations()
             }
             is AgentEvent.ReasoningDelta -> if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
                 appendTurnNativeReasoning(event.turnId, event.text, event.modelCall)
@@ -2069,7 +2125,6 @@ class VoiceAgentService : Service() {
             draft.currentRaw.setLength(0)
             draft.currentNativeReasoning.setLength(0)
             draft.answer = ""
-            draft.details = ""
         }
     }
 
@@ -2101,18 +2156,12 @@ class VoiceAgentService : Service() {
         val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
         synchronized(draft) {
             draft.modelCall = modelCall
-            val parsed = ExperimentalReplyParser.parse(message.content.orEmpty())
-            draft.addMarkdown(draft.currentNativeReasoning.toString())
-            draft.addMarkdown(parsed.thinking)
+            val body = message.content.orEmpty().trim()
             if (message.toolCalls.isNotEmpty()) {
-                // Any pre-tool prose remains observable, but it cannot become the final answer.
-                draft.addMarkdown(parsed.answer)
-                draft.addMarkdown(parsed.details)
+                draft.addMarkdown(body)
                 draft.answer = ""
-                draft.details = ""
             } else {
-                draft.answer = parsed.answer
-                draft.details = parsed.details
+                draft.answer = body
                 draft.metadata = message.responseMetadata
             }
             draft.currentRaw.setLength(0)
@@ -2156,29 +2205,29 @@ class VoiceAgentService : Service() {
 
     private fun finishTurnPresentation(
         turnId: String,
-        parsed: ExperimentalReplyParser.Result,
+        finalText: String,
         rawText: String,
         metadata: CloudSpeechClient.ResponseMetadata?,
     ) {
         val draft = turnPresentationDrafts.computeIfAbsent(turnId) { TurnPresentationDraft() }
         synchronized(draft) {
-            draft.answer = parsed.answer
-            draft.details = parsed.details
+            draft.answer = finalText.trim()
             draft.metadata = metadata
             emitTurnPresentation(draft, streaming = false, forcePersist = true)
-            draft.messageId?.let { store.setLlmContent(it, rawText) }
+            draft.messageId?.let {
+                store.setLlmContent(it, rawText)
+                store.clearReasoningText(it)
+            }
         }
     }
 
     private fun interruptTurnPresentation(turnId: String) {
         val draft = turnPresentationDrafts[turnId] ?: return
         synchronized(draft) {
-            val parsed = ExperimentalReplyParser.parse(draft.currentRaw.toString())
-            draft.addMarkdown(draft.currentNativeReasoning.toString())
-            draft.addMarkdown(parsed.thinking)
-            if (draft.answer.isBlank()) draft.answer = parsed.answer
-            if (draft.details.isBlank()) draft.details = parsed.details
+            draft.addMarkdown(draft.currentRaw.toString())
+            draft.currentRaw.setLength(0)
             emitTurnPresentation(draft, streaming = false, forcePersist = true, interrupted = true)
+            draft.messageId?.let(interruptedPresentationMessageIds::add)
         }
     }
 
@@ -2188,19 +2237,18 @@ class VoiceAgentService : Service() {
         forcePersist: Boolean = false,
         interrupted: Boolean = false,
     ) {
-        val current = ExperimentalReplyParser.parseStreaming(draft.currentRaw.toString())
         val previewItems = buildList {
             addAll(draft.items)
-            draft.currentNativeReasoning.toString().trim().takeIf(String::isNotBlank)?.let {
-                add(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, it))
-            }
-            current.thinking.takeIf(String::isNotBlank)?.let {
-                add(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, it))
+            if (streaming && draft.currentRaw.isNotBlank() && draft.answer.isBlank()) {
+                add(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, draft.currentRaw.toString().trim()))
             }
         }
-        val answer = if (draft.currentRaw.isNotEmpty()) current.answer else draft.answer
-        val details = if (draft.currentRaw.isNotEmpty()) current.details else draft.details
-        val displayText = composeExperimentalDisplay(answer, details)
+        val displayText = when {
+            draft.answer.isNotBlank() -> draft.answer.trim()
+            streaming -> draft.currentRaw.toString().trim()
+            else -> ""
+        }
+        val liveReasoning = draft.currentNativeReasoning.toString()
         if (displayText.isBlank() && previewItems.isEmpty()) return
         val state = when {
             interrupted -> ChatStreamState.INTERRUPTED
@@ -2216,6 +2264,7 @@ class VoiceAgentService : Service() {
                 role = "assistant",
                 content = displayText,
                 streamState = state,
+                reasoningText = liveReasoning.takeIf { streaming && draft.currentRaw.isBlank() && it.isNotBlank() },
                 reasoningItems = previewItems,
                 responseMetadata = draft.metadata,
                 llmVisible = !streaming,
@@ -2229,6 +2278,7 @@ class VoiceAgentService : Service() {
                 messageId = requireNotNull(draft.messageId),
                 content = displayText,
                 streamState = state,
+                reasoningText = liveReasoning.takeIf { streaming && draft.currentRaw.isBlank() && it.isNotBlank() },
                 reasoningItems = previewItems,
                 responseMetadata = draft.metadata,
                 llmVisible = !streaming,
@@ -2245,6 +2295,7 @@ class VoiceAgentService : Service() {
                     timestamp = draft.timestamp,
                     messageId = draft.messageId,
                     streamState = state,
+                    reasoningText = liveReasoning.takeIf { streaming && draft.currentRaw.isBlank() && it.isNotBlank() },
                     reasoningItems = previewItems,
                     modelId = draft.metadata?.modelId,
                     promptTokens = draft.metadata?.promptTokens,
@@ -2255,22 +2306,11 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun composeExperimentalDisplay(answer: String, details: String): String = buildString {
-        append(answer.trim())
-        if (details.isNotBlank()) {
-            if (isNotEmpty()) append("\n\n")
-            append(ReplyDetailPolicy.OPEN_TAG).append('\n')
-            append(details.trim()).append('\n')
-            append(ReplyDetailPolicy.CLOSE_TAG)
-        }
-    }
-
     private data class TurnPresentationDraft(
         val items: MutableList<ReasoningDisplayItem> = mutableListOf(),
         val currentRaw: StringBuilder = StringBuilder(),
         val currentNativeReasoning: StringBuilder = StringBuilder(),
         var answer: String = "",
-        var details: String = "",
         var messageId: String? = null,
         var timestamp: Long = System.currentTimeMillis(),
         var modelCall: Int = 0,
@@ -2559,7 +2599,7 @@ class VoiceAgentService : Service() {
             return AgentLoop.ToolExecution(
                 message = CloudSpeechClient.LlmMessage(
                     role = "tool",
-                    content = "未受支持的工具调用格式。请立即使用 API 提供的原生 tool_calls 重新输出；不要在正文中输出工具标签或伪工具 JSON。如果原内容只是展示资料，请先给出自然语言结论，再将不需要播报的 Markdown 详情放入 <DETAILS>...</DETAILS>。",
+                    content = "未受支持的工具调用格式。请立即使用 API 提供的原生 tool_calls 重新输出；不要在正文中输出工具标签或伪工具 JSON。展示资料时直接给出自然语言正文。",
                     toolCallId = call.id,
                 ),
                 succeeded = false,
@@ -3514,6 +3554,7 @@ class VoiceAgentService : Service() {
             try {
                 when (task) {
                     is BackgroundLlmTask.Memory -> runMemoryCompaction(task)
+                    is BackgroundLlmTask.RealtimeDigest -> runRealtimeDigest(task)
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -3541,6 +3582,39 @@ class VoiceAgentService : Service() {
                 "background.memory.failed",
                 "task=${task.taskId} conversation=${task.source.id} attempts=3 " +
                     "reason=${error.javaClass.simpleName}:${error.message}",
+            )
+        }
+    }
+
+    private suspend fun runRealtimeDigest(task: BackgroundLlmTask.RealtimeDigest) {
+        val instruction = realtimeSessionCompactor.instruction(task.transcript)
+        val result = executeBackgroundLlm(task, instruction, realtimeSessionCompactor::parseStrict)
+        result.onSuccess { output ->
+            val digest = output.value.trim()
+            if (digest.isBlank()) {
+                DiagLog.i(
+                    "realtime.digest.completed",
+                    "task=${task.taskId} conversation=${task.conversationId} useful=false attempts=${output.attemptCount}",
+                )
+                return@onSuccess
+            }
+            val endedAt = java.text.SimpleDateFormat(
+                "yyyy-MM-dd HH:mm",
+                java.util.Locale.CHINA,
+            ).format(java.util.Date())
+            store.appendPendingContextNote(
+                task.conversationId,
+                "Realtime 会话提炼（$endedAt）：\n$digest",
+            )
+            DiagLog.i(
+                "realtime.digest.completed",
+                "task=${task.taskId} conversation=${task.conversationId} useful=true digestChars=${digest.length} " +
+                    "attempts=${output.attemptCount} model=${output.modelId}",
+            )
+        }.onFailure { error ->
+            DiagLog.w(
+                "realtime.digest.failed",
+                "task=${task.taskId} conversation=${task.conversationId} reason=${error.javaClass.simpleName}:${error.message}",
             )
         }
     }
@@ -4400,6 +4474,32 @@ class VoiceAgentService : Service() {
                     .onFailure { Timber.w(it, "CloudSpeechClient shutdown failed") }
             }
         }
+    }
+
+    private fun cancelActiveAgent() {
+        if (!mainTurnActive.get()) {
+            EventBus.emitUserNotice("当前没有正在运行的 Agent 回合")
+            return
+        }
+        val turnId = activeLoopTurnId
+        val reason = "用户手动停止当前回合"
+        if (agentHarness.abort(reason)) {
+            if (turnId.isNotBlank()) onAgentEvent(AgentEvent.AgentInterrupted(turnId, reason))
+            EventBus.emitUserNotice("已停止当前 Agent 回合")
+        } else {
+            EventBus.emitUserNotice("当前回合已经结束")
+        }
+    }
+
+    private fun cleanupInterruptedPresentations() {
+        if (interruptedPresentationMessageIds.isEmpty()) return
+        val ids = interruptedPresentationMessageIds.toList()
+        var changed = false
+        ids.forEach { id ->
+            if (store.clearPresentationDetails(id)) changed = true
+            interruptedPresentationMessageIds.remove(id)
+        }
+        if (changed) EventBus.emitChatReset(store.recentChatMessages())
     }
 
     private fun fail(message: String) {

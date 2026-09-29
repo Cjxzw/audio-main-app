@@ -409,6 +409,27 @@ class ConversationStore(context: Context) {
         }
     }
 
+    fun clearPresentationDetails(messageId: String): Boolean = synchronized(lock) {
+        val session = currentSessionLocked()
+        val index = session.messages.indexOfFirst { it.id == messageId }
+        if (index < 0) return@synchronized false
+        val previous = session.messages[index]
+        if (previous.reasoningText == null && previous.reasoningItems.isEmpty()) return@synchronized false
+        session.messages[index] = previous.copy(reasoningText = null, reasoningItems = emptyList())
+        session.updatedAt = System.currentTimeMillis()
+        persistLocked()
+        true
+    }
+
+    fun clearReasoningText(messageId: String) = synchronized(lock) {
+        val session = currentSessionLocked()
+        val index = session.messages.indexOfFirst { it.id == messageId }
+        if (index < 0 || session.messages[index].reasoningText == null) return@synchronized
+        session.messages[index] = session.messages[index].copy(reasoningText = null)
+        session.updatedAt = System.currentTimeMillis()
+        persistLocked()
+    }
+
     fun deleteMessage(messageId: String): Boolean = synchronized(lock) {
         val session = currentSessionLocked()
         val removed = session.messages.removeAll { it.id == messageId }

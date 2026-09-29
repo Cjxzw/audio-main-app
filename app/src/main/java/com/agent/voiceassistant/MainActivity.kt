@@ -83,6 +83,7 @@ class MainActivity : AppCompatActivity() {
     private val pendingAttachments = mutableListOf<WorkspaceRepository.Entry>()
     private var pendingCameraFile: File? = null
     private var agentListening = false
+    private var agentRunning = false
     private var pendingLegacyShareUris: List<Uri> = emptyList()
     private var chatTailFollowPending = false
     private var chatTailFollowEnabled = true
@@ -304,7 +305,7 @@ class MainActivity : AppCompatActivity() {
         })
 
         homeBinding.btnSendText.setOnClickListener {
-            sendTextInput()
+            if (agentRunning) confirmStopAgent() else sendTextInput()
         }
         homeBinding.etTextInput.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEND) {
@@ -362,6 +363,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendTextInput() {
+        if (agentRunning) return
         val text = homeBinding.etTextInput.text?.toString()?.trim().orEmpty()
         if (text.isBlank() && pendingAttachments.isEmpty()) return
         val attachments = pendingAttachments.map(WorkspaceRepository.Entry::virtualPath)
@@ -371,6 +373,26 @@ class MainActivity : AppCompatActivity() {
         pendingAttachments.clear()
         updatePendingAttachments()
         VoiceAgentService.sendText(this, effectiveText, attachments)
+    }
+
+    private fun confirmStopAgent() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("停止当前任务？")
+            .setMessage("当前回合会被标记为中断，已完成的工具调用和过程会保留。")
+            .setNegativeButton("继续运行", null)
+            .setPositiveButton("停止") { _, _ -> VoiceAgentService.cancelAgent(this) }
+            .show()
+    }
+
+    private fun updateAgentButton(running: Boolean) {
+        agentRunning = running
+        homeBinding.btnSendText.setImageResource(if (running) R.drawable.ic_stop_24 else R.drawable.ic_send_24)
+        homeBinding.btnSendText.contentDescription = getString(
+            if (running) R.string.btn_stop_agent else R.string.btn_send_text,
+        )
+        TooltipCompat.setTooltipText(homeBinding.btnSendText, getString(
+            if (running) R.string.btn_stop_agent else R.string.btn_send_text,
+        ))
     }
 
     private fun toggleAttachmentPanel() {
@@ -544,6 +566,9 @@ class MainActivity : AppCompatActivity() {
             EventBus.conversationBusy.collectLatest { busy ->
                 binding.btnNewConversation.isEnabled = !busy
             }
+        }
+        lifecycleScope.launch {
+            EventBus.agentRunning.collectLatest(::updateAgentButton)
         }
         lifecycleScope.launch {
             EventBus.userNotices.collectLatest(::showMessage)

@@ -219,18 +219,17 @@ class ChatAdapter(
         }
 
         private fun bindReasoning(msg: ChatMessage, requestedExpanded: Boolean) {
-            val items = msg.reasoningItems.ifEmpty {
-                msg.reasoningText.orEmpty().trim().takeIf(String::isNotBlank)?.let {
-                    listOf(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, it))
-                }.orEmpty()
-            }
-            if (msg.role != BOT || items.isEmpty()) {
+            val items = msg.reasoningItems
+            val live = msg.reasoningText.orEmpty().trim()
+                .takeIf { (msg.streamState == ChatStreamState.STREAMING || msg.streamState == ChatStreamState.INTERRUPTED) && it.isNotBlank() }
+                ?.lineSequence()?.toList()?.takeLast(3)?.joinToString("\n")
+            if (msg.role != BOT || (items.isEmpty() && live.isNullOrBlank())) {
                 llReasoning.visibility = View.GONE
                 return
             }
             llReasoning.visibility = View.VISIBLE
-            bindReasoningItems(items, msg.streamState == ChatStreamState.STREAMING)
-            reasoningExpanded = requestedExpanded
+            bindReasoningItems(items, msg.streamState == ChatStreamState.STREAMING, live)
+            reasoningExpanded = requestedExpanded || !live.isNullOrBlank()
             llReasoningHeader.setOnClickListener {
                 reasoningExpanded = !reasoningExpanded
                 stabilizeReplyFocus { setReasoningExpanded(reasoningExpanded) }
@@ -248,9 +247,19 @@ class ChatAdapter(
             )
         }
 
-        private fun bindReasoningItems(items: List<ReasoningDisplayItem>, streaming: Boolean) {
+        private fun bindReasoningItems(items: List<ReasoningDisplayItem>, streaming: Boolean, live: String?) {
             llReasoningContent.removeAllViews()
             val maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            live?.let { preview ->
+                llReasoningContent.addView(TextView(itemView.context).apply {
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    setPadding((12 * resources.displayMetrics.density).roundToInt(), 2, (12 * resources.displayMetrics.density).roundToInt(), 4)
+                    this.maxWidth = maxWidth
+                    setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+                    textSize = 13f
+                    text = preview
+                })
+            }
             items.forEach { item ->
                 when (item.kind) {
                     ReasoningItemKind.MARKDOWN -> {
@@ -291,22 +300,17 @@ class ChatAdapter(
 
         private fun bindText(msg: ChatMessage, requestedDetailsExpanded: Boolean) {
             if (msg.role == BOT) {
-                val extraction = ReplyDetailPolicy.extract(msg.text)
-                tvText.visibility = if (extraction.speakableText.isBlank()) View.GONE else View.VISIBLE
-                if (extraction.speakableText.isNotBlank()) {
+                tvText.visibility = if (msg.text.isBlank()) View.GONE else View.VISIBLE
+                if (msg.text.isNotBlank()) {
                     if (msg.streamState == ChatStreamState.STREAMING) {
-                        tvText.text = extraction.speakableText
+                        tvText.text = msg.text
                     } else {
-                        markwon.setMarkdown(tvText, extraction.speakableText)
+                        markwon.setMarkdown(tvText, msg.text)
                     }
                 } else {
                     tvText.text = ""
                 }
-                if (msg.streamState == ChatStreamState.STREAMING) {
-                    llDetails.visibility = View.GONE
-                } else {
-                    bindDetails(extraction, requestedDetailsExpanded)
-                }
+                llDetails.visibility = View.GONE
             } else {
                 tvText.visibility = View.VISIBLE
                 tvText.text = msg.text
@@ -403,10 +407,7 @@ class ChatAdapter(
 
     private fun isReasoningExpanded(position: Int): Boolean {
         val message = messages[position]
-        return reasoningOverrides[detailKey(message, position)]
-            ?: (message.streamState == ChatStreamState.STREAMING &&
-                message.text.isBlank() &&
-                (message.reasoningItems.isNotEmpty() || !message.reasoningText.isNullOrBlank()))
+        return reasoningOverrides[detailKey(message, position)] ?: false
     }
 
     private fun detailKey(message: ChatMessage, position: Int): String =

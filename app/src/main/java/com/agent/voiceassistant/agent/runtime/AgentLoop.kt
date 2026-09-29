@@ -471,8 +471,8 @@ class AgentLoop(
                     content = buildString {
                         append("工具阶段已经结束：")
                         append(reason)
-                        append("。请根据已有工具结果直接向用户总结当前进展、失败原因和下一步建议。")
-                        append("不得再次调用工具，不得声称未完成的动作已经完成，回复保持简洁。")
+                        append("。工具调用次数已耗尽，请立即做出总结。")
+                        append("不得再次发起工具调用；请根据已有结果说明已完成内容、未完成内容和限制，回复保持适度简洁。")
                     },
                 )
                 repeat(MAX_FINAL_PROTOCOL_ATTEMPTS) { attempt ->
@@ -760,7 +760,7 @@ class AgentLoop(
         private const val MAX_CONSECUTIVE_TOOL_FAILURE_ROUNDS = 3
         private const val MAX_FINAL_PROTOCOL_ATTEMPTS = 2
         private const val MAX_EMPTY_FINAL_RETRIES = 2
-        private const val FINAL_SUMMARY_MAX_COMPLETION_TOKENS = 256
+        private const val FINAL_SUMMARY_MAX_COMPLETION_TOKENS = 1024
         private const val DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD = 3
         private const val DEFAULT_ACTIVE_TOOL_BUDGET_MS = 30_000L
         private const val ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE =
@@ -772,8 +772,7 @@ class AgentLoop(
         private fun buildFinalFormatRepairInstruction() = buildString {
             append("上一条正文包含疑似伪工具调用协议，已被系统拦截。")
             append("如果意图调用工具，必须使用 API 原生 tool_calls；当前最终总结阶段不得再调用工具。")
-            append("如果只是展示 JSON、XML、命令或代码，先给出简短自然语言结论，")
-            append("再把不需要播报的 Markdown 详情放入 <DETAILS>...</DETAILS>。")
+            append("如果只是展示 JSON、XML、命令或代码，也直接输出自然语言正文，不使用自定义 XML 标记块。")
             append("不要在正文中输出 tool_call、function、parameter 等伪工具标签。")
         }
 

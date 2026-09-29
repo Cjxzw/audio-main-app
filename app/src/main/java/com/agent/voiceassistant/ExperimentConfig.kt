@@ -14,6 +14,6 @@ object ExperimentConfig {
     const val ENABLE_EMPTY_FINAL_RETRY = false
     const val ENABLE_STREAM_INTEGRITY_RETRY = false
     const val ENABLE_ACTIVE_TOOL_BUDGET = false
-    const val ENABLE_FORCED_FINAL_SUMMARY = false
+    const val ENABLE_FORCED_FINAL_SUMMARY = true
     const val INCLUDE_BUILTIN_DIAGNOSTIC_RULE = false
 }

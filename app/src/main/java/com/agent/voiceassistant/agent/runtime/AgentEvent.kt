@@ -144,4 +144,10 @@ sealed interface AgentEvent {
         val error: String,
         override val timestamp: Long = System.currentTimeMillis(),
     ) : AgentEvent
+
+    data class AgentInterrupted(
+        override val turnId: String,
+        val reason: String,
+        override val timestamp: Long = System.currentTimeMillis(),
+    ) : AgentEvent
 }
