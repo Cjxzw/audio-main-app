@@ -218,12 +218,11 @@ class CredentialProfilesFragment : PreferenceFragmentCompat() {
                 runCatching {
                     val name = fields[0].text.toString().trim()
                     val base = fields[1].text.toString().trim().ifBlank { null }
-                    val header = fields[2].text.toString().trim()
+                    val key = fields[2].text.toString().trim()
                     val value = fields[3].text.toString()
-                    require(name.isNotBlank() && header.isNotBlank() && value.isNotBlank()) { getString(R.string.settings_http_credentials_invalid) }
-                    if (base != null) require(base.startsWith("https://") || base.startsWith("http://")) { getString(R.string.settings_http_credentials_invalid_base) }
-                    store.putHeaders(name, mapOf(header to value))
-                    if (base != null) store.putBaseUrl(name, base)
+                    require(name.isNotBlank() && key.isNotBlank() && value.isNotBlank() && base != null) { getString(R.string.settings_http_credentials_invalid) }
+                    require(base.startsWith("https://") || base.startsWith("http://")) { getString(R.string.settings_http_credentials_invalid_base) }
+                    store.putEntries(name, mapOf(key to value), listOf(base))
                 }.onSuccess { rebuild() }
                     .onFailure { Toast.makeText(context, it.message ?: getString(R.string.settings_http_credentials_invalid), Toast.LENGTH_LONG).show() }
             }

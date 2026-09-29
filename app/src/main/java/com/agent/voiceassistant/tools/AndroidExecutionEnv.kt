@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -34,6 +35,8 @@ class AndroidExecutionEnv(
         .readTimeout(5, TimeUnit.SECONDS)
         .writeTimeout(5, TimeUnit.SECONDS)
         .callTimeout(5, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build(),
 ) {
     data class ReadResult(
@@ -282,11 +285,15 @@ class AndroidExecutionEnv(
         body: String? = null,
         contentType: String? = null,
         credentialProfile: String? = null,
+        headers: Map<String, String> = emptyMap(),
     ): HttpResult = withContext(Dispatchers.IO) {
         val resolvedUrl = credentialProfile
             ?.takeIf(String::isNotBlank)
             ?.let { credentialStore.resolveUrl(it, url) }
             ?: url
+        credentialProfile?.takeIf(String::isNotBlank)?.let { profile -> credentialStore.validateUrl(profile, resolvedUrl) }
+        val expandedHeaders = headers.mapValues { (_, value) -> requireNotNull(credentialStore.expandReferences(credentialProfile, value)) }
+        val expandedBody = credentialStore.expandReferences(credentialProfile, body)
         require(resolvedUrl.startsWith("https://") || resolvedUrl.startsWith("http://")) {
             "只允许 http 或 https URL"
         }
@@ -294,14 +301,15 @@ class AndroidExecutionEnv(
         require(normalizedMethod in HTTP_METHODS) { "不支持的 HTTP 方法：$method" }
         val requestBody = when {
             normalizedMethod in setOf("POST", "PUT", "PATCH") ->
-                body.orEmpty().toRequestBody((contentType ?: "application/json; charset=utf-8").toMediaTypeOrNull())
-            body != null -> body.toRequestBody(contentType?.toMediaTypeOrNull())
+                expandedBody.orEmpty().toRequestBody((contentType ?: "application/json; charset=utf-8").toMediaTypeOrNull())
+            expandedBody != null -> expandedBody.toRequestBody(contentType?.toMediaTypeOrNull())
             else -> null
         }
         val builder = Request.Builder().url(resolvedUrl).method(normalizedMethod, requestBody)
         credentialProfile?.takeIf(String::isNotBlank)?.let { profile ->
-            credentialStore.headers(profile).forEach(builder::addHeader)
+            if (expandedHeaders.isEmpty()) credentialStore.headers(profile).forEach(builder::addHeader)
         }
+        expandedHeaders.forEach { (name, value) -> builder.addHeader(name, value) }
         val request = builder.build()
         var lastTimeout: IOException? = null
         repeat(MAX_HTTP_ATTEMPTS) {
@@ -558,6 +566,20 @@ class CredentialProfileStore(context: Context) {
         preferences.edit().putString(profile, encrypt(plaintext)).apply()
     }
 
+    fun putEntries(profile: String, entries: Map<String, String>, allowedUrlPrefixes: List<String>) {
+        require(profile.matches(Regex("[a-zA-Z0-9._-]{1,64}"))) { "凭据配置名称无效" }
+        require(entries.isNotEmpty()) { "凭据至少需要一个键值" }
+        entries.forEach { (name, value) ->
+            require(name.matches(Regex("[A-Za-z0-9._-]{1,80}"))) { "凭据键名称无效" }
+            require(!value.contains('\r') && !value.contains('\n')) { "凭据值不能换行" }
+        }
+        val plaintext = entries.entries.joinToString("\n") { (name, value) -> "$name=$value" }
+        preferences.edit()
+            .putString(entriesKey(profile), encrypt(plaintext))
+            .putString(prefixesKey(profile), allowedUrlPrefixes.joinToString("\n") { it.trimEnd('/') + "/" })
+            .apply()
+    }
+
     fun putBasic(profile: String, username: String, password: String, baseUrl: String? = null) {
         val token = Base64.encodeToString("$username:$password".toByteArray(), Base64.NO_WRAP)
         putHeaders(profile, mapOf("Authorization" to "Basic $token"))
@@ -565,14 +587,43 @@ class CredentialProfileStore(context: Context) {
     }
 
     fun headers(profile: String): Map<String, String> {
-        val encrypted = preferences.getString(profile, null)
-            ?: throw IOException("凭据配置不存在：$profile")
+        val encrypted = preferences.getString(profile, null) ?: return emptyMap()
         return decrypt(encrypted).lineSequence()
             .mapNotNull { line ->
                 val index = line.indexOf(':')
                 if (index <= 0) null else line.substring(0, index) to line.substring(index + 1)
             }
             .toMap()
+    }
+
+    fun entries(profile: String): Map<String, String> = preferences.getString(entriesKey(profile), null)
+        ?.let { parseEntries(decrypt(it)) }
+        ?: headers(profile)
+
+    fun allowedUrlPrefixes(profile: String): List<String> = preferences
+        .getString(prefixesKey(profile), null)
+        ?.lineSequence()?.map(String::trim)?.filter(String::isNotBlank)?.toList()
+        ?.takeIf { it.isNotEmpty() }
+        ?: preferences.getString(baseUrlKey(profile), null)?.let { listOf(it.trimEnd('/') + "/") }.orEmpty()
+
+    fun validateUrl(profile: String, url: String) {
+        val target = url.toHttpUrlOrNull() ?: throw IOException("HTTP URL 无效")
+        val prefixes = allowedUrlPrefixes(profile)
+        require(prefixes.isNotEmpty()) { "凭据 profile $profile 未配置允许的 URL 前缀" }
+        require(prefixes.any { isWithinPrefix(target, it) }) {
+            "HTTP 请求已拒绝：URL 不在凭据 profile $profile 的允许范围内"
+        }
+    }
+
+    fun expandReferences(profile: String?, text: String?): String? {
+        if (text == null) return null
+        val pattern = Regex("\\{\\{credential\\.([A-Za-z0-9._-]+)\\.([A-Za-z0-9._-]+)}}")
+        return pattern.replace(text) { match ->
+            val referencedProfile = match.groupValues[1]
+            require(profile == referencedProfile) { "凭证引用的 profile 与请求 profile 不一致" }
+            entries(referencedProfile)[match.groupValues[2]]
+                ?: throw IOException("凭据 profile $referencedProfile 缺少键 ${match.groupValues[2]}")
+        }
     }
 
     fun resolveUrl(profile: String, url: String): String {
@@ -584,13 +635,15 @@ class CredentialProfileStore(context: Context) {
     }
 
     fun availableProfiles(): List<Profile> = preferences.all.keys
-        .filterNot { it.endsWith(BASE_URL_SUFFIX) }
+        .filterNot { it.endsWith(BASE_URL_SUFFIX) || it.endsWith(ENTRIES_SUFFIX) || it.endsWith(PREFIXES_SUFFIX) }
         .sorted()
         .map { name -> Profile(name, preferences.getString(baseUrlKey(name), null)) }
 
     fun delete(profile: String) {
         preferences.edit()
             .remove(profile)
+            .remove(entriesKey(profile))
+            .remove(prefixesKey(profile))
             .remove(baseUrlKey(profile))
             .apply()
     }
@@ -633,6 +686,23 @@ class CredentialProfileStore(context: Context) {
     }
 
     private fun baseUrlKey(profile: String) = "$profile$BASE_URL_SUFFIX"
+    private fun entriesKey(profile: String) = "$profile$ENTRIES_SUFFIX"
+    private fun prefixesKey(profile: String) = "$profile$PREFIXES_SUFFIX"
+
+    private fun parseEntries(plaintext: String): Map<String, String> = plaintext.lineSequence()
+        .mapNotNull { line ->
+            val index = line.indexOf('=')
+            if (index <= 0) null else line.substring(0, index) to line.substring(index + 1)
+        }
+        .toMap()
+
+    private fun isWithinPrefix(target: okhttp3.HttpUrl, rawPrefix: String): Boolean {
+        val prefix = rawPrefix.toHttpUrlOrNull() ?: return false
+        if (target.scheme != prefix.scheme || target.host != prefix.host || target.port != prefix.port) return false
+        val prefixPath = prefix.encodedPath.trimEnd('/') + "/"
+        val targetPath = target.encodedPath
+        return targetPath == prefixPath.trimEnd('/') || targetPath.startsWith(prefixPath)
+    }
 
     private companion object {
         private const val PREFERENCES = "credential-profiles"
@@ -640,5 +710,7 @@ class CredentialProfileStore(context: Context) {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val IV_BYTES = 12
         private const val BASE_URL_SUFFIX = ".base_url"
+        private const val ENTRIES_SUFFIX = ".entries"
+        private const val PREFIXES_SUFFIX = ".url_prefixes"
     }
 }

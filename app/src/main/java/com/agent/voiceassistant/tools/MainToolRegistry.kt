@@ -766,7 +766,7 @@ class MainToolRegistry(
 
     private fun httpRequest() = tool(
         name = TOOL_HTTP_REQUEST,
-        description = "发送通用 HTTP/HTTPS 请求，用于 API 调试和 Skill 调用。凭据只能通过 credential_profile 引用，不得要求用户把密钥放进参数。",
+        description = "发送完整 HTTP/HTTPS 请求，用于 API 调试和纯文本 Skill 调用。Skill 必须提供完整 URL、headers 和 body；凭证只能通过 profile 与 {{credential.profile.key}} 引用，不得要求用户把密钥放进参数。",
         required = listOf("url"),
     ) {
         putJsonObject("method") {
@@ -782,9 +782,14 @@ class MainToolRegistry(
         }
         putJsonObject("body") { put("type", "string") }
         putJsonObject("content_type") { put("type", "string") }
+        putJsonObject("headers") {
+            put("type", "object")
+            put("additionalProperties", buildJsonObject { put("type", "string") })
+            put("description", "完整请求 Header；敏感值使用 {{credential.profile.key}} 引用")
+        }
         putJsonObject("credential_profile") {
             put("type", "string")
-            put("description", "Android Keystore 中已配置的凭据别名")
+            put("description", "Android Keystore 中已配置的凭据 profile；请求 URL 必须匹配其允许前缀")
         }
     }
 

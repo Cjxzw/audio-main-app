@@ -433,6 +433,7 @@ class LocalToolExecutor(
                 body = (payload["body"] as? JsonPrimitive)?.contentOrNull,
                 contentType = payload.string("content_type"),
                 credentialProfile = payload.string("credential_profile"),
+                headers = payload.objectStringMap("headers"),
             )
         }.fold(
             onSuccess = { result ->
@@ -692,4 +693,9 @@ class LocalToolExecutor(
             else -> emptyList()
         }
     }
+
+    private fun JsonObject.objectStringMap(key: String): Map<String, String> =
+        (this[key] as? JsonObject)?.mapNotNull { (name, value) ->
+            (value as? JsonPrimitive)?.contentOrNull?.let { name to it }
+        }?.toMap().orEmpty()
 }

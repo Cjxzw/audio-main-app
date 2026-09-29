@@ -181,10 +181,10 @@
     <string name="settings_http_credentials_delete">删除</string>
     <string name="settings_http_credentials_save">保存</string>
     <string name="settings_http_credentials_name">Profile 名称</string>
-    <string name="settings_http_credentials_base_url">基础 URL（可选）</string>
-    <string name="settings_http_credentials_header_name">Header 名称，例如 Authorization</string>
-    <string name="settings_http_credentials_header_value">Header 值</string>
-    <string name="settings_http_credentials_invalid">请填写名称、Header 名称和 Header 值</string>
+    <string name="settings_http_credentials_base_url">允许的 URL 前缀</string>
+    <string name="settings_http_credentials_header_name">凭证键名，例如 token</string>
+    <string name="settings_http_credentials_header_value">凭证值</string>
+    <string name="settings_http_credentials_invalid">请填写名称、URL 前缀、键名和键值</string>
     <string name="settings_http_credentials_invalid_base">基础 URL 必须使用 HTTP 或 HTTPS</string>
     <string name="settings_manage_providers">供应商配置</string>
     <string name="settings_add_provider">添加供应商</string>
