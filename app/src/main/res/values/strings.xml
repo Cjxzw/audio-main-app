@@ -179,6 +179,7 @@
     <string name="settings_http_credentials_profile_no_base">必须使用完整 URL</string>
     <string name="settings_http_credentials_profile_actions">认证值不会显示。删除后需要重新添加。</string>
     <string name="settings_http_credentials_delete">删除</string>
+    <string name="settings_http_credentials_edit">编辑</string>
     <string name="settings_http_credentials_save">保存</string>
     <string name="settings_http_credentials_name">Profile 名称</string>
     <string name="settings_http_credentials_base_url">允许的 URL 前缀</string>

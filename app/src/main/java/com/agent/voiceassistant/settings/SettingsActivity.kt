@@ -178,13 +178,14 @@ class CredentialProfilesFragment : PreferenceFragmentCompat() {
             store.availableProfiles().forEach { profile ->
                 addPreference(Preference(requireContext()).apply {
                     title = profile.name
-                    summary = profile.baseUrl?.let { getString(R.string.settings_http_credentials_profile, it) }
-                        ?: getString(R.string.settings_http_credentials_profile_no_base)
+                    summary = store.allowedUrlPrefixes(profile.name).joinToString()
+                        .ifBlank { getString(R.string.settings_http_credentials_profile_no_base) }
                     setOnPreferenceClickListener {
                         AlertDialog.Builder(requireContext())
                             .setTitle(profile.name)
                             .setMessage(getString(R.string.settings_http_credentials_profile_actions))
                             .setNegativeButton(android.R.string.cancel, null)
+                            .setNeutralButton(R.string.settings_http_credentials_edit) { _, _ -> showEditor(profile.name) }
                             .setPositiveButton(R.string.settings_http_credentials_delete) { _, _ ->
                                 store.delete(profile.name)
                                 rebuild()
@@ -197,12 +198,14 @@ class CredentialProfilesFragment : PreferenceFragmentCompat() {
         }
     }
 
-    private fun showEditor() {
+    private fun showEditor(existingProfile: String? = null) {
         val context = requireContext()
+        val existingEntries = existingProfile?.let(store::entries).orEmpty()
+        val existingPrefix = existingProfile?.let(store::allowedUrlPrefixes)?.firstOrNull().orEmpty()
         val fields = listOf(
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_name) },
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_base_url) },
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_name) },
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_name); setText(existingProfile.orEmpty()) },
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_base_url); setText(existingPrefix) },
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_name); setText(existingEntries.keys.sorted().firstOrNull().orEmpty()) },
             EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_value); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD },
         )
         val container = LinearLayout(context).apply {
@@ -220,9 +223,15 @@ class CredentialProfilesFragment : PreferenceFragmentCompat() {
                     val base = fields[1].text.toString().trim().ifBlank { null }
                     val key = fields[2].text.toString().trim()
                     val value = fields[3].text.toString()
-                    require(name.isNotBlank() && key.isNotBlank() && value.isNotBlank() && base != null) { getString(R.string.settings_http_credentials_invalid) }
+                    require(name.isNotBlank() && key.isNotBlank() && base != null) { getString(R.string.settings_http_credentials_invalid) }
                     require(base.startsWith("https://") || base.startsWith("http://")) { getString(R.string.settings_http_credentials_invalid_base) }
-                    store.putEntries(name, mapOf(key to value), listOf(base))
+                    val retained = existingEntries[key]
+                    require(value.isNotBlank() || retained != null) { getString(R.string.settings_http_credentials_invalid) }
+                    val updatedEntries = existingEntries.toMutableMap().apply {
+                        put(key, value.ifBlank { retained!! })
+                    }
+                    store.putEntries(name, updatedEntries, listOf(base))
+                    if (existingProfile != null && existingProfile != name) store.delete(existingProfile)
                 }.onSuccess { rebuild() }
                     .onFailure { Toast.makeText(context, it.message ?: getString(R.string.settings_http_credentials_invalid), Toast.LENGTH_LONG).show() }
             }

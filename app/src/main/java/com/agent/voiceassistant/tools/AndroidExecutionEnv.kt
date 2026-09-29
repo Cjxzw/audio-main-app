@@ -600,6 +600,8 @@ class CredentialProfileStore(context: Context) {
         ?.let { parseEntries(decrypt(it)) }
         ?: headers(profile)
 
+    fun entryNames(profile: String): List<String> = entries(profile).keys.sorted()
+
     fun allowedUrlPrefixes(profile: String): List<String> = preferences
         .getString(prefixesKey(profile), null)
         ?.lineSequence()?.map(String::trim)?.filter(String::isNotBlank)?.toList()
