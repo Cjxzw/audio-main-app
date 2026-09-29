@@ -5,9 +5,12 @@ import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
 import androidx.preference.ListPreference
 import androidx.preference.EditTextPreference
@@ -20,6 +23,7 @@ import com.agent.voiceassistant.R
 import com.agent.voiceassistant.BuildConfig
 import com.agent.voiceassistant.databinding.ActivitySettingsBinding
 import com.agent.voiceassistant.workspace.WorkspaceActivity
+import com.agent.voiceassistant.tools.CredentialProfileStore
 import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
 import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.hub.HubSettings
@@ -98,6 +102,15 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
             addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_http_credentials)
+                summary = getString(R.string.settings_http_credentials_summary)
+                setIcon(R.drawable.ic_model_24)
+                setOnPreferenceClickListener {
+                    (activity as SettingsActivity).open(CredentialProfilesFragment(), getString(R.string.settings_http_credentials))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_voice)
                 summary = getString(R.string.settings_voice_summary)
                 setIcon(R.drawable.ic_volume_24)
@@ -143,6 +156,78 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
         }
+    }
+}
+
+class CredentialProfilesFragment : PreferenceFragmentCompat() {
+    private lateinit var store: CredentialProfileStore
+
+    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        store = CredentialProfileStore(requireContext())
+        rebuild()
+    }
+
+    private fun rebuild() {
+        preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_http_credentials_add)
+                summary = getString(R.string.settings_http_credentials_add_summary)
+                setIcon(R.drawable.ic_add_24)
+                setOnPreferenceClickListener { showEditor(); true }
+            })
+            store.availableProfiles().forEach { profile ->
+                addPreference(Preference(requireContext()).apply {
+                    title = profile.name
+                    summary = profile.baseUrl?.let { getString(R.string.settings_http_credentials_profile, it) }
+                        ?: getString(R.string.settings_http_credentials_profile_no_base)
+                    setOnPreferenceClickListener {
+                        AlertDialog.Builder(requireContext())
+                            .setTitle(profile.name)
+                            .setMessage(getString(R.string.settings_http_credentials_profile_actions))
+                            .setNegativeButton(android.R.string.cancel, null)
+                            .setPositiveButton(R.string.settings_http_credentials_delete) { _, _ ->
+                                store.delete(profile.name)
+                                rebuild()
+                            }
+                            .show()
+                        true
+                    }
+                })
+            }
+        }
+    }
+
+    private fun showEditor() {
+        val context = requireContext()
+        val fields = listOf(
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_name) },
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_base_url) },
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_name) },
+            EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_value); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD },
+        )
+        val container = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 0, 48, 0)
+            fields.forEach { addView(it, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT)) }
+        }
+        AlertDialog.Builder(context)
+            .setTitle(R.string.settings_http_credentials_add)
+            .setView(container)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.settings_http_credentials_save) { _, _ ->
+                runCatching {
+                    val name = fields[0].text.toString().trim()
+                    val base = fields[1].text.toString().trim().ifBlank { null }
+                    val header = fields[2].text.toString().trim()
+                    val value = fields[3].text.toString()
+                    require(name.isNotBlank() && header.isNotBlank() && value.isNotBlank()) { getString(R.string.settings_http_credentials_invalid) }
+                    if (base != null) require(base.startsWith("https://") || base.startsWith("http://")) { getString(R.string.settings_http_credentials_invalid_base) }
+                    store.putHeaders(name, mapOf(header to value))
+                    if (base != null) store.putBaseUrl(name, base)
+                }.onSuccess { rebuild() }
+                    .onFailure { Toast.makeText(context, it.message ?: getString(R.string.settings_http_credentials_invalid), Toast.LENGTH_LONG).show() }
+            }
+            .show()
     }
 }
 

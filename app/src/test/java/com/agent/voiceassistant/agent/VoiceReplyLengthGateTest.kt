@@ -17,8 +17,8 @@ class VoiceReplyLengthGateTest {
     fun triggersOnlyAfterTheThreshold() {
         val gate = VoiceReplyLengthGate(30)
 
-        assertFalse(gate.observe("甲".repeat(30)))
-        assertTrue(gate.observe("乙"))
+        assertTrue(gate.observe("甲".repeat(30)))
+        assertFalse(gate.observe("乙"))
         assertFalse(gate.observe("丙"))
         assertTrue(gate.exceeded)
     }

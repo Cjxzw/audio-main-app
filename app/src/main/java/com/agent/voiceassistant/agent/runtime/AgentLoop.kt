@@ -477,7 +477,7 @@ class AgentLoop(
                 )
                 repeat(MAX_FINAL_PROTOCOL_ATTEMPTS) { attempt ->
                     val (streamed, assistant) = requestModel(
-                        tools = runtime.toolDefinitions(config.allowReasoningEscalation),
+                        tools = emptyList(),
                         maxCompletionTokens = FINAL_SUMMARY_MAX_COMPLETION_TOKENS,
                     )
                     val invalid = assistant.toolCalls.isNotEmpty() ||
@@ -557,16 +557,7 @@ class AgentLoop(
                         return@repeat
                     }
                     val terminalCall = terminalCalls.single()
-                    eventSink(AgentEvent.ToolStarted(turnId, terminalCall, runtime.toolDisplayName(terminalCall.name)))
                     val terminal = runtime.executeTerminalPresentation(terminalCall)
-                    eventSink(
-                        AgentEvent.ToolFinished(
-                            turnId = turnId,
-                            call = terminalCall,
-                            result = terminal.result.message,
-                            success = terminal.result.succeeded,
-                        ),
-                    )
                     if (terminal.result.succeeded && !terminal.finalText.isNullOrBlank()) {
                         playedSpeech = playedSpeech || terminal.playedSpeech
                         config.onContextFinalized(turnId, workingMessages + terminal.result.message)
@@ -687,6 +678,24 @@ class AgentLoop(
 
                 for ((_, execution) in executions) {
                     workingMessages += execution.message
+                }
+                val reasoningCall = pendingTools.firstOrNull { pending ->
+                    pending.blockedReason == null && runtime.isReasoningEscalation(pending.call)
+                }
+                if (reasoningCall != null && thinkingMode != CloudSpeechClient.ThinkingMode.ENABLED) {
+                    thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED
+                    runtime.onReasoningEscalation(runtime.reasoningEscalationReason(reasoningCall.call))
+                    eventSink(AgentEvent.ThinkingModeChanged(turnId, thinkingMode))
+                }
+                if (thinkingMode != CloudSpeechClient.ThinkingMode.ENABLED &&
+                    businessToolCallCount >= config.automaticReasoningToolThreshold
+                ) {
+                    thinkingMode = CloudSpeechClient.ThinkingMode.ENABLED
+                    val triggerCalls = pendingTools
+                        .filter { it.blockedReason == null && runtime.countsTowardAutomaticReasoning(it.call) }
+                        .map { it.call }
+                    runtime.onAutomaticReasoningEscalation(businessToolCallCount, triggerCalls)
+                    eventSink(AgentEvent.AutomaticThinkingEscalated(turnId, businessToolCallCount, triggerCalls))
                 }
                 val budgetBlockedThisRound = pendingTools.any { pending ->
                     pending.blockedReason == ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE

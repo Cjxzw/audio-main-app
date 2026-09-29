@@ -588,6 +588,18 @@ class CredentialProfileStore(context: Context) {
         .sorted()
         .map { name -> Profile(name, preferences.getString(baseUrlKey(name), null)) }
 
+    fun delete(profile: String) {
+        preferences.edit()
+            .remove(profile)
+            .remove(baseUrlKey(profile))
+            .apply()
+    }
+
+    fun putBaseUrl(profile: String, baseUrl: String?) {
+        require(profile.matches(Regex("[a-zA-Z0-9._-]{1,64}"))) { "凭据配置名称无效" }
+        preferences.edit().putString(baseUrlKey(profile), baseUrl?.trimEnd('/')).apply()
+    }
+
     private fun encrypt(plaintext: String): String {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key())
