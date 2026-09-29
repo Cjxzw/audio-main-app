@@ -48,17 +48,17 @@ class MainMediaLibraryService : MediaLibraryService() {
             object : AssistantMediaPlayer.Callbacks {
             override fun onPlayRequested() {
                 DiagLog.i("media3.control.play", "source=external_controller", showInUi = true)
-                VoiceAgentService.wake(this@MainMediaLibraryService)
+                VoiceAgentService.startRealtime(this@MainMediaLibraryService)
             }
 
             override fun onPauseRequested() {
                 DiagLog.i("media3.control.pause", "source=external_controller", showInUi = true)
-                VoiceAgentService.sleep(this@MainMediaLibraryService)
+                VoiceAgentService.stopRealtime(this@MainMediaLibraryService)
             }
 
             override fun onStopRequested() {
                 DiagLog.i("media3.control.stop", "source=external_controller", showInUi = true)
-                VoiceAgentService.sleep(this@MainMediaLibraryService)
+                VoiceAgentService.stopRealtime(this@MainMediaLibraryService)
             }
             },
         )

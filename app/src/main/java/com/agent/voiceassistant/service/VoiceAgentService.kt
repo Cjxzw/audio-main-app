@@ -1310,6 +1310,9 @@ class VoiceAgentService : Service() {
         val routes = routeManager
         routeManager = null
         EventBus.emitVolume(0f)
+        _state.value = State.READY
+        emitState(ServiceState.IDLE)
+        MainMediaLibraryService.publishState(this, active = false, status = "Realtime 已挂断")
         updateNotification(if (dormant) "休眠中，等待唤醒" else "主会话就绪")
         serviceScope.launch { runCatching { routes?.release() } }
     }

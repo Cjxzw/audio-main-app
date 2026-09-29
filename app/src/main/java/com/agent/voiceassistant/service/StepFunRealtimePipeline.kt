@@ -409,7 +409,7 @@ class StepFunRealtimePipeline(
             return
         }
         val call = CloudSpeechClient.ToolCall(event.callId, event.name, event.arguments)
-        if (call.name == MainToolRegistry.TOOL_AGENT_SLEEP) {
+        if (call.name == MainToolRegistry.TOOL_AGENT_SLEEP || call.name == MainToolRegistry.TOOL_REALTIME_HANGUP) {
             onSleepRequested()
             return
         }

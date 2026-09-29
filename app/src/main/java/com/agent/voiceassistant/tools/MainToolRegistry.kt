@@ -53,7 +53,7 @@ class MainToolRegistry(
         allowReasoningEscalation: Boolean,
     ): List<CloudSpeechClient.ToolDefinition> {
         if (profile == Profile.REALTIME) {
-            return listOf(mainConversationQuery(), memorySearch(), delegateToMain())
+            return listOf(mainConversationQuery(), memorySearch(), delegateToMain(), realtimeHangup())
         }
         return listOf(
         memoryCreate(),
@@ -515,6 +515,11 @@ class MainToolRegistry(
         }
     }
 
+    private fun realtimeHangup() = tool(
+        name = TOOL_REALTIME_HANGUP,
+        description = "主动挂断当前 Realtime 实时语音通话。仅当用户明确要求结束通话、挂断或离开时调用；调用后立即关闭 Realtime 音频管线。",
+    ) {}
+
     private fun locationRefresh() = tool(
         name = TOOL_LOCATION_REFRESH,
         description = "获取手机当前位置缓存，并在允许时后台发起一次刷新。返回经纬度、精度、来源、定位时间和缓存状态；已有缓存时不等待刷新。启动或新话题也会自动后台刷新，成功后 5 分钟内不会重复请求系统定位。",
@@ -855,6 +860,7 @@ class MainToolRegistry(
         const val TOOL_PROTOCOL_REPAIR = "__repair_tool_protocol"
         const val TOOL_MAIN_CONVERSATION_QUERY = "main_conversation_query"
         const val TOOL_DELEGATE_TO_MAIN = "delegate_to_main"
+        const val TOOL_REALTIME_HANGUP = "realtime_hangup"
 
         val NATIVE_TOOL_NAMES = setOf(
             TOOL_MEMORY_CREATE, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
@@ -864,7 +870,7 @@ class MainToolRegistry(
             TOOL_SKILL_USE, TOOL_AGENT_SLEEP,
             TOOL_VOICE_REPLY, TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,
             TOOL_HUB_DISPATCH_TASK,
-            TOOL_MAIN_CONVERSATION_QUERY, TOOL_DELEGATE_TO_MAIN,
+            TOOL_MAIN_CONVERSATION_QUERY, TOOL_DELEGATE_TO_MAIN, TOOL_REALTIME_HANGUP,
         )
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48
 

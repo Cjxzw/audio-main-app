@@ -10,7 +10,9 @@ import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.VoiceAgentService
+import com.agent.voiceassistant.service.ServiceState
 import com.agent.voiceassistant.ui.ChatAdapter
+import com.agent.voiceassistant.ui.VoiceBarView
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -19,6 +21,7 @@ class RealtimeActivity : AppCompatActivity() {
     private lateinit var store: ConversationStore
     private lateinit var adapter: ChatAdapter
     private var conversationId: String? = null
+    private var sessionObserved = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -26,6 +29,7 @@ class RealtimeActivity : AppCompatActivity() {
         store = ConversationStore(this)
         adapter = ChatAdapter()
         val list = findViewById<RecyclerView>(R.id.rvRealtimeChat)
+        val voiceBar = findViewById<VoiceBarView>(R.id.realtimeVoiceBar)
         list.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
         list.itemAnimator = null
         list.adapter = adapter
@@ -46,6 +50,17 @@ class RealtimeActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             EventBus.chatRemovals.collectLatest { id -> adapter.removeMessage(id) }
+        }
+        lifecycleScope.launch {
+            EventBus.volumeEvents.collectLatest { level -> voiceBar.setLevel(level) }
+        }
+        lifecycleScope.launch {
+            EventBus.states.collectLatest { state ->
+                if (state == ServiceState.LISTENING) sessionObserved = true
+                if (sessionObserved && state in setOf(ServiceState.IDLE, ServiceState.DORMANT, ServiceState.FAILED)) {
+                    finish()
+                }
+            }
         }
     }
 

@@ -496,7 +496,6 @@ class MainActivity : AppCompatActivity() {
     private fun startAgentService() {
         appendLog("正在启动 Agent…")
         VoiceAgentService.startRealtime(this)
-        setVoiceControlActive(true)
         startActivity(Intent(this, RealtimeActivity::class.java))
     }
 
@@ -548,11 +547,6 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             EventBus.userNotices.collectLatest(::showMessage)
-        }
-        lifecycleScope.launch {
-            EventBus.volumeEvents.collectLatest { level ->
-                homeBinding.inputVoiceBar.setLevel(level)
-            }
         }
     }
 
@@ -609,21 +603,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun setVoiceControlActive(active: Boolean) {
         agentListening = active
-        homeBinding.etTextInput.isEnabled = !active
-        homeBinding.etTextInput.visibility = if (active) View.GONE else View.VISIBLE
-        homeBinding.inputVoiceBar.visibility = if (active) View.VISIBLE else View.GONE
-        homeBinding.btnAttach.isEnabled = !active
-        homeBinding.btnSendText.isEnabled = !active
-        homeBinding.btnAttach.alpha = if (active) 0.35f else 1f
-        homeBinding.btnSendText.alpha = if (active) 0.35f else 1f
-        if (active) {
-            homeBinding.etTextInput.clearFocus()
-            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
-                .hideSoftInputFromWindow(homeBinding.etTextInput.windowToken, 0)
-        } else {
-            homeBinding.inputVoiceBar.setLevel(0f)
-        }
-
         val title = getString(if (active) R.string.voice_stop else R.string.voice_start)
         val icon = ContextCompat.getDrawable(
             this,
