@@ -750,7 +750,7 @@ class MainToolRegistry(
     ) {
         putJsonObject("argv") {
             put("type", "array")
-            put("description", "程序和参数数组。例如 [\"cp\", \"/source/README.md\", \"/workspace/README.md\"]。不要传 shell command 字符串。")
+            put("description", "程序和参数数组。例如 [\"cp\", \"/source/README.md\", \"/workspace/README.md\"]。兼容被 JSON 二次序列化的一层数组字符串；仍然不接受 shell command 字符串。")
             put("items", buildJsonObject { put("type", "string") })
         }
         putJsonObject("timeout_seconds") {

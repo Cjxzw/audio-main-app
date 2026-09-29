@@ -16,6 +16,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.security.KeyStore
@@ -218,7 +219,7 @@ class AndroidExecutionEnv(
             "exec 参数不能通过 .. 离开已授权虚拟目录"
         }
         val displayCommand = argv.joinToString(" ") { argument ->
-            if (argument.any(Char::isWhitespace)) "\"${argument.replace("\"", "\\\"")}" else argument
+            if (argument.any(Char::isWhitespace)) "\"${argument.replace("\"", "\\\"")}\"" else argument
         }
         require(!WorkspaceDeletePolicy.attemptsDirectDeletion(argv)) {
             "exec 不允许直接删除文件；请使用 workspace_delete，以便将 Agent 删除的内容移入回收站"
@@ -235,7 +236,14 @@ class AndroidExecutionEnv(
             val process = ProcessBuilder(resolvedArgv)
                 .directory(physicalCwd)
                 .redirectErrorStream(true)
+                .also { builder ->
+                    // Do not pass app/debug environment values into arbitrary programs.
+                    builder.environment().clear()
+                    builder.environment()["PATH"] = "/system/bin:/system/xbin"
+                }
                 .start()
+            // exec has no stdin contract; close it so commands such as cat cannot wait forever.
+            process.outputStream.close()
             try {
                 coroutineScope {
                     val output = async(Dispatchers.IO) { readProcessOutput(process) }
@@ -464,18 +472,26 @@ class AndroidExecutionEnv(
     }
 
     private fun readProcessOutput(process: Process): Pair<String, Boolean> {
-        val output = StringBuilder()
+        val output = ByteArrayOutputStream(MAX_EXEC_OUTPUT_CHARS)
+        val buffer = ByteArray(8 * 1024)
+        var totalBytes = 0
         var truncated = false
-        process.inputStream.bufferedReader().useLines { lines ->
-            lines.forEach { line ->
-                if (output.length + line.length + 1 <= MAX_EXEC_OUTPUT_CHARS) {
-                    output.appendLine(line)
+        process.inputStream.use { input ->
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                val remaining = MAX_EXEC_OUTPUT_CHARS - totalBytes
+                if (remaining > 0) {
+                    val keep = minOf(count, remaining)
+                    output.write(buffer, 0, keep)
+                    if (keep < count) truncated = true
                 } else {
                     truncated = true
                 }
+                totalBytes += count
             }
         }
-        return output.toString().trimEnd() to truncated
+        return output.toString(Charsets.UTF_8.name()).trimEnd() to truncated
     }
 
     private fun File.readTextOrNull(): String? = runCatching { readText() }.getOrNull()

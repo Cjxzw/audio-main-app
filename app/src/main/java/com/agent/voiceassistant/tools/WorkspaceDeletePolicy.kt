@@ -33,5 +33,16 @@ internal object WorkspaceDeletePolicy {
         "busybox",
         "toybox",
         "xargs",
+        // These wrappers can indirectly invoke a shell or reach Android services.
+        "env",
+        "command",
+        "nohup",
+        "setsid",
+        "run-as",
+        "su",
+        "app_process",
+        "app_process64",
+        "dalvikvm",
+        "cmd",
     )
 }

@@ -388,7 +388,9 @@ class LocalToolExecutor(
     }
 
     private suspend fun execCommand(payload: JsonObject): ToolResult {
-        val argv = payload.stringList("argv")
+        val argv = runCatching { ExecArgumentParser.parse(payload["argv"]) }.getOrElse { error ->
+            return invalidArguments("exec", error.message ?: "argv 格式无效")
+        }
         if (argv.isEmpty()) return invalidArguments("exec", "缺少 argv 字段；exec 不接受 shell command 字符串")
         val env = executionEnv ?: return unavailable("exec")
         return runCatching {

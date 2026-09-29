@@ -24,6 +24,8 @@ class WorkspaceDeletePolicyTest {
         assertTrue(WorkspaceDeletePolicy.attemptsDirectDeletion(listOf("rm", "-rf", "/workspace/a")))
         assertTrue(WorkspaceDeletePolicy.attemptsDirectDeletion(listOf("find", "/workspace", "-delete")))
         assertTrue(WorkspaceDeletePolicy.attemptsShellExecution(listOf("sh", "-c", "echo ok")))
+        assertTrue(WorkspaceDeletePolicy.attemptsShellExecution(listOf("env", "sh", "-c", "echo ok")))
+        assertTrue(WorkspaceDeletePolicy.attemptsShellExecution(listOf("run-as", "u0_a123", "sh")))
         assertFalse(WorkspaceDeletePolicy.attemptsShellExecution(listOf("sed", "-n", "1p", "/workspace/a")))
     }
 }
