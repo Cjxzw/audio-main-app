@@ -342,6 +342,16 @@ class AgentLoop(
                 emptyFinalRetriesRemaining: Int = MAX_EMPTY_FINAL_RETRIES,
                 retryMaxCompletionTokens: Int? = null,
             ): Outcome.Completed {
+                val finishReason = assistant.responseMetadata?.finishReason.orEmpty().lowercase()
+                if (finishReason in NON_SUCCESS_FINISH_REASONS) {
+                    val detail = when (finishReason) {
+                        "content_filter" -> "模型安全策略拒绝了本次请求"
+                        "error" -> "模型服务返回了错误"
+                        else -> "模型以异常原因结束了响应：$finishReason"
+                    }
+                    eventSink(AgentEvent.AgentFailed(turnId, detail))
+                    return finishLocalFailure("$detail。已保留当前过程和工具记录，请调整请求后重试。")
+                }
                 val finalText = assistant.content.orEmpty().trim()
                 if (finalText.isBlank()) {
                     if (config.enableFinalResponseFormatRepair && allowFormatRepair) {
@@ -761,6 +771,7 @@ class AgentLoop(
         private const val MAX_FINAL_PROTOCOL_ATTEMPTS = 2
         private const val MAX_EMPTY_FINAL_RETRIES = 2
         private const val FINAL_SUMMARY_MAX_COMPLETION_TOKENS = 1024
+        private val NON_SUCCESS_FINISH_REASONS = setOf("content_filter", "error")
         private const val DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD = 3
         private const val DEFAULT_ACTIVE_TOOL_BUDGET_MS = 30_000L
         private const val ACTIVE_TOOL_BUDGET_BLOCK_MESSAGE =

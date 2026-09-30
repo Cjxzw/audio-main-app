@@ -9,7 +9,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.text.method.ScrollingMovementMethod
 import android.text.method.LinkMovementMethod
-import android.text.TextUtils
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
@@ -131,6 +130,7 @@ class ChatAdapter(
         private val llReasoningHeader = view.findViewById<LinearLayout>(R.id.llReasoningHeader)
         private val llReasoningContent = view.findViewById<ScrollView>(R.id.llReasoningContent)
         private val llReasoningItems = view.findViewById<LinearLayout>(R.id.llReasoningItems)
+        private val tvLiveReasoning = view.findViewById<TextView>(R.id.tvLiveReasoning)
         private val ivReasoningToggle = view.findViewById<ImageView>(R.id.ivReasoningToggle)
         private val llToolStatus = view.findViewById<LinearLayout>(R.id.llToolStatus)
         private val tvToolSummary = view.findViewById<TextView>(R.id.tvToolSummary)
@@ -235,6 +235,9 @@ class ChatAdapter(
             }
             val streaming = msg.streamState == ChatStreamState.STREAMING
             llReasoning.visibility = View.VISIBLE
+            llReasoning.layoutParams = llReasoning.layoutParams.apply {
+                width = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            }
             llReasoningHeader.visibility = if (streaming) View.GONE else View.VISIBLE
             bindReasoningItems(items, streaming, live)
             reasoningExpanded = streaming || requestedExpanded
@@ -256,26 +259,18 @@ class ChatAdapter(
         }
 
         private fun bindReasoningItems(items: List<ReasoningDisplayItem>, streaming: Boolean, live: String?) {
-            llReasoningItems.removeAllViews()
-            val maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            while (llReasoningItems.childCount > 1) {
+                llReasoningItems.removeViewAt(1)
+            }
+            val maxWidth = llReasoning.layoutParams.width
             val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.42f).roundToInt()
             llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply {
                 height = ViewGroup.LayoutParams.WRAP_CONTENT
             }
-            live?.let { preview ->
-                llReasoningItems.addView(TextView(itemView.context).apply {
-                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                    setPadding((12 * resources.displayMetrics.density).roundToInt(), 2, (12 * resources.displayMetrics.density).roundToInt(), 4)
-                    this.maxWidth = maxWidth
-                    setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
-                    textSize = 13f
-                    isSingleLine = true
-                    ellipsize = TextUtils.TruncateAt.MARQUEE
-                    marqueeRepeatLimit = -1
-                    isSelected = true
-                    setHorizontallyScrolling(true)
-                    text = preview
-                })
+            tvLiveReasoning.visibility = if (live.isNullOrBlank()) View.GONE else View.VISIBLE
+            if (!live.isNullOrBlank() && tvLiveReasoning.text.toString() != live) {
+                tvLiveReasoning.text = live
+                tvLiveReasoning.isSelected = true
             }
             items.forEach { item ->
                 when (item.kind) {
