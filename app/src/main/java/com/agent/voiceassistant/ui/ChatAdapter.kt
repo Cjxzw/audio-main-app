@@ -5,6 +5,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ImageView
+import android.widget.HorizontalScrollView
 import android.widget.ScrollView
 import android.widget.TextView
 import android.text.method.ScrollingMovementMethod
@@ -130,6 +131,7 @@ class ChatAdapter(
         private val llReasoningHeader = view.findViewById<LinearLayout>(R.id.llReasoningHeader)
         private val llReasoningContent = view.findViewById<ScrollView>(R.id.llReasoningContent)
         private val llReasoningItems = view.findViewById<LinearLayout>(R.id.llReasoningItems)
+        private val svLiveReasoning = view.findViewById<HorizontalScrollView>(R.id.svLiveReasoning)
         private val tvLiveReasoning = view.findViewById<TextView>(R.id.tvLiveReasoning)
         private val ivReasoningToggle = view.findViewById<ImageView>(R.id.ivReasoningToggle)
         private val llToolStatus = view.findViewById<LinearLayout>(R.id.llToolStatus)
@@ -150,7 +152,7 @@ class ChatAdapter(
             tvText.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             llDetails.visibility = View.GONE
             llReasoning.visibility = View.GONE
-            tvLiveReasoning.visibility = View.GONE
+            svLiveReasoning.visibility = View.GONE
             llToolStatus.visibility = if (isToolStatus) View.VISIBLE else View.GONE
             if (isToolStatus) {
                 llBubble.gravity = android.view.Gravity.START
@@ -254,14 +256,17 @@ class ChatAdapter(
                 .takeIf { msg.role == BOT && msg.streamState == ChatStreamState.STREAMING && it.isNotBlank() }
                 ?.replace(Regex("\\s+"), " ")
             if (live.isNullOrBlank()) {
-                tvLiveReasoning.visibility = View.GONE
+                svLiveReasoning.visibility = View.GONE
                 tvLiveReasoning.text = ""
                 return
             }
-            tvLiveReasoning.visibility = View.VISIBLE
+            svLiveReasoning.visibility = View.VISIBLE
             if (tvLiveReasoning.text.toString() != live) tvLiveReasoning.text = live
-            tvLiveReasoning.isSelected = true
-            tvLiveReasoning.post { tvLiveReasoning.isSelected = true }
+            // This is a following viewport, not a marquee animation. Each
+            // SSE update places the newest text at the right edge immediately.
+            svLiveReasoning.post {
+                svLiveReasoning.fullScroll(View.FOCUS_RIGHT)
+            }
         }
 
         private fun setReasoningExpanded(expanded: Boolean) {

@@ -84,22 +84,30 @@
         android:textSize="15sp"
         android:textColor="@color/white" />
 
-    <TextView
-        android:id="@+id/tvLiveReasoning"
+    <HorizontalScrollView
+        android:id="@+id/svLiveReasoning"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="2dp"
         android:background="@drawable/bubble_details"
-        android:paddingHorizontal="12dp"
-        android:paddingTop="5dp"
-        android:paddingBottom="5dp"
-        android:singleLine="true"
-        android:ellipsize="marquee"
-        android:marqueeRepeatLimit="marquee_forever"
-        android:fadeScrollbars="false"
+        android:fillViewport="false"
+        android:scrollbars="none"
+        android:overScrollMode="never"
         android:visibility="gone"
-        android:textColor="@color/text_secondary"
-        android:textSize="13sp" />
+        android:layoutDirection="ltr">
+
+        <TextView
+            android:id="@+id/tvLiveReasoning"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="12dp"
+            android:paddingTop="5dp"
+            android:paddingBottom="5dp"
+            android:singleLine="true"
+            android:ellipsize="none"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+    </HorizontalScrollView>
 
     <LinearLayout
         android:id="@+id/llDetails"
