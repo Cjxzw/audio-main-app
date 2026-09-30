@@ -16,6 +16,18 @@
         android:textColor="@color/gray_500"
         android:paddingHorizontal="12dp" />
 
+    <TextView
+        android:id="@+id/tvText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:background="@drawable/bubble_user"
+        android:padding="12dp"
+        android:maxWidth="280dp"
+        android:textIsSelectable="true"
+        android:textSize="15sp"
+        android:textColor="@color/white" />
+
     <LinearLayout
         android:id="@+id/llReasoning"
         android:layout_width="match_parent"
@@ -57,6 +69,9 @@
             android:layout_height="wrap_content"
             android:fillViewport="false"
             android:scrollbars="vertical"
+            android:fadeScrollbars="false"
+            android:scrollbarFadeDuration="0"
+            android:scrollbarStyle="insideOverlay"
             android:overScrollMode="ifContentScrolls"
             android:visibility="gone">
 
@@ -83,18 +98,6 @@
             </LinearLayout>
         </ScrollView>
     </LinearLayout>
-
-    <TextView
-        android:id="@+id/tvText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:background="@drawable/bubble_user"
-        android:padding="12dp"
-        android:maxWidth="280dp"
-        android:textIsSelectable="true"
-        android:textSize="15sp"
-        android:textColor="@color/white" />
 
     <LinearLayout
         android:id="@+id/llDetails"

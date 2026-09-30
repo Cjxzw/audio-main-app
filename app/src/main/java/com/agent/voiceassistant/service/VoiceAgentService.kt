@@ -1441,6 +1441,20 @@ class VoiceAgentService : Service() {
                     return agentHarness.awaitRetry(networkTimeout).text
                 }
 
+                override fun onTransportInterruption(reason: String) {
+                    val notice = "模型连接短暂中断，正在继续请求…"
+                    DiagLog.w("agent.stream.interrupted", "reason=${reason.take(300)}")
+                    EventBus.emitChatMessage(
+                        ChatMessage(
+                            role = ChatRole.SYSTEM,
+                            text = notice,
+                            messageId = "network-$activeSourceTurnId",
+                        ),
+                    )
+                    emitLog(notice)
+                    updateNotification("正在恢复模型连接…")
+                }
+
                 override suspend fun modelTurn(
                     request: CloudSpeechClient.ChatRequest,
                     beforeSpeech: suspend () -> Unit,
@@ -2246,7 +2260,7 @@ class VoiceAgentService : Service() {
         val displayText = if (streaming) draft.liveBodyText() else draft.answer.trim()
         val previewItems = if (streaming) emptyList() else draft.items.toList()
         val liveReasoning = draft.currentNativeReasoning.toString()
-        if (displayText.isBlank() && previewItems.isEmpty()) return
+        if (displayText.isBlank() && previewItems.isEmpty() && liveReasoning.isBlank()) return
         val state = when {
             interrupted -> ChatStreamState.INTERRUPTED
             streaming -> ChatStreamState.STREAMING
@@ -2261,7 +2275,7 @@ class VoiceAgentService : Service() {
                 role = "assistant",
                 content = displayText,
                 streamState = state,
-                reasoningText = liveReasoning.takeIf { streaming && draft.currentRaw.isBlank() && it.isNotBlank() },
+                reasoningText = liveReasoning.takeIf { streaming && it.isNotBlank() },
                 reasoningItems = previewItems,
                 responseMetadata = draft.metadata,
                 llmVisible = !streaming,
@@ -2275,7 +2289,7 @@ class VoiceAgentService : Service() {
                 messageId = requireNotNull(draft.messageId),
                 content = displayText,
                 streamState = state,
-                reasoningText = liveReasoning.takeIf { streaming && draft.currentRaw.isBlank() && it.isNotBlank() },
+                reasoningText = liveReasoning.takeIf { streaming && it.isNotBlank() },
                 reasoningItems = previewItems,
                 responseMetadata = draft.metadata,
                 llmVisible = !streaming,
@@ -2292,7 +2306,7 @@ class VoiceAgentService : Service() {
                     timestamp = draft.timestamp,
                     messageId = draft.messageId,
                     streamState = state,
-                    reasoningText = liveReasoning.takeIf { streaming && draft.currentRaw.isBlank() && it.isNotBlank() },
+                    reasoningText = liveReasoning.takeIf { streaming && it.isNotBlank() },
                     reasoningItems = previewItems,
                     modelId = draft.metadata?.modelId,
                     promptTokens = draft.metadata?.promptTokens,

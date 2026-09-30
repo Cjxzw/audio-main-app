@@ -229,9 +229,7 @@ class ChatAdapter(
             val live = msg.reasoningText.orEmpty().trim()
                 .takeIf { (msg.streamState == ChatStreamState.STREAMING || msg.streamState == ChatStreamState.INTERRUPTED) && it.isNotBlank() }
                 ?.replace(Regex("\\s+"), " ")
-            // Streaming content lives in the normal reply bubble. Reveal the
-            // process section only after the turn has completed (or was stopped).
-            if (msg.role != BOT || msg.streamState == ChatStreamState.STREAMING || (items.isEmpty() && live.isNullOrBlank())) {
+            if (msg.role != BOT || (items.isEmpty() && live.isNullOrBlank())) {
                 llReasoning.visibility = View.GONE
                 return
             }
@@ -264,11 +262,15 @@ class ChatAdapter(
             while (llReasoningItems.childCount > 1) {
                 llReasoningItems.removeViewAt(1)
             }
-            val maxWidth = llReasoning.layoutParams.width
+            val maxWidth = llReasoning.layoutParams.width.takeIf { it > 0 }
+                ?: (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.42f).roundToInt()
             llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply {
                 height = ViewGroup.LayoutParams.WRAP_CONTENT
             }
+            llReasoningContent.isVerticalScrollBarEnabled = !streaming
+            llReasoningContent.isScrollbarFadingEnabled = false
+            llReasoningContent.scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
             tvLiveReasoning.visibility = if (live.isNullOrBlank()) View.GONE else View.VISIBLE
             if (!live.isNullOrBlank() && tvLiveReasoning.text.toString() != live) {
                 tvLiveReasoning.text = live
@@ -312,11 +314,17 @@ class ChatAdapter(
                 }
             }
             llReasoningContent.post {
-                val constrained = llReasoningItems.measuredHeight > maxHeight
+                llReasoningItems.measure(
+                    View.MeasureSpec.makeMeasureSpec(maxWidth, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                )
+                val constrained = !streaming && llReasoningItems.measuredHeight > maxHeight
                 val height = if (constrained) maxHeight else ViewGroup.LayoutParams.WRAP_CONTENT
                 if (llReasoningContent.layoutParams.height != height) {
                     llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply { this.height = height }
                 }
+                llReasoningContent.isVerticalScrollBarEnabled = constrained
+                if (constrained) llReasoningContent.post { llReasoningContent.scrollTo(0, 0) }
             }
         }
 

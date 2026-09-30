@@ -174,6 +174,9 @@ class AndroidExecutionEnv(
         expectedSha256: String? = null,
     ): WriteResult {
         require(content.toByteArray().size <= MAX_WRITE_BYTES) { "单次写入不能超过 $MAX_WRITE_BYTES 字节" }
+        require(content.split('\n').size <= MAX_WRITE_LINES) {
+            "单次写入最多 $MAX_WRITE_LINES 行；请先用 overwrite 写入首段，再用 append 分段追加"
+        }
         val file = pathResolver.resolve(path, write = true)
         file.parentFile?.mkdirs()
         val normalizedMode = mode.lowercase()
@@ -503,6 +506,7 @@ class AndroidExecutionEnv(
         private const val MAX_READ_FILE_BYTES = 2L * 1024 * 1024
         private const val MAX_READ_OUTPUT_CHARS = 40_000
         private const val MAX_WRITE_BYTES = 8 * 1024
+        private const val MAX_WRITE_LINES = 50
         private const val DEFAULT_EXEC_TIMEOUT_SECONDS = 30
         private const val MAX_EXEC_TIMEOUT_SECONDS = 120
         private const val MAX_EXEC_ARGV_ITEMS = 64

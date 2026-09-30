@@ -696,7 +696,7 @@ class MainToolRegistry(
 
     private fun writeFile() = tool(
         name = TOOL_WRITE,
-        description = "在 /workspace 中创建、覆盖、追加或按行补丁 UTF-8 文本文件。不得写入源码、日志或 Skill 目录；单次 content 最多 8 KiB。",
+        description = "在 /workspace 中创建、覆盖、追加或按行补丁 UTF-8 文本文件。不得写入源码、日志或 Skill 目录；单次 content 最多 50 行且不超过 8 KiB。大文本必须分段写入。",
         required = listOf("path", "content"),
     ) {
         putJsonObject("path") {
@@ -705,7 +705,7 @@ class MainToolRegistry(
         }
         putJsonObject("content") {
             put("type", "string")
-            put("description", "写入文本；单次最多 8 KiB。大文本请拆分为 append，多数已有文件复制请用 exec 的 cp argv")
+            put("description", "写入文本；单次最多 50 行且不超过 8 KiB。大文本先用 overwrite 写首段，后续使用 append，每段最多 50 行。多数已有文件复制请用 exec 的 cp argv")
         }
         putJsonObject("mode") {
             put("type", "string")

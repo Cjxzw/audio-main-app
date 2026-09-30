@@ -82,6 +82,8 @@ class AgentLoop(
             CloudSpeechClient.ToolCall(callId, call.name, call.arguments.toString())
         suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String = ""
 
+        fun onTransportInterruption(reason: String) = Unit
+
         suspend fun modelTurn(
             request: CloudSpeechClient.ChatRequest,
             beforeSpeech: suspend () -> Unit,
@@ -234,6 +236,7 @@ class AgentLoop(
                         }
                         val completion = candidate.completion
                         val diagnostics = completion.streamDiagnostics
+                        diagnostics.interruptionReason?.let(runtime::onTransportInterruption)
                         val blank = completion.message.content.isNullOrBlank() && completion.message.toolCalls.isEmpty()
                         val truncated = completion.finishReason == "length"
                         val brokenStream = diagnostics.protocolObserved && (
