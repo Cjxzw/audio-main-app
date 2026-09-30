@@ -164,9 +164,8 @@ class ChatAdapter(
                 }
                 return
             }
-            val modelBubbleWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             tvText.layoutParams.width = if (msg.role == BOT) {
-                modelBubbleWidth
+                ViewGroup.LayoutParams.MATCH_PARENT
             } else {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             }
@@ -177,7 +176,11 @@ class ChatAdapter(
             val horizontal = (12 * density).roundToInt()
             val vertical = (10 * density).roundToInt()
             tvText.setPadding(horizontal, vertical, horizontal, vertical)
-            tvText.maxWidth = modelBubbleWidth
+            tvText.maxWidth = if (msg.role == BOT) {
+                itemView.resources.displayMetrics.widthPixels
+            } else {
+                (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            }
             tvTime.maxWidth = tvText.maxWidth
             tvTime.maxLines = 2
             tvTime.ellipsize = null
@@ -242,7 +245,7 @@ class ChatAdapter(
             }
             llReasoning.visibility = View.VISIBLE
             llReasoning.layoutParams = llReasoning.layoutParams.apply {
-                width = modelBubbleWidth()
+                width = ViewGroup.LayoutParams.MATCH_PARENT
             }
             llReasoningHeader.visibility = View.VISIBLE
             bindReasoningItems(items)
@@ -265,7 +268,9 @@ class ChatAdapter(
                 tvLiveReasoning.text = ""
                 return
             }
-            svLiveReasoning.layoutParams = svLiveReasoning.layoutParams.apply { width = modelBubbleWidth() }
+            svLiveReasoning.layoutParams = svLiveReasoning.layoutParams.apply {
+                width = ViewGroup.LayoutParams.MATCH_PARENT
+            }
             svLiveReasoning.visibility = View.VISIBLE
             if (tvLiveReasoning.text.toString() != live) tvLiveReasoning.text = live
             // This is a following viewport, not a marquee animation. Each
@@ -274,9 +279,6 @@ class ChatAdapter(
                 svLiveReasoning.fullScroll(View.FOCUS_RIGHT)
             }
         }
-
-        private fun modelBubbleWidth(): Int =
-            (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
 
         private fun setReasoningExpanded(expanded: Boolean) {
             llReasoningContent.visibility = if (expanded) View.VISIBLE else View.GONE
@@ -289,7 +291,7 @@ class ChatAdapter(
         private fun bindReasoningItems(items: List<ReasoningDisplayItem>) {
             while (llReasoningItems.childCount > 0) llReasoningItems.removeViewAt(0)
             val maxWidth = llReasoning.layoutParams.width.takeIf { it > 0 }
-                ?: (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+                ?: itemView.resources.displayMetrics.widthPixels
             val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.42f).roundToInt()
             llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply {
                 height = ViewGroup.LayoutParams.WRAP_CONTENT
