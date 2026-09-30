@@ -203,6 +203,7 @@ dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("io.noties.markwon:core:4.6.2")
+    implementation("io.noties.markwon:linkify:4.6.2")
     implementation("io.noties.markwon:ext-tables:4.6.2")
 
     // 协程

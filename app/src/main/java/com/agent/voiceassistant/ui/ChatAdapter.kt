@@ -5,8 +5,11 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ImageView
+import android.widget.ScrollView
 import android.widget.TextView
 import android.text.method.ScrollingMovementMethod
+import android.text.method.LinkMovementMethod
+import android.text.TextUtils
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
@@ -16,6 +19,7 @@ import com.agent.voiceassistant.ui.ChatRole.BOT
 import com.agent.voiceassistant.ui.ChatRole.SYSTEM
 import com.agent.voiceassistant.ui.ChatRole.USER
 import io.noties.markwon.Markwon
+import io.noties.markwon.linkify.LinkifyPlugin
 import io.noties.markwon.ext.tables.TablePlugin
 import kotlin.math.roundToInt
 
@@ -76,6 +80,7 @@ class ChatAdapter(
         val v = LayoutInflater.from(parent.context)
             .inflate(R.layout.item_chat_message, parent, false)
         val markdownRenderer = markwon ?: Markwon.builder(parent.context.applicationContext)
+            .usePlugin(LinkifyPlugin.create())
             .usePlugin(TablePlugin.create(parent.context.applicationContext))
             .build()
             .also { markwon = it }
@@ -124,7 +129,8 @@ class ChatAdapter(
         private val tvTime = view.findViewById<TextView>(R.id.tvTime)
         private val llReasoning = view.findViewById<LinearLayout>(R.id.llReasoning)
         private val llReasoningHeader = view.findViewById<LinearLayout>(R.id.llReasoningHeader)
-        private val llReasoningContent = view.findViewById<LinearLayout>(R.id.llReasoningContent)
+        private val llReasoningContent = view.findViewById<ScrollView>(R.id.llReasoningContent)
+        private val llReasoningItems = view.findViewById<LinearLayout>(R.id.llReasoningItems)
         private val ivReasoningToggle = view.findViewById<ImageView>(R.id.ivReasoningToggle)
         private val llToolStatus = view.findViewById<LinearLayout>(R.id.llToolStatus)
         private val tvToolSummary = view.findViewById<TextView>(R.id.tvToolSummary)
@@ -222,14 +228,16 @@ class ChatAdapter(
             val items = msg.reasoningItems
             val live = msg.reasoningText.orEmpty().trim()
                 .takeIf { (msg.streamState == ChatStreamState.STREAMING || msg.streamState == ChatStreamState.INTERRUPTED) && it.isNotBlank() }
-                ?.lineSequence()?.toList()?.takeLast(3)?.joinToString("\n")
+                ?.replace(Regex("\\s+"), " ")
             if (msg.role != BOT || (items.isEmpty() && live.isNullOrBlank())) {
                 llReasoning.visibility = View.GONE
                 return
             }
+            val streaming = msg.streamState == ChatStreamState.STREAMING
             llReasoning.visibility = View.VISIBLE
-            bindReasoningItems(items, msg.streamState == ChatStreamState.STREAMING, live)
-            reasoningExpanded = requestedExpanded || !live.isNullOrBlank()
+            llReasoningHeader.visibility = if (streaming) View.GONE else View.VISIBLE
+            bindReasoningItems(items, streaming, live)
+            reasoningExpanded = streaming || requestedExpanded
             llReasoningHeader.setOnClickListener {
                 reasoningExpanded = !reasoningExpanded
                 stabilizeReplyFocus { setReasoningExpanded(reasoningExpanded) }
@@ -248,15 +256,24 @@ class ChatAdapter(
         }
 
         private fun bindReasoningItems(items: List<ReasoningDisplayItem>, streaming: Boolean, live: String?) {
-            llReasoningContent.removeAllViews()
+            llReasoningItems.removeAllViews()
             val maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.42f).roundToInt()
+            llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply {
+                height = ViewGroup.LayoutParams.WRAP_CONTENT
+            }
             live?.let { preview ->
-                llReasoningContent.addView(TextView(itemView.context).apply {
+                llReasoningItems.addView(TextView(itemView.context).apply {
                     layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                     setPadding((12 * resources.displayMetrics.density).roundToInt(), 2, (12 * resources.displayMetrics.density).roundToInt(), 4)
                     this.maxWidth = maxWidth
                     setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                     textSize = 13f
+                    isSingleLine = true
+                    ellipsize = TextUtils.TruncateAt.MARQUEE
+                    marqueeRepeatLimit = -1
+                    isSelected = true
+                    setHorizontallyScrolling(true)
                     text = preview
                 })
             }
@@ -280,11 +297,12 @@ class ChatAdapter(
                             setTextIsSelectable(true)
                         }
                         if (streaming) textView.text = item.text else markwon.setMarkdown(textView, item.text)
-                        llReasoningContent.addView(textView)
+                        if (!streaming) textView.movementMethod = LinkMovementMethod.getInstance()
+                        llReasoningItems.addView(textView)
                     }
                     ReasoningItemKind.TOOL -> {
                         val toolView = LayoutInflater.from(itemView.context)
-                            .inflate(R.layout.item_reasoning_tool_status, llReasoningContent, false)
+                            .inflate(R.layout.item_reasoning_tool_status, llReasoningItems, false)
                         toolView.layoutParams = toolView.layoutParams.apply { width = maxWidth }
                         toolView.findViewById<TextView>(R.id.tvToolSummary).text = item.text
                         toolView.findViewById<TextView>(R.id.tvToolState).text = when (item.toolStatus) {
@@ -292,8 +310,15 @@ class ChatAdapter(
                             ToolDisplayStatus.FAILED -> "❌"
                             else -> "..."
                         }
-                        llReasoningContent.addView(toolView)
+                        llReasoningItems.addView(toolView)
                     }
+                }
+            }
+            llReasoningContent.post {
+                val constrained = llReasoningItems.measuredHeight > maxHeight
+                val height = if (constrained) maxHeight else ViewGroup.LayoutParams.WRAP_CONTENT
+                if (llReasoningContent.layoutParams.height != height) {
+                    llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply { this.height = height }
                 }
             }
         }
@@ -306,6 +331,7 @@ class ChatAdapter(
                         tvText.text = msg.text
                     } else {
                         markwon.setMarkdown(tvText, msg.text)
+                        tvText.movementMethod = LinkMovementMethod.getInstance()
                     }
                 } else {
                     tvText.text = ""
@@ -335,6 +361,7 @@ class ChatAdapter(
                 tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, 0, 0)
                 tvDetails.setOnClickListener(null)
                 markwon.setMarkdown(tvDetails, extraction.detailsText)
+                tvDetails.movementMethod = LinkMovementMethod.getInstance()
             } else {
                 tvDetails.text = extraction.detailsText.replace("`", "")
                 tvDetails.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_file_24, 0, 0, 0)

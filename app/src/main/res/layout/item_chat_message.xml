@@ -51,13 +51,22 @@
                 android:src="@drawable/ic_chevron_down_24" />
         </LinearLayout>
 
-        <LinearLayout
+        <ScrollView
             android:id="@+id/llReasoningContent"
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:paddingBottom="10dp"
-            android:visibility="gone" />
+            android:fillViewport="false"
+            android:scrollbars="vertical"
+            android:overScrollMode="ifContentScrolls"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:id="@+id/llReasoningItems"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingBottom="10dp" />
+        </ScrollView>
     </LinearLayout>
 
     <TextView

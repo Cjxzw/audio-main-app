@@ -42,6 +42,7 @@ import com.agent.voiceassistant.media.MainMediaLibraryService
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.ServiceState
 import com.agent.voiceassistant.service.VoiceAgentService
+import com.agent.voiceassistant.agent.runtime.MainAgentHarness
 import com.agent.voiceassistant.settings.SettingsActivity
 import com.agent.voiceassistant.ui.ChatAdapter
 import com.agent.voiceassistant.ui.ConversationAdapter
@@ -384,7 +385,14 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun updateAgentButton(running: Boolean) {
+    private fun updateAgentButton(state: MainAgentHarness.State) {
+        val running = state in setOf(
+            MainAgentHarness.State.RUNNING,
+            MainAgentHarness.State.WAITING_NETWORK,
+            MainAgentHarness.State.WAITING_RETRY,
+            MainAgentHarness.State.WAITING_RECOVERY,
+            MainAgentHarness.State.CANCELLING,
+        )
         agentRunning = running
         homeBinding.btnSendText.setImageResource(if (running) R.drawable.ic_stop_24 else R.drawable.ic_send_24)
         homeBinding.btnSendText.contentDescription = getString(
@@ -568,7 +576,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         lifecycleScope.launch {
-            EventBus.agentRunning.collectLatest(::updateAgentButton)
+            EventBus.agentState.collectLatest(::updateAgentButton)
         }
         lifecycleScope.launch {
             EventBus.userNotices.collectLatest(::showMessage)

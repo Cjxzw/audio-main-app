@@ -1,9 +1,13 @@
 package com.agent.voiceassistant.service
 
+import com.agent.voiceassistant.agent.runtime.MainAgentHarness
 import com.agent.voiceassistant.ui.ChatMessage
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 object EventBus {
 
@@ -67,6 +71,9 @@ object EventBus {
     )
     val agentRunning: SharedFlow<Boolean> = _agentRunning.asSharedFlow()
 
+    private val _agentState = MutableStateFlow(MainAgentHarness.State.IDLE)
+    val agentState: StateFlow<MainAgentHarness.State> = _agentState.asStateFlow()
+
     private val _userNotices = MutableSharedFlow<String>(
         replay = 0,
         extraBufferCapacity = 16,
@@ -111,6 +118,10 @@ object EventBus {
 
     fun emitAgentRunning(running: Boolean) {
         _agentRunning.tryEmit(running)
+    }
+
+    fun emitAgentState(state: MainAgentHarness.State) {
+        _agentState.value = state
     }
 
     fun emitUserNotice(message: String) {

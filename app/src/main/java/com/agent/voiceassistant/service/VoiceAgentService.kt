@@ -119,6 +119,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -525,6 +526,9 @@ class VoiceAgentService : Service() {
         serviceScope.launch { taskCoordinator.recover() }
         serviceScope.launch { taskReportReviewLoop() }
         serviceScope.launch { backgroundLlmWorker() }
+        serviceScope.launch {
+            agentHarness.state.collect(EventBus::emitAgentState)
+        }
         locationProvider.refreshInBackground("service_start")
         earcons = EarconPlayer { routeManager }
         createNotificationChannel()
