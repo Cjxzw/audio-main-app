@@ -150,6 +150,7 @@ class ChatAdapter(
             tvText.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             llDetails.visibility = View.GONE
             llReasoning.visibility = View.GONE
+            tvLiveReasoning.visibility = View.GONE
             llToolStatus.visibility = if (isToolStatus) View.VISIBLE else View.GONE
             if (isToolStatus) {
                 llBubble.gravity = android.view.Gravity.START
@@ -205,6 +206,7 @@ class ChatAdapter(
                 }
             }
             bindText(msg, detailsExpanded)
+            bindLiveReasoning(msg)
             bindReasoning(msg, reasoningExpanded)
             tvTime.text = msg.metadataStr
         }
@@ -215,6 +217,7 @@ class ChatAdapter(
             reasoningExpanded: Boolean,
         ) {
             bindText(msg, detailsExpanded)
+            bindLiveReasoning(msg)
             bindReasoning(msg, reasoningExpanded)
             tvRole.text = when (msg.streamState) {
                 ChatStreamState.STREAMING -> itemView.context.getString(R.string.chat_role_bot_streaming)
@@ -226,21 +229,17 @@ class ChatAdapter(
 
         private fun bindReasoning(msg: ChatMessage, requestedExpanded: Boolean) {
             val items = msg.reasoningItems
-            val live = msg.reasoningText.orEmpty().trim()
-                .takeIf { (msg.streamState == ChatStreamState.STREAMING || msg.streamState == ChatStreamState.INTERRUPTED) && it.isNotBlank() }
-                ?.replace(Regex("\\s+"), " ")
-            if (msg.role != BOT || (items.isEmpty() && live.isNullOrBlank())) {
+            if (msg.role != BOT || msg.streamState == ChatStreamState.STREAMING || items.isEmpty()) {
                 llReasoning.visibility = View.GONE
                 return
             }
-            val streaming = msg.streamState == ChatStreamState.STREAMING
             llReasoning.visibility = View.VISIBLE
             llReasoning.layoutParams = llReasoning.layoutParams.apply {
                 width = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             }
-            llReasoningHeader.visibility = if (streaming) View.GONE else View.VISIBLE
-            bindReasoningItems(items, streaming, live)
-            reasoningExpanded = streaming || requestedExpanded
+            llReasoningHeader.visibility = View.VISIBLE
+            bindReasoningItems(items)
+            reasoningExpanded = requestedExpanded
             llReasoningHeader.setOnClickListener {
                 reasoningExpanded = !reasoningExpanded
                 stabilizeReplyFocus { setReasoningExpanded(reasoningExpanded) }
@@ -248,6 +247,21 @@ class ChatAdapter(
                 if (position != RecyclerView.NO_POSITION) onReasoningToggle(position, reasoningExpanded)
             }
             setReasoningExpanded(reasoningExpanded)
+        }
+
+        private fun bindLiveReasoning(msg: ChatMessage) {
+            val live = msg.reasoningText.orEmpty().trim()
+                .takeIf { msg.role == BOT && msg.streamState == ChatStreamState.STREAMING && it.isNotBlank() }
+                ?.replace(Regex("\\s+"), " ")
+            if (live.isNullOrBlank()) {
+                tvLiveReasoning.visibility = View.GONE
+                tvLiveReasoning.text = ""
+                return
+            }
+            tvLiveReasoning.visibility = View.VISIBLE
+            if (tvLiveReasoning.text.toString() != live) tvLiveReasoning.text = live
+            tvLiveReasoning.isSelected = true
+            tvLiveReasoning.post { tvLiveReasoning.isSelected = true }
         }
 
         private fun setReasoningExpanded(expanded: Boolean) {
@@ -258,24 +272,17 @@ class ChatAdapter(
             )
         }
 
-        private fun bindReasoningItems(items: List<ReasoningDisplayItem>, streaming: Boolean, live: String?) {
-            while (llReasoningItems.childCount > 1) {
-                llReasoningItems.removeViewAt(1)
-            }
+        private fun bindReasoningItems(items: List<ReasoningDisplayItem>) {
+            while (llReasoningItems.childCount > 0) llReasoningItems.removeViewAt(0)
             val maxWidth = llReasoning.layoutParams.width.takeIf { it > 0 }
                 ?: (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
             val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.42f).roundToInt()
             llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply {
                 height = ViewGroup.LayoutParams.WRAP_CONTENT
             }
-            llReasoningContent.isVerticalScrollBarEnabled = !streaming
+            llReasoningContent.isVerticalScrollBarEnabled = true
             llReasoningContent.isScrollbarFadingEnabled = false
             llReasoningContent.scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
-            tvLiveReasoning.visibility = if (live.isNullOrBlank()) View.GONE else View.VISIBLE
-            if (!live.isNullOrBlank() && tvLiveReasoning.text.toString() != live) {
-                tvLiveReasoning.text = live
-                tvLiveReasoning.isSelected = true
-            }
             items.forEach { item ->
                 when (item.kind) {
                     ReasoningItemKind.MARKDOWN -> {
@@ -295,8 +302,8 @@ class ChatAdapter(
                             textSize = 13f
                             setTextIsSelectable(true)
                         }
-                        if (streaming) textView.text = item.text else markwon.setMarkdown(textView, item.text)
-                        if (!streaming) textView.movementMethod = LinkMovementMethod.getInstance()
+                        markwon.setMarkdown(textView, item.text)
+                        textView.movementMethod = LinkMovementMethod.getInstance()
                         llReasoningItems.addView(textView)
                     }
                     ReasoningItemKind.TOOL -> {
@@ -318,7 +325,7 @@ class ChatAdapter(
                     View.MeasureSpec.makeMeasureSpec(maxWidth, View.MeasureSpec.EXACTLY),
                     View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
                 )
-                val constrained = !streaming && llReasoningItems.measuredHeight > maxHeight
+                val constrained = llReasoningItems.measuredHeight > maxHeight
                 val height = if (constrained) maxHeight else ViewGroup.LayoutParams.WRAP_CONTENT
                 if (llReasoningContent.layoutParams.height != height) {
                     llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply { this.height = height }
