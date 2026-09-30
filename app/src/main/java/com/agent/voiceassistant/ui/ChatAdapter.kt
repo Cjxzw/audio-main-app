@@ -164,7 +164,12 @@ class ChatAdapter(
                 }
                 return
             }
-            tvText.layoutParams.width = ViewGroup.LayoutParams.WRAP_CONTENT
+            val modelBubbleWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            tvText.layoutParams.width = if (msg.role == BOT) {
+                modelBubbleWidth
+            } else {
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            }
             tvText.textSize = 15f
             tvText.maxLines = Int.MAX_VALUE
             tvText.ellipsize = null
@@ -172,7 +177,7 @@ class ChatAdapter(
             val horizontal = (12 * density).roundToInt()
             val vertical = (10 * density).roundToInt()
             tvText.setPadding(horizontal, vertical, horizontal, vertical)
-            tvText.maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+            tvText.maxWidth = modelBubbleWidth
             tvTime.maxWidth = tvText.maxWidth
             tvTime.maxLines = 2
             tvTime.ellipsize = null
@@ -237,7 +242,7 @@ class ChatAdapter(
             }
             llReasoning.visibility = View.VISIBLE
             llReasoning.layoutParams = llReasoning.layoutParams.apply {
-                width = (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+                width = modelBubbleWidth()
             }
             llReasoningHeader.visibility = View.VISIBLE
             bindReasoningItems(items)
@@ -260,6 +265,7 @@ class ChatAdapter(
                 tvLiveReasoning.text = ""
                 return
             }
+            svLiveReasoning.layoutParams = svLiveReasoning.layoutParams.apply { width = modelBubbleWidth() }
             svLiveReasoning.visibility = View.VISIBLE
             if (tvLiveReasoning.text.toString() != live) tvLiveReasoning.text = live
             // This is a following viewport, not a marquee animation. Each
@@ -268,6 +274,9 @@ class ChatAdapter(
                 svLiveReasoning.fullScroll(View.FOCUS_RIGHT)
             }
         }
+
+        private fun modelBubbleWidth(): Int =
+            (itemView.resources.displayMetrics.widthPixels * 0.82f).roundToInt()
 
         private fun setReasoningExpanded(expanded: Boolean) {
             llReasoningContent.visibility = if (expanded) View.VISIBLE else View.GONE
