@@ -229,7 +229,9 @@ class ChatAdapter(
             val live = msg.reasoningText.orEmpty().trim()
                 .takeIf { (msg.streamState == ChatStreamState.STREAMING || msg.streamState == ChatStreamState.INTERRUPTED) && it.isNotBlank() }
                 ?.replace(Regex("\\s+"), " ")
-            if (msg.role != BOT || (items.isEmpty() && live.isNullOrBlank())) {
+            // Streaming content lives in the normal reply bubble. Reveal the
+            // process section only after the turn has completed (or was stopped).
+            if (msg.role != BOT || msg.streamState == ChatStreamState.STREAMING || (items.isEmpty() && live.isNullOrBlank())) {
                 llReasoning.visibility = View.GONE
                 return
             }

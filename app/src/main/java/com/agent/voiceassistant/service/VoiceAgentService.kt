@@ -2241,17 +2241,10 @@ class VoiceAgentService : Service() {
         forcePersist: Boolean = false,
         interrupted: Boolean = false,
     ) {
-        val previewItems = buildList {
-            addAll(draft.items)
-            if (streaming && draft.currentRaw.isNotBlank() && draft.answer.isBlank()) {
-                add(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, draft.currentRaw.toString().trim()))
-            }
-        }
-        val displayText = when {
-            draft.answer.isNotBlank() -> draft.answer.trim()
-            streaming -> draft.currentRaw.toString().trim()
-            else -> ""
-        }
+        // Keep one chronological reply bubble while the turn is live. The
+        // process section is materialized only after the final answer arrives.
+        val displayText = if (streaming) draft.liveBodyText() else draft.answer.trim()
+        val previewItems = if (streaming) emptyList() else draft.items.toList()
         val liveReasoning = draft.currentNativeReasoning.toString()
         if (displayText.isBlank() && previewItems.isEmpty()) return
         val state = when {
@@ -2323,6 +2316,32 @@ class VoiceAgentService : Service() {
         var lastPersistedAt: Long = 0L,
         var lastEmittedAt: Long = 0L,
     ) {
+        fun liveBodyText(): String = buildString {
+            fun appendPart(text: String) {
+                val normalized = text.trim()
+                if (normalized.isBlank()) return
+                if (isNotEmpty()) append("\n\n")
+                append(normalized)
+            }
+
+            items.forEach { item ->
+                when (item.kind) {
+                    ReasoningItemKind.MARKDOWN -> appendPart(item.text)
+                    ReasoningItemKind.TOOL -> {
+                        val state = when (item.toolStatus) {
+                            ToolDisplayStatus.SUCCEEDED -> " ✅"
+                            ToolDisplayStatus.FAILED -> " ❌"
+                            ToolDisplayStatus.RUNNING -> " ..."
+                            null -> " ..."
+                        }
+                        appendPart("🔧 ${item.text}$state")
+                    }
+                }
+            }
+            appendPart(currentRaw.toString())
+            appendPart(answer)
+        }
+
         fun addMarkdown(text: String) {
             val normalized = text.trim()
             if (normalized.isBlank()) return
