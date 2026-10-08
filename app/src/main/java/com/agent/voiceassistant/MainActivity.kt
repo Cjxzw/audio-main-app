@@ -394,6 +394,11 @@ class MainActivity : AppCompatActivity() {
             MainAgentHarness.State.CANCELLING,
         )
         agentRunning = running
+        if (running) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         homeBinding.btnSendText.setImageResource(if (running) R.drawable.ic_stop_24 else R.drawable.ic_send_24)
         homeBinding.btnSendText.contentDescription = getString(
             if (running) R.string.btn_stop_agent else R.string.btn_send_text,
@@ -464,6 +469,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleIncomingIntent(intent: Intent?) {
+        intent?.getStringExtra(VoiceAgentService.EXTRA_CONVERSATION_ID)?.takeIf { it.isNotBlank() }?.let { id ->
+            VoiceAgentService.switchConversation(this, id)
+            binding.pagePager.setCurrentItem(0, false)
+            intent.removeExtra(VoiceAgentService.EXTRA_CONVERSATION_ID)
+        }
+
         if (intent?.getBooleanExtra(VoiceAgentService.EXTRA_OPEN_TASKS, false) == true) {
             binding.pagePager.setCurrentItem(1, false)
             intent.removeExtra(VoiceAgentService.EXTRA_OPEN_TASKS)
@@ -765,6 +776,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         pageTabsMediator.detach()
         super.onDestroy()
     }

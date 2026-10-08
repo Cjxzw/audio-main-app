@@ -23,6 +23,9 @@ object EventBus {
     )
     val states: SharedFlow<ServiceState> = _states.asSharedFlow()
 
+    private val _realtimeStates = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 8)
+    val realtimeStates: SharedFlow<RealtimeState> = _realtimeStates.asSharedFlow()
+
     private val _pendingCounts = MutableSharedFlow<Int>(
         replay = 1,
         extraBufferCapacity = 8
@@ -88,6 +91,10 @@ object EventBus {
         _states.tryEmit(state)
     }
 
+    fun emitRealtimeState(state: RealtimeState) {
+        _realtimeStates.tryEmit(state)
+    }
+
     fun emitPendingCount(count: Int) {
         _pendingCounts.tryEmit(count)
     }
@@ -141,4 +148,11 @@ enum class ServiceState {
     READY,
     LISTENING,
     FAILED
+}
+
+enum class RealtimeState {
+    CONNECTING,
+    READY,
+    FAILED,
+    STOPPED,
 }

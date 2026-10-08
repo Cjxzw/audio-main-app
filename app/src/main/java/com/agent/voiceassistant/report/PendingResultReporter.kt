@@ -163,7 +163,7 @@ class PendingResultReporter(
             val combined = batch.joinToString("\n") { r ->
                 "- ${r.taskType}任务：${r.summary}"
             }
-            val prompt = "[系统通知] 以下后台任务已完成：\n$combined\n请用简洁的语音向用户汇报结果。"
+            val prompt = "[系统通知] 以下后台任务已完成：\n$combined\n请简要向用户汇报结果。"
             Timber.i("Reporter: injecting ${batch.size} results")
 
             // 注入到 LLM 上下文（通过 TextFrame 上游推送）
@@ -185,7 +185,7 @@ class PendingResultReporter(
     }
 
     private suspend fun injectResult(result: PendingResult) {
-        val prompt = "[系统通知] 紧急任务 ${result.taskId} 完成：\n${result.summary}\n请立即用简洁的语音向用户汇报。"
+        val prompt = "[系统通知] 紧急任务 ${result.taskId} 完成：\n${result.summary}\n请立即向用户简要汇报。"
         pipeline.sendUpstream(DataFrame.TextFrame(prompt))
         result.reported = true
         result.reportedAt = System.currentTimeMillis()

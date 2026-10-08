@@ -34,6 +34,7 @@ import com.agent.voiceassistant.agent.SpokenReplyPolicy
 import com.agent.voiceassistant.agent.VoiceReplyLengthGate
 import com.agent.voiceassistant.agent.buildCurrentTurnUserContent
 import com.agent.voiceassistant.agent.buildMainSystemPrompt
+import com.agent.voiceassistant.agent.buildRealtimeSystemPrompt
 import com.agent.voiceassistant.agent.BodyToolCall
 import com.agent.voiceassistant.agent.runtime.AgentEvent
 import com.agent.voiceassistant.agent.runtime.AgentLoop
@@ -71,7 +72,6 @@ import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.data.ConversationCompressionSource
 import com.agent.voiceassistant.data.ToolHistoryPolicy
 import com.agent.voiceassistant.data.ConversationMemoryCompactor
-import com.agent.voiceassistant.data.RealtimeSessionCompactor
 import com.agent.voiceassistant.data.RuleStore
 import com.agent.voiceassistant.data.StoredAttachment
 import com.agent.voiceassistant.media.MainMediaLibraryService
@@ -183,6 +183,7 @@ class VoiceAgentService : Service() {
         private const val VOICE_REPLY_SUMMARY_TIMEOUT_MS = 6_000L
         private const val VOICE_REPLY_SUMMARY_MAX_TOKENS = 256
         private const val VOICE_REPLY_SUMMARY_INPUT_CHARS = 24_000
+        private const val BACKGROUND_LLM_TIMEOUT_MS = 10L * 60L * 1_000L
         private const val MAX_LOG_PREVIEW_CHARS = 500
         private const val MAX_VOICE_FALLBACK_CHARS = 180
         private val VOICE_SENTENCE_ENDINGS = setOf('。', '！', '？', '!', '?', ';', '；', '.')
@@ -247,7 +248,7 @@ class VoiceAgentService : Service() {
         const val EXTRA_OPEN_TASKS = "open_tasks"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_ATTACHMENTS = "attachments"
-        private const val EXTRA_CONVERSATION_ID = "conversation_id"
+        const val EXTRA_CONVERSATION_ID = "conversation_id"
         private const val EXTRA_CONVERSATION_TITLE = "conversation_title"
         private const val EXTRA_TASK_ID = "task_id"
 
@@ -300,11 +301,6 @@ class VoiceAgentService : Service() {
                     "api.wake.denied",
                     "${error.javaClass.simpleName}:${error.message}",
                     showInUi = true,
-                )
-                MainMediaLibraryService.publishState(
-                    ctx,
-                    active = false,
-                    status = "请点击通知或打开 App 后唤醒",
                 )
             }
         }
@@ -382,6 +378,7 @@ class VoiceAgentService : Service() {
     private lateinit var taskRepository: TaskRepository
     private lateinit var taskCoordinator: AsyncTaskCoordinator
     private lateinit var executionEnv: AndroidExecutionEnv
+    private lateinit var agentKeepAlive: AgentKeepAlive
     private lateinit var workspaceRepository: WorkspaceRepository
     private lateinit var skillRegistry: SkillRegistry
     private lateinit var imageEncoder: MultimodalImageEncoder
@@ -390,7 +387,6 @@ class VoiceAgentService : Service() {
     private lateinit var activeTurnCheckpointStore: ActiveTurnCheckpointStore
     private val agentHarness = MainAgentHarness()
     private val memoryCompactor = ConversationMemoryCompactor()
-    private val realtimeSessionCompactor = RealtimeSessionCompactor()
     private lateinit var earcons: EarconPlayer
     private var dormant = true
     private val turnMutex = Mutex()
@@ -406,6 +402,7 @@ class VoiceAgentService : Service() {
     private val lastNewConversationRequestAt = AtomicLong(0L)
     private val checkpointRecoveryStarted = AtomicBoolean(false)
     private var checkpointWriteJob: Job? = null
+    private val pendingRealtimeResults = ConcurrentHashMap<String, Pair<String, Boolean>>()
     private var stepFunRealtimePipeline: StepFunRealtimePipeline? = null
     @Volatile private var realtimeActive = false
     private var mainConversationId: String = ""
@@ -438,15 +435,6 @@ class VoiceAgentService : Service() {
             override val purpose: String = "memory_compaction"
         }
 
-        data class RealtimeDigest(
-            override val taskId: String,
-            override val provider: LlmProviderProfile,
-            val conversationId: String,
-            val transcript: String,
-            override val snapshot: List<CloudSpeechClient.LlmMessage> = emptyList(),
-        ) : BackgroundLlmTask {
-            override val purpose: String = "realtime_digest"
-        }
 
     }
 
@@ -476,6 +464,7 @@ class VoiceAgentService : Service() {
         capabilityResolver = AppCapabilityResolver(this)
         locationProvider = LocationProvider(this, store)
         executionEnv = AndroidExecutionEnv(this)
+        agentKeepAlive = AgentKeepAlive(this)
         workspaceRepository = WorkspaceRepository(this)
         taskRepository = TaskRepository(this)
         taskCoordinator = AsyncTaskCoordinator(taskRepository, serviceScope).apply {
@@ -672,6 +661,7 @@ class VoiceAgentService : Service() {
                 externalOutputConnected = external,
                 userSpeaking = recorder?.isUserSpeaking() == true,
                 audioReportsEnabled = audioReportsEnabled,
+                realtimeActive = realtimeActive,
             )
         val action = taskRepository.beginReport(batch, route.name.lowercase())
         val hydrated: List<TaskEntity>
@@ -709,6 +699,10 @@ class VoiceAgentService : Service() {
         }
 
         when (route) {
+            TaskReportPolicy.Route.REALTIME -> {
+                queueRealtimeResult("task-report-${action.reportActionId}", summary, false)
+                DiagLog.i("realtime.task.completed", "tasks=${hydrated.size} summaryChars=${summary.length}", showInUi = true)
+            }
             TaskReportPolicy.Route.DEFER -> Unit
             TaskReportPolicy.Route.NOTIFICATION -> reportTasksByNotification(hydrated, summary)
             TaskReportPolicy.Route.ACTIVE_AUDIO -> reportTasksByAudio(hydrated, summary, fromDormant = false)
@@ -847,6 +841,7 @@ class VoiceAgentService : Service() {
 
     override fun onDestroy() {
         hardStopAgent(keepForeground = false)
+        agentKeepAlive.release()
         backgroundLlmTasks.close()
         serviceScope.cancel()
         locationProvider.close()
@@ -871,7 +866,6 @@ class VoiceAgentService : Service() {
             _state.value = State.READY
             emitState(ServiceState.DORMANT)
             emitLog("系统不允许从当前后台状态启动麦克风，请点击通知或打开 App 后重试")
-            MainMediaLibraryService.publishState(this, active = false, status = "点击 App 后唤醒")
             ensureDormantForeground()
             serviceScope.launch { earcons.error() }
             return
@@ -890,7 +884,6 @@ class VoiceAgentService : Service() {
         }
 
         dormant = false
-        MainMediaLibraryService.publishState(this, active = true, status = "聆听中")
         val routes = AudioRouteManager(this)
         routeManager = routes
         val routeSummary = routes.configureForVoiceSession()
@@ -1254,6 +1247,7 @@ class VoiceAgentService : Service() {
         stepFunRealtimePipeline = created
         return try {
             created.start(captureAudio)
+            flushRealtimeResults()
             created
         } catch (error: Throwable) {
             created.stop()
@@ -1263,6 +1257,8 @@ class VoiceAgentService : Service() {
     }
 
     private fun invalidateRealtimePipeline(reason: String) {
+        MainMediaLibraryService.publishState(this, active = realtimeActive,
+            status = if (realtimeActive) "Realtime 正在重连" else "Realtime 已挂断")
         stepFunRealtimePipeline?.stop()
         stepFunRealtimePipeline = null
         EventBus.emitVolume(0f)
@@ -1275,19 +1271,37 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun createStepFunRealtimePipeline(routes: AudioRouteManager): StepFunRealtimePipeline =
-        StepFunRealtimePipeline(
+    private fun queueRealtimeResult(turnId: String, body: String, failed: Boolean) {
+        pendingRealtimeResults[turnId] = body to failed
+        flushRealtimeResults()
+    }
+
+    private fun flushRealtimeResults() {
+        val pipeline = stepFunRealtimePipeline?.takeIf { it.isReady } ?: return
+        pendingRealtimeResults.entries.toList().forEach { (turnId, result) ->
+            if (pipeline.injectMainAssistantReply(turnId, result.first, result.second)) {
+                pendingRealtimeResults.remove(turnId, result)
+            }
+        }
+    }
+
+    private fun createStepFunRealtimePipeline(routes: AudioRouteManager): StepFunRealtimePipeline {
+        val mainId = mainConversationId
+        val realtimeId = realtimeConversationId
+        return StepFunRealtimePipeline(
             scope = serviceScope,
             store = store,
             routes = routes,
             settings = realtimePipelineRepository,
             tools = toolRegistry,
-            conversationId = realtimeConversationId,
-            queryMainConversation = { keyword, turns -> store.conversationProjection(mainConversationId, keyword, turns) },
+            conversationId = realtimeId,
+            mainSnapshot = { store.realtimeStartupSnapshot(mainId) },
+            queryMainConversation = { keyword, turns -> store.conversationProjection(mainId, keyword, turns) },
             delegateToMain = ::delegateRealtimeToMain,
-            onSessionFinished = { transcript -> finishRealtimeSession(transcript) },
+            onSessionFinished = { store.transferRealtimeTranscript(realtimeId, mainId) },
+            onUndeliveredMainReply = { turnId, text, failed -> pendingRealtimeResults[turnId] = text to failed },
             instructions = {
-                buildMainSystemPrompt() + "\n\n当前通过 StepFun Realtime 进行全双工语音会话。直接输出适合朗读的自然语言纯文本。不得输出 Markdown：不要使用标题符号、星号加粗、下划线、反引号、列表符号、编号列表、链接语法、表格或代码块；需要列举时用完整句子依次说明。不得输出 <working>、<answer>、<thinking>、<details> 或其他自定义 XML 标签。思考、工具调用和语音由 Realtime 原生事件承载。"
+                buildRealtimeSystemPrompt()
             },
             onLog = ::emitLog,
             onDisconnected = { message ->
@@ -1296,6 +1310,7 @@ class VoiceAgentService : Service() {
             },
             onSleepRequested = { sleepAgent() },
         )
+    }
 
     private suspend fun delegateRealtimeToMain(content: String): String {
         val normalized = content.trim()
@@ -1303,26 +1318,12 @@ class VoiceAgentService : Service() {
         if (mainTurnActive.get() || agentHarness.state.value != MainAgentHarness.State.IDLE) {
             return "主会话繁忙，请稍后再试。"
         }
-        processUserText("[Realtime 转交] $normalized", source = "realtime-delegate")
-        return "已转交主会话处理，完成后会把最新正文回灌到当前实时对话。"
-    }
-
-    private fun finishRealtimeSession(transcript: String) {
-        val normalized = transcript.trim()
-        if (normalized.isBlank()) return
-        val conversationId = mainConversationId
-        enqueueBackgroundTask(
-            BackgroundLlmTask.RealtimeDigest(
-                taskId = UUID.randomUUID().toString(),
-                provider = llmProviderRepository.activeProfile(),
-                conversationId = conversationId,
-                transcript = normalized,
-            ),
-        )
-        DiagLog.i(
-            "realtime.digest.queued",
-            "conversation=$conversationId transcriptChars=${normalized.length}",
-        )
+        serviceScope.launch {
+            runCatching { processUserText("[Realtime 转交] $normalized", source = "realtime-delegate") }
+                .onFailure { DiagLog.w("realtime.delegate.failed", "reason=${it.message ?: it.javaClass.simpleName}") }
+        }
+        DiagLog.i("realtime.delegate.accepted", "accepted=true", showInUi = true)
+        return "已交给主会话处理，完成后会告诉你。"
     }
 
     private fun startRealtimeSession() {
@@ -1332,24 +1333,34 @@ class VoiceAgentService : Service() {
             return
         }
         realtimeActive = true
+        EventBus.emitRealtimeState(RealtimeState.CONNECTING)
+        MainMediaLibraryService.publishState(this, active = true, status = "Realtime 正在连接")
+        agentKeepAlive.acquire("realtime")
         dormant = false
         ensureForeground("Realtime 聆听中...", microphoneActive = true)
         serviceScope.launch {
             runCatching {
                 ensureRealtimePipeline(captureAudio = true)
+                EventBus.emitRealtimeState(RealtimeState.READY)
                 _state.value = State.LISTENING
                 emitState(ServiceState.LISTENING)
                 MainMediaLibraryService.publishState(this@VoiceAgentService, active = true, status = "Realtime 聆听中")
                 updateNotification("Realtime 聆听中...")
-            }.onFailure { invalidateRealtimePipeline("启动失败：${it.message ?: it.javaClass.simpleName}") }
+            }.onFailure {
+                EventBus.emitRealtimeState(RealtimeState.FAILED)
+                invalidateRealtimePipeline("启动失败：${it.message ?: it.javaClass.simpleName}")
+            }
         }
     }
 
     private fun stopRealtimeSession() {
         realtimeActive = false
+        EventBus.emitRealtimeState(RealtimeState.STOPPED)
+        agentKeepAlive.release("realtime_stopped")
         stepFunRealtimePipeline?.stop()
         stepFunRealtimePipeline = null
         realtimeConversationId = ""
+        pendingRealtimeResults.clear()
         val routes = routeManager
         routeManager = null
         EventBus.emitVolume(0f)
@@ -1377,6 +1388,9 @@ class VoiceAgentService : Service() {
         onInitialTools: (List<CloudSpeechClient.ToolDefinition>) -> Unit = {},
         checkpointContext: TurnCheckpointContext? = null,
     ): AgentLoop.Outcome.Completed {
+        var notificationTurnId = ""
+        var interruptionNotified = false
+        val notifyUserTurn = checkpointContext != null
         var reasoningFeedbackJob: Job? = null
         var initialToolsCaptured = false
         val voiceReplyGate = if (voiceReplySummaryEnabled && speakReplies && speechClient != null) {
@@ -1438,11 +1452,17 @@ class VoiceAgentService : Service() {
                     EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, notice, messageId = "recovery-$activeSourceTurnId"))
                     emitLog(notice)
                     updateNotification(state)
-                    return agentHarness.awaitRetry(networkTimeout).text
+                    if (notifyUserTurn && !interruptionNotified) {
+                        interruptionNotified = notifyBackgroundTurn(notificationTurnId, "等待继续", notice)
+                    }
+                    val retry = agentHarness.awaitRetry(networkTimeout).text
+                    clearBackgroundTurnNotification(notificationTurnId)
+                    interruptionNotified = false
+                    return retry
                 }
 
                 override fun onTransportInterruption(reason: String) {
-                    val notice = "模型连接短暂中断，正在继续请求…"
+                    val notice = "模型连接中断，等待网络恢复后自动续写一次…"
                     DiagLog.w("agent.stream.interrupted", "reason=${reason.take(300)}")
                     EventBus.emitChatMessage(
                         ChatMessage(
@@ -1453,6 +1473,16 @@ class VoiceAgentService : Service() {
                     )
                     emitLog(notice)
                     updateNotification("正在恢复模型连接…")
+                }
+
+                override suspend fun awaitNetworkForRetry(): Boolean {
+                    delay(1_000L)
+                    val deadline = SystemClock.elapsedRealtime() + 15_000L
+                    while (!hasUsableNetwork()) {
+                        if (SystemClock.elapsedRealtime() >= deadline) return false
+                        delay(1_000L)
+                    }
+                    return true
                 }
 
                 override suspend fun modelTurn(
@@ -1786,6 +1816,11 @@ class VoiceAgentService : Service() {
                 }
                 metricsTracker?.onEvent(presentationEvent)
                 onAgentEvent(presentationEvent)
+                when (event) {
+                    is AgentEvent.AgentStarted -> notificationTurnId = event.turnId
+                    is AgentEvent.AgentInterrupted -> clearBackgroundTurnNotification(event.turnId)
+                    else -> Unit
+                }
             },
         )
         return try {
@@ -1796,8 +1831,8 @@ class VoiceAgentService : Service() {
                     initialThinkingMode = initialThinkingMode,
                     maxToolRounds = maxToolRounds,
                     allowReasoningEscalation = allowReasoningEscalation,
-                    fastMaxCompletionTokens = FAST_MAX_COMPLETION_TOKENS,
-                    deepMaxCompletionTokens = DEEP_MAX_COMPLETION_TOKENS,
+                    fastMaxCompletionTokens = null,
+                    deepMaxCompletionTokens = null,
                     initialBusinessToolCallCount = checkpointContext?.resumed?.businessToolCallCount ?: 0,
                     initialActiveElapsedMs = checkpointContext?.resumed?.activeElapsedMs ?: 0,
                     initialActiveBudgetStarted = checkpointContext?.resumed?.activeBudgetStarted ?: false,
@@ -1845,8 +1880,23 @@ class VoiceAgentService : Service() {
                 ),
                 turnId = checkpointContext?.resumed?.turnId,
             )) {
-                is AgentLoop.Outcome.Completed -> outcome
+                is AgentLoop.Outcome.Completed -> {
+                    if (notifyUserTurn) {
+                        val body = if (outcome.successful) com.agent.voiceassistant.data.RealtimeContextProjection.assistantBody(outcome.finalText) else
+                            "主会话本次任务未能完成。已保留当前过程，请打开主会话查看详情并重新发送请求。"
+                        if (realtimeActive) {
+                            queueRealtimeResult(notificationTurnId, body, !outcome.successful)
+                            DiagLog.i("realtime.delegate.completed", "turn=$notificationTurnId success=${outcome.successful} resultChars=${body.length}")
+                        } else {
+                            notifyBackgroundTurn(notificationTurnId, if (outcome.successful) "任务已完成" else "任务中断", body, checkpointContext?.conversationId ?: mainConversationId)
+                        }
+                    }
+                    outcome
+                }
             }
+        } catch (cancelled: CancellationException) {
+            clearBackgroundTurnNotification(notificationTurnId)
+            throw cancelled
         } finally {
             awaitReasoningFeedback()
             llmClient.close()
@@ -1960,6 +2010,7 @@ class VoiceAgentService : Service() {
         when (event) {
             is AgentEvent.AgentStarted -> {
                 activeLoopTurnId = event.turnId
+                agentKeepAlive.acquire("agent_loop:${event.turnId}")
                 EventBus.emitAgentRunning(true)
                 DiagLog.i("agent.loop.started", "turn=${event.turnId}")
             }
@@ -2034,6 +2085,7 @@ class VoiceAgentService : Service() {
             )
             is AgentEvent.AgentFailed -> {
                 activeLoopTurnId = ""
+                agentKeepAlive.release("agent_failed:${event.turnId}")
                 EventBus.emitAgentRunning(false)
                 if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
                     interruptTurnPresentation(event.turnId)
@@ -2047,6 +2099,7 @@ class VoiceAgentService : Service() {
             }
             is AgentEvent.AgentInterrupted -> {
                 activeLoopTurnId = ""
+                agentKeepAlive.release("agent_interrupted:${event.turnId}")
                 EventBus.emitAgentRunning(false)
                 if (ExperimentConfig.ENABLE_STRUCTURED_REPLY_PRESENTATION) {
                     interruptTurnPresentation(event.turnId)
@@ -2122,6 +2175,7 @@ class VoiceAgentService : Service() {
             }
             is AgentEvent.AgentFinished -> {
                 activeLoopTurnId = ""
+                agentKeepAlive.release("agent_finished:${event.turnId}")
                 EventBus.emitAgentRunning(false)
                 turnPresentationDrafts.remove(event.turnId)
                 removeAssistantDrafts(event.turnId)
@@ -2525,7 +2579,6 @@ class VoiceAgentService : Service() {
                     promptTokensEstimated = responseMetadata?.promptTokensEstimated == true,
                 ),
             )
-            stepFunRealtimePipeline?.injectMainAssistantReply(finalText)
             return
         }
         store.updateMessage(
@@ -2538,7 +2591,6 @@ class VoiceAgentService : Service() {
         EventBus.emitChatMessage(
             draft.toChatMessage(finalText, ChatStreamState.COMPLETED, responseMetadata),
         )
-        stepFunRealtimePipeline?.injectMainAssistantReply(finalText)
     }
 
     private fun normalizeFinalAssistantText(text: String): String {
@@ -3211,11 +3263,11 @@ class VoiceAgentService : Service() {
     ): String {
         val runtimeContext = buildString {
             appendLine(deviceContextProvider.build(source, currentNetworkLabel()))
-            store.consumePendingContextNotes(mainConversationId).takeIf { it.isNotEmpty() }?.let { notes ->
+            store.realtimeContextNotes(mainConversationId).takeIf { it.isNotEmpty() }?.let { notes ->
                 appendLine()
-                appendLine("<realtime_session_digest>")
+                appendLine("<realtime_session_transcript>")
                 notes.forEach { appendLine(it) }
-                appendLine("</realtime_session_digest>")
+                appendLine("</realtime_session_transcript>")
             }
             appendLine()
             append("Agent 虚拟文件系统：\n")
@@ -3302,12 +3354,16 @@ class VoiceAgentService : Service() {
     }.getOrElse { "未知" }
 
     @SuppressLint("MissingPermission")
-    private fun hasValidatedNetwork(): Boolean = runCatching {
+    private fun hasUsableNetwork(): Boolean = runCatching {
         val manager = getSystemService(ConnectivityManager::class.java)
         val network = manager.activeNetwork ?: return@runCatching false
         val capabilities = manager.getNetworkCapabilities(network) ?: return@runCatching false
         capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH))
     }.getOrDefault(false)
 
     @SuppressLint("MissingPermission")
@@ -3352,7 +3408,6 @@ class VoiceAgentService : Service() {
         try {
             for (sentence in sentences) {
                 emitLog("播报: $sentence")
-                MainMediaLibraryService.publishNowPlaying(this@VoiceAgentService, sentence, "正在播报")
                 if (playbackSession.playSentence(sentence)) {
                     streamedAny = true
                 } else {
@@ -3361,7 +3416,6 @@ class VoiceAgentService : Service() {
             }
         } finally {
             playbackSession.finish()
-            MainMediaLibraryService.publishState(this, active = !dormant, status = if (dormant) "休眠中" else "聆听中")
         }
     }
 
@@ -3591,7 +3645,6 @@ class VoiceAgentService : Service() {
             try {
                 when (task) {
                     is BackgroundLlmTask.Memory -> runMemoryCompaction(task)
-                    is BackgroundLlmTask.RealtimeDigest -> runRealtimeDigest(task)
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -3623,39 +3676,6 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private suspend fun runRealtimeDigest(task: BackgroundLlmTask.RealtimeDigest) {
-        val instruction = realtimeSessionCompactor.instruction(task.transcript)
-        val result = executeBackgroundLlm(task, instruction, realtimeSessionCompactor::parseStrict)
-        result.onSuccess { output ->
-            val digest = output.value.trim()
-            if (digest.isBlank()) {
-                DiagLog.i(
-                    "realtime.digest.completed",
-                    "task=${task.taskId} conversation=${task.conversationId} useful=false attempts=${output.attemptCount}",
-                )
-                return@onSuccess
-            }
-            val endedAt = java.text.SimpleDateFormat(
-                "yyyy-MM-dd HH:mm",
-                java.util.Locale.CHINA,
-            ).format(java.util.Date())
-            store.appendPendingContextNote(
-                task.conversationId,
-                "Realtime 会话提炼（$endedAt）：\n$digest",
-            )
-            DiagLog.i(
-                "realtime.digest.completed",
-                "task=${task.taskId} conversation=${task.conversationId} useful=true digestChars=${digest.length} " +
-                    "attempts=${output.attemptCount} model=${output.modelId}",
-            )
-        }.onFailure { error ->
-            DiagLog.w(
-                "realtime.digest.failed",
-                "task=${task.taskId} conversation=${task.conversationId} reason=${error.javaClass.simpleName}:${error.message}",
-            )
-        }
-    }
-
     private suspend fun <T> executeBackgroundLlm(
         task: BackgroundLlmTask,
         instruction: String,
@@ -3678,7 +3698,7 @@ class VoiceAgentService : Service() {
                         "provider=${if (BackgroundLlmRetryPlan.usesDefaultProvider(task.provider.builtIn, attempt)) LlmProviderRepository.BUILT_IN_ID else task.provider.id} " +
                         "model=${config.modelName} request=$requestId",
                 )
-                val completion = withTimeoutOrNull(60_000L) {
+                val completion = withTimeoutOrNull(BACKGROUND_LLM_TIMEOUT_MS) {
                     client.streamChat(
                         CloudSpeechClient.ChatRequest(
                             messages = task.snapshot + CloudSpeechClient.LlmMessage("system", instruction),
@@ -3690,7 +3710,10 @@ class VoiceAgentService : Service() {
                             requestId = requestId,
                         ),
                     ) { }
-                } ?: throw NetworkTimeoutException("background ${task.purpose}", timeoutSeconds = 60)
+                } ?: throw NetworkTimeoutException(
+                    "background ${task.purpose}",
+                    timeoutSeconds = BACKGROUND_LLM_TIMEOUT_MS / 1_000L,
+                )
                 requireValidBackgroundCompletion(completion)
                 val content = completion.message.content.orEmpty().trim()
                 val parsed = parser(content).getOrThrow()
@@ -3813,7 +3836,6 @@ class VoiceAgentService : Service() {
         client: CloudSpeechClient,
         directive: VoiceReplyDirective,
     ) {
-        MainMediaLibraryService.publishNowPlaying(this, directive.text, "个性化播报")
         try {
             if (directive.options.mode == VoiceReplyMode.PRESET) {
                 val playback = StreamingTtsPlaybackSession(client)
@@ -3829,11 +3851,6 @@ class VoiceAgentService : Service() {
                 playAudio(client.synthesizeSpeech(directive.text, directive.options))
             }
         } finally {
-            MainMediaLibraryService.publishState(
-                this,
-                active = !dormant,
-                status = if (dormant) "休眠中" else "聆听中",
-            )
         }
     }
 
@@ -4455,7 +4472,6 @@ class VoiceAgentService : Service() {
         _state.value = State.READY
         emitState(ServiceState.DORMANT)
         emitLog("Agent 已休眠")
-        MainMediaLibraryService.publishState(this, active = false, status = "休眠中")
         if (keepForeground) ensureDormantForeground()
         DiagLog.i(
             "agent.sleep.done",
@@ -4689,11 +4705,39 @@ class VoiceAgentService : Service() {
         )
     }
 
+    private fun clearBackgroundTurnNotification(turnId: String) {
+        getSystemService(NotificationManager::class.java).cancel("main-turn", 9208)
+    }
+
+    private fun notifyBackgroundTurn(turnId: String, status: String, body: String, conversationId: String = mainConversationId): Boolean {
+        if (!BackgroundTurnNotificationPolicy.shouldNotify(true, com.agent.voiceassistant.AppVisibility.isVisible, turnId, realtimeActive)) {
+            DiagLog.i("turn.notification.skipped", "turn=$turnId reason=foreground_or_no_turn")
+            return false
+        }
+        val intent = Intent(this, MainActivity::class.java)
+            .putExtra(EXTRA_CONVERSATION_ID, conversationId)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val pending = PendingIntent.getActivity(this, 9208, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notification = NotificationCompat.Builder(this, TASK_REPORT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle(status)
+            .setContentText(body.replace('\n', ' ').take(120))
+            .setSubText(getString(R.string.app_name))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body.take(4000)))
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.activeNotifications.filter { it.id == 9208 && it.tag?.startsWith("main-turn-") == true }
+            .forEach { manager.cancel(it.tag, it.id) }
+        manager.notify("main-turn", 9208, notification)
+        DiagLog.i("turn.notification.posted", "turn=$turnId status=$status")
+        return true
+    }
+
     private fun buildNotification(text: String): Notification {
-        MainMediaLibraryService.buildForegroundNotification(
-            active = !dormant,
-            status = text,
-        )?.let { return it }
+        MainMediaLibraryService.buildForegroundNotification()?.let { return it }
 
         val intent = Intent(this, MainActivity::class.java)
         val pi = PendingIntent.getActivity(
@@ -4703,7 +4747,7 @@ class VoiceAgentService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val controlIntent = Intent(this, VoiceAgentService::class.java).setAction(
-            if (dormant) ACTION_WAKE else ACTION_SLEEP
+            if (realtimeActive) ACTION_REALTIME_STOP else ACTION_REALTIME_START
         )
         val controlPi = PendingIntent.getService(
             this,
@@ -4711,8 +4755,8 @@ class VoiceAgentService : Service() {
             controlIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val actionIcon = if (dormant) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
-        val actionText = if (dormant) "唤醒" else "休眠"
+        val actionIcon = if (!realtimeActive) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
+        val actionText = if (realtimeActive) "暂停" else "播放"
         val builder = NotificationCompat.Builder(this, AssistantNotificationContract.CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
@@ -4727,7 +4771,6 @@ class VoiceAgentService : Service() {
     private fun updateNotification(text: String) {
         val mgr = getSystemService(NotificationManager::class.java)
         mgr.notify(AssistantNotificationContract.NOTIFICATION_ID, buildNotification(text))
-        MainMediaLibraryService.publishState(this, active = !dormant, status = text)
     }
 
 }

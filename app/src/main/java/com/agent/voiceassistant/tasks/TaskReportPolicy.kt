@@ -1,7 +1,7 @@
 package com.agent.voiceassistant.tasks
 
 object TaskReportPolicy {
-    enum class Route { ACTIVE_AUDIO, DORMANT_EXTERNAL_AUDIO, NOTIFICATION, DEFER }
+    enum class Route { REALTIME, ACTIVE_AUDIO, DORMANT_EXTERNAL_AUDIO, NOTIFICATION, DEFER }
 
     fun route(
         dormant: Boolean,
@@ -9,7 +9,9 @@ object TaskReportPolicy {
         externalOutputConnected: Boolean,
         userSpeaking: Boolean,
         audioReportsEnabled: Boolean = true,
+        realtimeActive: Boolean = false,
     ): Route = when {
+        realtimeActive -> Route.REALTIME
         !audioReportsEnabled -> Route.NOTIFICATION
         !sameConversation -> Route.NOTIFICATION
         !externalOutputConnected -> Route.NOTIFICATION
@@ -19,10 +21,10 @@ object TaskReportPolicy {
     }
 
     fun summaryInstructions(): String = """
-        请把全部任务结果合并成不超过三句、自然且适合语音播报的中文总结。
+        请把全部任务结果合并成不超过三句的简明中文总结。
         先说明任务是否完成，再用一句话概括对用户有用的结果；失败时只说明用户能理解的原因和下一步。
-        播报正文不得出现代码函数名、类名、内部字段名、状态常量、文件路径、协议名或其他没有必要的专业术语，也不要复述执行步骤。
-        即使原始结果很复杂，也必须压缩成简短结论。只输出摘要，不要输出 DETAILS 标签、原始正文或前后说明。
+        正文不得出现代码函数名、类名、内部字段名、状态常量、文件路径、协议名或其他没有必要的专业术语，也不要复述执行步骤。
+        只输出摘要，不要输出 DETAILS 标签、原始正文或前后说明。
     """.trimIndent()
 
     fun normalizeSummary(candidate: String, fallback: String): String {

@@ -38,4 +38,17 @@ class LLMConfigTest {
         assertFalse(content.contains("request_deep_reasoning"))
         assertTrue(content.endsWith("<user_input>\n你好\n</user_input>"))
     }
+
+    @Test
+    fun realtimePromptIsIndependentFromMainAgentInstructions() {
+        val prompt = buildRealtimeSystemPrompt()
+
+        assertTrue(prompt.contains("实时语音助手"))
+        assertTrue(prompt.contains("转交主会话"))
+        assertTrue(prompt.contains("结束实时通话"))
+        assertFalse(prompt.contains("skill_use"))
+        assertFalse(prompt.contains("hub_dispatch_task"))
+        assertFalse(prompt.contains("agent_sleep"))
+        assertFalse(prompt.contains("长期记忆，调用 memory_create"))
+    }
 }

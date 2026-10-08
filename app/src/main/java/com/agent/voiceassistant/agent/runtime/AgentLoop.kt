@@ -5,10 +5,12 @@ import com.agent.voiceassistant.agent.BodyToolCall
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
+import com.agent.voiceassistant.cloud.LlmTransportException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import java.util.UUID
 
 class AgentLoop(
@@ -21,8 +23,8 @@ class AgentLoop(
         val messages: List<CloudSpeechClient.LlmMessage>,
         val initialThinkingMode: CloudSpeechClient.ThinkingMode,
         val maxToolRounds: Int,
-        val fastMaxCompletionTokens: Int,
-        val deepMaxCompletionTokens: Int,
+        val fastMaxCompletionTokens: Int?,
+        val deepMaxCompletionTokens: Int?,
         val allowReasoningEscalation: Boolean,
         val automaticReasoningToolThreshold: Int = DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD,
         val activeToolBudgetMs: Long = DEFAULT_ACTIVE_TOOL_BUDGET_MS,
@@ -71,6 +73,7 @@ class AgentLoop(
         data class Completed(
             val finalText: String,
             val playedSpeech: Boolean,
+            val successful: Boolean = true,
         ) : Outcome
     }
 
@@ -83,6 +86,11 @@ class AgentLoop(
         suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String = ""
 
         fun onTransportInterruption(reason: String) = Unit
+
+        suspend fun awaitNetworkForRetry(): Boolean {
+            delay(AUTOMATIC_NETWORK_RETRY_DELAY_MS)
+            return true
+        }
 
         suspend fun modelTurn(
             request: CloudSpeechClient.ChatRequest,
@@ -187,7 +195,7 @@ class AgentLoop(
             config.onTurnCompleted(turnId)
             eventSink(AgentEvent.TurnFinished(turnId, text))
             eventSink(AgentEvent.AgentFinished(turnId))
-            return Outcome.Completed(text, playedSpeech)
+            return Outcome.Completed(text, playedSpeech, successful = false)
         }
 
         eventSink(AgentEvent.AgentStarted(turnId))
@@ -200,8 +208,24 @@ class AgentLoop(
             ): Pair<ModelTurn, CloudSpeechClient.LlmMessage> {
                 var streamedResult: ModelTurn? = null
                 var integrityRetry = 0
+                var automaticNetworkRetry = 0
                 var partialContent = ""
                 var partialReasoning = ""
+                fun retainPartial(message: CloudSpeechClient.LlmMessage) {
+                    partialContent += message.content.orEmpty()
+                    partialReasoning += message.reasoningContent.orEmpty()
+                    if (!message.content.isNullOrBlank() || !message.reasoningContent.isNullOrBlank()) {
+                        workingMessages += message.copy(toolCalls = emptyList())
+                    }
+                }
+                suspend fun automaticallyRecover(reason: String): Boolean {
+                    if (automaticNetworkRetry >= MAX_AUTOMATIC_NETWORK_RETRIES) return false
+                    automaticNetworkRetry += 1
+                    pauseActiveBudget()
+                    checkpoint(CheckpointPhase.WAITING_NETWORK)
+                    runtime.onTransportInterruption(reason)
+                    return runtime.awaitNetworkForRetry()
+                }
                 while (streamedResult == null) {
                     pauseActiveBudget()
                     modelCall += 1
@@ -209,6 +233,7 @@ class AgentLoop(
                     val request = CloudSpeechClient.ChatRequest(
                         messages = workingMessages.toList(),
                         tools = tools,
+                        transportAttemptLimit = 1,
                         thinkingMode = thinkingMode,
                         maxCompletionTokens = maxCompletionTokens ?: if (thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) {
                             config.deepMaxCompletionTokens
@@ -236,7 +261,26 @@ class AgentLoop(
                         }
                         val completion = candidate.completion
                         val diagnostics = completion.streamDiagnostics
-                        diagnostics.interruptionReason?.let(runtime::onTransportInterruption)
+                        if (diagnostics.interruptionReason != null) {
+                            retainPartial(completion.message)
+                            if (automaticallyRecover(diagnostics.interruptionReason)) {
+                                workingMessages += CloudSpeechClient.LlmMessage(
+                                    role = "system",
+                                    content = "模型连接中断。请从上一条助手回复的末尾继续完成，禁止重复已经输出的内容，直接继续回答并正常结束。",
+                                )
+                                continue
+                            }
+                            checkpoint(CheckpointPhase.WAITING_NETWORK)
+                            val retryInput = runtime.awaitRecovery(
+                                "模型流连续中断：${diagnostics.interruptionReason}",
+                                networkTimeout = true,
+                            )
+                            if (retryInput.isNotBlank()) {
+                                workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
+                            }
+                            automaticNetworkRetry = 0
+                            continue
+                        }
                         val blank = completion.message.content.isNullOrBlank() && completion.message.toolCalls.isEmpty()
                         val truncated = completion.finishReason == "length"
                         val brokenStream = diagnostics.protocolObserved && (
@@ -279,8 +323,16 @@ class AgentLoop(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Throwable) {
+                        val networkError = error is NetworkTimeoutException || error is LlmTransportException
+                        if (networkError && automaticallyRecover(error.message.orEmpty())) {
+                            workingMessages += CloudSpeechClient.LlmMessage(
+                                role = "system",
+                                content = "模型连接中断。请继续完成当前请求，已有助手正文不要重复，不要解释重试过程。",
+                            )
+                            continue
+                        }
                         checkpoint(
-                            if (error is NetworkTimeoutException) {
+                            if (networkError) {
                                 CheckpointPhase.WAITING_NETWORK
                             } else {
                                 CheckpointPhase.WAITING_RECOVERY
@@ -288,11 +340,12 @@ class AgentLoop(
                         )
                         val retryInput = runtime.awaitRecovery(
                             error.message ?: error.javaClass.simpleName,
-                            error is NetworkTimeoutException,
+                            networkError,
                         )
                         if (retryInput.isNotBlank()) {
                             workingMessages += CloudSpeechClient.LlmMessage("user", retryInput)
                         }
+                        automaticNetworkRetry = 0
                     }
                 }
                 val streamed = requireNotNull(streamedResult)
@@ -485,7 +538,7 @@ class AgentLoop(
                         append("工具阶段已经结束：")
                         append(reason)
                         append("。工具调用次数已耗尽，请立即做出总结。")
-                        append("不得再次发起工具调用；请根据已有结果说明已完成内容、未完成内容和限制，回复保持适度简洁。")
+                        append("不得再次发起工具调用；请只根据已有结果给出结论和必要限制，默认 3 至 6 句、约 300 个中文字以内，不要复述工具过程或内部推理。")
                     },
                 )
                 repeat(MAX_FINAL_PROTOCOL_ATTEMPTS) { attempt ->
@@ -765,6 +818,8 @@ class AgentLoop(
 
     private companion object {
         const val MAX_STREAM_INTEGRITY_RETRIES = 1
+        const val MAX_AUTOMATIC_NETWORK_RETRIES = 1
+        const val AUTOMATIC_NETWORK_RETRY_DELAY_MS = 1_000L
 
         fun contextWindowFor(modelId: String?): Long? = when (modelId) {
             "mimo-v2.5-pro", "mimo-v2.6-pro" -> 1_000_000L
@@ -798,7 +853,7 @@ class AgentLoop(
             append(reasons.distinct().joinToString("；"))
             append("。请重新决定是否需要调用工具。")
             append("如需调用，只能使用本轮提供的工具名称，arguments 必须是完整的 JSON 对象。")
-            append("不要复述或继续刚才的非法工具调用。")
+            append("保留用户原始任务意图；如果任务仍需工具，请修正参数后立即重试，不要因为上一批被拒绝就结束任务。不要复述或继续刚才的非法工具调用。")
         }
 
     }

@@ -94,6 +94,20 @@ class TaskReportPolicyTest {
         )
     }
 
+    @Test
+    fun `realtime owns completed task reporting`() {
+        assertEquals(
+            TaskReportPolicy.Route.REALTIME,
+            TaskReportPolicy.route(
+                dormant = false,
+                sameConversation = true,
+                externalOutputConnected = false,
+                userSpeaking = false,
+                realtimeActive = true,
+            ),
+        )
+    }
+
     private fun task(details: String) = TaskEntity(
         taskId = "task-1",
         idempotencyKey = "hub:task-1",

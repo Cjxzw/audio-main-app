@@ -25,7 +25,14 @@ Hanwo is a cloud-first Android voice agent. The active path is `VoiceAgentServic
 - `<DETAILS>...</DETAILS>` is retained in message history but rendered as a separate, collapsible detail block with a divider. Details from the three most recent user rounds are expanded by default; older details are collapsed.
 - Media3-based wake/sleep controls and external Bluetooth/USB/audio-glasses routing with route verification.
 - Debug-only ADB bridge and `tools/hanwo-dev` for state, configuration, session, and real-turn diagnostics.
-- Graphify snapshot bundled in the APK under `assets/codegraph/`; the current snapshot contains 2,587 nodes and 5,061 links and is built from commit `3838d703`.
+- Graphify snapshot bundled in the APK under `assets/codegraph/`; refreshed on 2026-10-08 with 3,243 nodes and 6,371 links, including the current local changes.
+
+## Main / Realtime handover (2026-10-08)
+
+- Startup snapshot: newest ten whole turns within 1,200 characters, excluding reasoning and tool result bodies; context injection does not trigger a response.
+- Final turn results use Realtime first, background notifications second, and stay quiet when the UI is visible. Realtime reports wait for speech, responses, tools and audio playback to finish.
+- Realtime transcripts are transferred directly to durable main context without LLM summarization. A persistent handover cursor prevents reconnect duplication.
+- Credential settings support multiple entries and enumerate modern/legacy profiles; HTTP requests support credential references, base URLs, timeout_ms and response headers. Mutating requests are not automatically retried.
 
 ## Verification
 

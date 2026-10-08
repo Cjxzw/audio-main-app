@@ -8,12 +8,15 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import androidx.annotation.RequiresPermission
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -119,6 +122,7 @@ class RealtimePcmPlayer(
         data class Audio(val generation: Long, val pcm: ByteArray) : Event
         data class AudioDone(val generation: Long) : Event
         data class Interrupt(val generation: Long) : Event
+        data class Drain(val done: CompletableDeferred<Unit>) : Event
         data object Stop : Event
     }
 
@@ -145,6 +149,15 @@ class RealtimePcmPlayer(
         events.trySend(Event.Interrupt(generation.incrementAndGet()))
     }
 
+    suspend fun awaitPlaybackDrained() {
+        if (released.get()) return
+        val done = CompletableDeferred<Unit>()
+        if (events.trySend(Event.Drain(done)).isSuccess) {
+            // A released worker may never consume a queued barrier. Bound that stale wait.
+            while (!released.get() && withTimeoutOrNull(1_000) { done.await(); true } != true) Unit
+        }
+    }
+
     fun playedAudioMs(): Long {
         val frames = track?.playbackHeadPosition?.toLong()?.and(0xffff_ffffL) ?: return 0L
         return frames * 1_000L / sampleRate
@@ -169,6 +182,7 @@ class RealtimePcmPlayer(
         var bufferedBytes = 0
         val startupBuffer = ArrayDeque<ByteArray>()
         var heldTail = ByteArray(0)
+        var writtenFrames = 0L
 
         fun reset(dropTrackBuffer: Boolean) {
             startupBuffer.clear()
@@ -180,6 +194,7 @@ class RealtimePcmPlayer(
                 track?.let { active ->
                     runCatching { active.pause() }
                     runCatching { active.flush() }
+                    writtenFrames = 0L
                 }
             }
         }
@@ -190,6 +205,7 @@ class RealtimePcmPlayer(
                 val written = active.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
                 check(written > 0) { "Realtime AudioTrack 写入失败：$written" }
                 offset += written
+                writtenFrames += written / Short.SIZE_BYTES
             }
         }
 
@@ -249,6 +265,15 @@ class RealtimePcmPlayer(
                         activeGeneration = event.generation
                         reset(dropTrackBuffer = true)
                         Timber.i("RealtimePcmPlayer: interrupted generation=$activeGeneration")
+                    }
+                    is Event.Drain -> {
+                        try {
+                            while (!released.get() && activeGeneration == generation.get()) {
+                                val frames = track?.playbackHeadPosition?.toLong()?.and(0xffff_ffffL) ?: writtenFrames
+                                if (frames >= writtenFrames) break
+                                delay(20)
+                            }
+                        } finally { event.done.complete(Unit) }
                     }
                     Event.Stop -> break
                 }

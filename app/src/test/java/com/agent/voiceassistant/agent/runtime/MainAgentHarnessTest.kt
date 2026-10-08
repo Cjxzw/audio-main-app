@@ -68,7 +68,7 @@ class MainAgentHarnessTest {
     }
 
     @Test
-    fun `timeout keeps same turn open until user resumes it`() = runBlocking {
+    fun `network timeout automatically retries once`() = runBlocking {
         val harness = MainAgentHarness()
         var attempts = 0
         val runtime = object : NoopRuntime() {
@@ -78,21 +78,15 @@ class MainAgentHarnessTest {
                 onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
             ): AgentLoop.ModelTurn {
                 if (attempts++ == 0) throw NetworkTimeoutException("test")
-                assertTrue(request.messages.any { it.role == "user" && it.content == "继续重试" })
+                assertTrue(request.messages.any { it.role == "system" && it.content.orEmpty().contains("连接中断") })
                 return super.modelTurn(request, beforeSpeech, onStreamEvent)
             }
-
-            override suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String {
-                assertTrue(networkTimeout)
-                return harness.awaitRetry(networkTimeout).text
-            }
         }
-        val running = async { harness.run(AgentLoop(runtime), config()) }
-        while (harness.state.value != MainAgentHarness.State.WAITING_NETWORK) delay(1)
+        val outcome = harness.run(AgentLoop(runtime), config())
 
-        assertTrue(harness.resume("继续重试"))
-        assertEquals(AgentLoop.Outcome.Completed("ok", true), running.await())
+        assertEquals(AgentLoop.Outcome.Completed("ok", true), outcome)
         assertEquals(MainAgentHarness.State.IDLE, harness.state.value)
+        assertEquals(2, attempts)
     }
 
     private fun config() = AgentLoop.Config(

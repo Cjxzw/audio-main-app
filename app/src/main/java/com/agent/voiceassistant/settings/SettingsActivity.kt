@@ -5,6 +5,8 @@ import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.widget.Button
+import android.widget.ScrollView
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
@@ -201,42 +203,86 @@ class CredentialProfilesFragment : PreferenceFragmentCompat() {
     private fun showEditor(existingProfile: String? = null) {
         val context = requireContext()
         val existingEntries = existingProfile?.let(store::entries).orEmpty()
-        val existingPrefix = existingProfile?.let(store::allowedUrlPrefixes)?.firstOrNull().orEmpty()
-        val fields = listOf(
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_name); setText(existingProfile.orEmpty()) },
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_base_url); setText(existingPrefix) },
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_name); setText(existingEntries.keys.sorted().firstOrNull().orEmpty()) },
-            EditText(context).apply { hint = getString(R.string.settings_http_credentials_header_value); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD },
-        )
+        val existingPrefixes = existingProfile?.let(store::allowedUrlPrefixes).orEmpty()
+        val nameField = EditText(context).apply {
+            hint = getString(R.string.settings_http_credentials_name)
+            setText(existingProfile.orEmpty())
+        }
+        val baseField = EditText(context).apply {
+            hint = getString(R.string.settings_http_credentials_base_url)
+            setText(existingProfile?.let { profile -> store.availableProfiles().firstOrNull { it.name == profile }?.baseUrl }
+                ?: existingPrefixes.firstOrNull().orEmpty())
+        }
+        data class EntryRow(val view: LinearLayout, val key: EditText, val value: EditText, val originalKey: String?)
+        val rows = mutableListOf<EntryRow>()
+        val entriesContainer = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        fun addRow(originalKey: String? = null) {
+            val key = EditText(context).apply {
+                hint = getString(R.string.settings_http_credentials_header_name)
+                setText(originalKey.orEmpty())
+                setSingleLine()
+            }
+            val value = EditText(context).apply {
+                hint = if (originalKey == null) getString(R.string.settings_http_credentials_header_value) else "已保存，留空保留原值"
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine()
+            }
+            val view = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            val row = EntryRow(view, key, value, originalKey)
+            view.addView(key)
+            view.addView(value)
+            view.addView(Button(context).apply {
+                text = "删除此项"
+                setOnClickListener { rows.remove(row); entriesContainer.removeView(view) }
+            })
+            rows += row
+            entriesContainer.addView(view)
+        }
+        existingEntries.keys.sorted().forEach(::addRow)
+        if (rows.isEmpty()) addRow()
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 0, 48, 0)
-            fields.forEach { addView(it, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT)) }
+            addView(nameField)
+            addView(baseField)
+            addView(entriesContainer)
+            addView(Button(context).apply { text = "添加一项"; setOnClickListener { addRow() } })
         }
-        AlertDialog.Builder(context)
-            .setTitle(R.string.settings_http_credentials_add)
-            .setView(container)
+        val dialog = AlertDialog.Builder(context)
+            .setTitle(if (existingProfile == null) R.string.settings_http_credentials_add else R.string.settings_http_credentials_edit)
+            .setView(ScrollView(context).apply { addView(container) })
             .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.settings_http_credentials_save) { _, _ ->
+            .setPositiveButton(R.string.settings_http_credentials_save, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 runCatching {
-                    val name = fields[0].text.toString().trim()
-                    val base = fields[1].text.toString().trim().ifBlank { null }
-                    val key = fields[2].text.toString().trim()
-                    val value = fields[3].text.toString()
-                    require(name.isNotBlank() && key.isNotBlank() && base != null) { getString(R.string.settings_http_credentials_invalid) }
+                    val name = nameField.text.toString().trim()
+                    val base = baseField.text.toString().trim()
+                    require(name.matches(Regex("[A-Za-z0-9._-]{1,64}"))) { "凭据配置名称无效" }
                     require(base.startsWith("https://") || base.startsWith("http://")) { getString(R.string.settings_http_credentials_invalid_base) }
-                    val retained = existingEntries[key]
-                    require(value.isNotBlank() || retained != null) { getString(R.string.settings_http_credentials_invalid) }
-                    val updatedEntries = existingEntries.toMutableMap().apply {
-                        put(key, value.ifBlank { retained!! })
+                    require(name == existingProfile || store.availableProfiles().none { it.name == name }) { "该凭据名称已存在" }
+                    val entries = linkedMapOf<String, String>()
+                    rows.forEach { row ->
+                        val key = row.key.text.toString().trim()
+                        val value = row.value.text.toString().ifBlank { existingEntries[row.originalKey].orEmpty() }
+                        require(key.matches(Regex("[A-Za-z0-9._-]{1,80}"))) { "请填写有效的键名" }
+                        require(key !in entries) { "键名不能重复：$key" }
+                        require(value.isNotBlank()) { "请填写 $key 的值" }
+                        require(!value.contains('\r') && !value.contains('\n')) { "凭据值不能换行" }
+                        entries[key] = value
                     }
-                    store.putEntries(name, updatedEntries, listOf(base))
+                    require(entries.isNotEmpty()) { "凭据至少需要一个键值" }
+                    val prefixes = listOf(base) + existingPrefixes.drop(1)
+                    store.putEntries(name, entries, prefixes, baseUrl = base)
                     if (existingProfile != null && existingProfile != name) store.delete(existingProfile)
-                }.onSuccess { rebuild() }
+                }.onSuccess { rebuild(); dialog.dismiss() }
                     .onFailure { Toast.makeText(context, it.message ?: getString(R.string.settings_http_credentials_invalid), Toast.LENGTH_LONG).show() }
             }
-            .show()
+        }
+        dialog.show()
     }
+
 }
 
 class StepFunRealtimeSettingsFragment : PreferenceFragmentCompat() {

@@ -360,10 +360,23 @@ class LocalToolExecutor(
             )
         }.fold(
             onSuccess = { result ->
+                val displayText = if (result.warning == null) {
+                    "写入成功：${result.path}"
+                } else {
+                    "写入成功，但有警告：${result.path}"
+                }
                 ToolResult(
                     actionType = "write",
-                    displayText = "写入 ${result.path}",
-                    contextText = "写入成功：${result.path}，${result.bytesWritten} 字节，模式 ${result.mode}，sha256=${result.sha256}。",
+                    displayText = displayText,
+                    contextText = buildString {
+                        if (result.warning == null) {
+                            append("写入成功。")
+                        } else {
+                            append("写入成功，但有警告；不要重复写入本次内容。")
+                        }
+                        append("路径：${result.path}，${result.bytesWritten} 字节，模式 ${result.mode}，sha256=${result.sha256}。")
+                        result.warning?.let { append(" $it") }
+                    },
                     shouldAskLlm = true,
                 )
             },
@@ -436,6 +449,7 @@ class LocalToolExecutor(
                 contentType = payload.string("content_type"),
                 credentialProfile = payload.string("credential_profile"),
                 headers = payload.objectStringMap("headers"),
+                timeoutMs = payload.int("timeout_ms") ?: 5_000,
             )
         }.fold(
             onSuccess = { result ->
@@ -444,7 +458,7 @@ class LocalToolExecutor(
                     displayText = "HTTP ${result.status}：${url.take(80)}",
                     contextText = buildString {
                         appendLine("HTTP 状态：${result.status}")
-                        result.contentType?.let { appendLine("Content-Type: $it") }
+                        result.headers.forEach { (name, values) -> appendLine("$name: ${values.joinToString()}") }
                         append(result.body.ifBlank { "[空响应]" })
                         if (result.truncated) append("\n[响应已截断]")
                     },
@@ -453,8 +467,13 @@ class LocalToolExecutor(
                 )
             },
             onFailure = { error ->
-                if (error is NetworkTimeoutException) throw error
-                failed("http_request", "HTTP 请求失败", error)
+                // HTTP mutations must never enter AgentLoop's automatic transport retry path.
+                val category = when (error) {
+                    is IllegalArgumentException -> "http_request 参数处理失败"
+                    is NetworkTimeoutException -> "HTTP 请求超时；未确认服务端是否已执行，请勿自动重试写入请求"
+                    else -> "HTTP 请求失败"
+                }
+                failed("http_request", category, error)
             },
         )
     }

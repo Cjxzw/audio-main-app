@@ -6,7 +6,6 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ImageView
 import android.widget.HorizontalScrollView
-import android.widget.ScrollView
 import android.widget.TextView
 import android.text.method.ScrollingMovementMethod
 import android.text.method.LinkMovementMethod
@@ -129,7 +128,7 @@ class ChatAdapter(
         private val tvTime = view.findViewById<TextView>(R.id.tvTime)
         private val llReasoning = view.findViewById<LinearLayout>(R.id.llReasoning)
         private val llReasoningHeader = view.findViewById<LinearLayout>(R.id.llReasoningHeader)
-        private val llReasoningContent = view.findViewById<ScrollView>(R.id.llReasoningContent)
+        private val llReasoningContent = view.findViewById<ProcessScrollView>(R.id.llReasoningContent)
         private val llReasoningItems = view.findViewById<LinearLayout>(R.id.llReasoningItems)
         private val svLiveReasoning = view.findViewById<HorizontalScrollView>(R.id.svLiveReasoning)
         private val tvLiveReasoning = view.findViewById<TextView>(R.id.tvLiveReasoning)
@@ -245,8 +244,10 @@ class ChatAdapter(
             }
             llReasoning.visibility = View.VISIBLE
             llReasoning.layoutParams = llReasoning.layoutParams.apply {
-                width = ViewGroup.LayoutParams.MATCH_PARENT
+                width = (itemView.resources.displayMetrics.widthPixels * 0.60f).roundToInt()
             }
+            llReasoning.clipChildren = true
+            llReasoning.clipToPadding = true
             llReasoningHeader.visibility = View.VISIBLE
             bindReasoningItems(items)
             reasoningExpanded = requestedExpanded
@@ -290,12 +291,15 @@ class ChatAdapter(
 
         private fun bindReasoningItems(items: List<ReasoningDisplayItem>) {
             while (llReasoningItems.childCount > 0) llReasoningItems.removeViewAt(0)
-            val maxWidth = llReasoning.layoutParams.width.takeIf { it > 0 }
-                ?: itemView.resources.displayMetrics.widthPixels
-            val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.42f).roundToInt()
+            val maxWidth = (itemView.resources.displayMetrics.widthPixels * 0.60f).roundToInt()
+            val maxHeight = (itemView.resources.displayMetrics.heightPixels * 0.60f).roundToInt()
             llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply {
                 height = ViewGroup.LayoutParams.WRAP_CONTENT
             }
+            llReasoningContent.maxViewportHeight = maxHeight
+            llReasoningContent.scrollTo(0, 0)
+            llReasoningContent.isNestedScrollingEnabled = false
+            llReasoningContent.clipToPadding = true
             llReasoningContent.isVerticalScrollBarEnabled = true
             llReasoningContent.isScrollbarFadingEnabled = false
             llReasoningContent.scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
@@ -304,7 +308,7 @@ class ChatAdapter(
                     ReasoningItemKind.MARKDOWN -> {
                         val textView = TextView(itemView.context).apply {
                             layoutParams = LinearLayout.LayoutParams(
-                                ViewGroup.LayoutParams.WRAP_CONTENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.WRAP_CONTENT,
                             )
                             setPadding(
@@ -335,19 +339,6 @@ class ChatAdapter(
                         llReasoningItems.addView(toolView)
                     }
                 }
-            }
-            llReasoningContent.post {
-                llReasoningItems.measure(
-                    View.MeasureSpec.makeMeasureSpec(maxWidth, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
-                )
-                val constrained = llReasoningItems.measuredHeight > maxHeight
-                val height = if (constrained) maxHeight else ViewGroup.LayoutParams.WRAP_CONTENT
-                if (llReasoningContent.layoutParams.height != height) {
-                    llReasoningContent.layoutParams = llReasoningContent.layoutParams.apply { this.height = height }
-                }
-                llReasoningContent.isVerticalScrollBarEnabled = constrained
-                if (constrained) llReasoningContent.post { llReasoningContent.scrollTo(0, 0) }
             }
         }
 

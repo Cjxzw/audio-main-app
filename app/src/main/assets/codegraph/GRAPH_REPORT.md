@@ -1,16 +1,16 @@
-# Graph Report - audio-main-app  (2026-08-03)
+# Graph Report - audio-main-app  (2026-10-08)
 
 ## Corpus Check
-- 176 files · ~86,862 words
+- 217 files · ~116,951 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2587 nodes · 5061 edges · 166 communities (111 shown, 55 thin omitted)
-- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 350 edges (avg confidence: 0.8)
+- 3243 nodes · 6371 edges · 212 communities (141 shown, 71 thin omitted)
+- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 419 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `3838d703`
+- Built from commit: `5dccf6cd`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -91,7 +91,7 @@
 - VoiceReplyDirective.kt
 - TaskAdapter
 - SimpleVadRecorder
-- TaskStatus
+- .append
 - 5.1 OpenAI 兼容协议
 - SettingsActivity
 - HubClient
@@ -140,9 +140,9 @@
 - TurnMetricsTracker
 - LlmProviderEditorActivity
 - ConversationStore.kt
-- HubConfigRepository
-- DeviceContextProvider
-- ConversationMemoryCompactor
+- SkillRegistry
+- OpenAiCompatibleLlmClient
+- .executeBackgroundLlm
 - HubSettings
 - TaskAdapter
 - HubRuntime
@@ -151,7 +151,7 @@
 - Listener
 - HubConnectionState
 - ExaWebSearchClient
-- .client
+- .error
 - TurnMetricsTrackerTest
 - HubModels.kt
 - nextHubReportState
@@ -161,10 +161,10 @@
 - 13. 语音时延、上下文和单回合思考协议
 - 7. 当前已知问题
 - AudioFeedbackPolicy
-- HubClient.kt
+- SpeechSegmenter
 - WorkspaceDeletePolicyTest
 - 0. 2026-07-21 本轮更新
-- DebugBridgeProtocol
+- DeviceContextProvider
 - WorkspaceDeletePolicy
 - ReplyDetailPolicyTest
 - AudioFeedbackPolicyTest
@@ -173,88 +173,131 @@
 - 17. 可扩展设置中心、模型解耦与个性化播报
 - showLightDialog
 - TextPatchApplier
-- ChatDetailsExpansionPolicy
+- .playAudio
 - MultimodalTranscriberTest
 - HubConfigValidationTest
-- .`expands details in the three most recent user rounds`
+- RealtimePipelineRepository
 - hanwo-dev script
+- .client
+- .use
+- README.md
+- ExperimentalReplyParserTest
+- State
+- TextEditorActivity.kt
+- AppVisibility
+- JsonElement
+- IntentRouting.kt
+- Gitea.Common.psm1
+- 27. 渐进式 Skill、回合韧性与委派约束
+- 28. 跨设备签名、手动恢复与长详情转储
+- HubSettingsFragment
+- LongDetailsPolicyTest
+- BackgroundLlmRetryPlanTest
+- 26. 空正文重试、详情折叠与代码图谱同步
+- BackgroundLlmRetryPlan
+- ActiveTurnCheckpointStoreTest
+- ExperimentConfig.kt
+- .write
+- ChatAdapter
+- AndroidExecutionEnv.kt
+- State
+- FileLogTree
+- ExecArgumentParserTest
+- RealtimeTranscriptAccumulatorTest
+- RealtimePlainTextPolicy
+- RealtimeTranscriptAccumulator
+- State
+- RealtimePlainTextPolicyTest
+- VoiceReplyLengthGate
+- TaskStatus
+- SettingsActivity
+- MainRealtimeIntegrationTest
+- LongDetailsPolicy
+- buildCurrentTurnUserContent
+- ServiceState
+- ProcessScrollView
+- MainAgentHarnessTest
+- RealtimeState
+- BackgroundTurnNotificationPolicy
+- BackgroundTurnNotificationPolicyTest
+- ChatDetailsExpansionPolicy
 
 ## God Nodes (most connected - your core abstractions)
-1. `VoiceAgentService` - 133 edges
-2. `CloudSpeechClient` - 119 edges
-3. `Communities (119 total, 33 thin omitted)` - 83 edges
-4. `ConversationStore` - 54 edges
-5. `SkillRegistry` - 50 edges
-6. `TaskEntity` - 49 edges
-7. `MainActivity` - 48 edges
-8. `MainToolRegistry` - 39 edges
-9. `WorkspaceRepository` - 39 edges
-10. `FakeRuntime` - 38 edges
+1. `VoiceAgentService` - 179 edges
+2. `CloudSpeechClient` - 153 edges
+3. `Communities (218 total, 77 thin omitted)` - 137 edges
+4. `ConversationStore` - 79 edges
+5. `SkillRegistry` - 63 edges
+6. `MainActivity` - 52 edges
+7. `TaskEntity` - 49 edges
+8. `FakeRuntime` - 45 edges
+9. `MainToolRegistry` - 43 edges
+10. `AgentLoop` - 42 edges
 
 ## Surprising Connections (you probably didn't know these)
+- `withoutPrivateReasoning()` --references--> `CloudSpeechClient`  [EXTRACTED]
+  app/src/main/java/com/agent/voiceassistant/agent/runtime/IntentRouting.kt → app/src/main/java/com/agent/voiceassistant/cloud/CloudSpeechClient.kt
 - `MainActivity` --references--> `ConversationStore`  [EXTRACTED]
   app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/data/ConversationStore.kt
 - `MainActivity` --references--> `TaskRepository`  [EXTRACTED]
   app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/tasks/TaskRepository.kt
-- `MainActivity` --references--> `HubAgentAdapter`  [EXTRACTED]
-  app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/ui/HubAgentAdapter.kt
-- `MainActivity` --references--> `TaskAdapter`  [EXTRACTED]
-  app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/ui/TaskAdapter.kt
-- `MainActivity` --references--> `WorkspaceRepository`  [EXTRACTED]
-  app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/workspace/WorkspaceRepository.kt
+- `MainActivity` --references--> `ChatAdapter`  [EXTRACTED]
+  app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/ui/ChatAdapter.kt
+- `MainActivity` --references--> `ConversationAdapter`  [EXTRACTED]
+  app/src/main/java/com/agent/voiceassistant/MainActivity.kt → app/src/main/java/com/agent/voiceassistant/ui/ConversationAdapter.kt
 
 ## Import Cycles
 - None detected.
 
-## Communities (166 total, 55 thin omitted)
+## Communities (212 total, 71 thin omitted)
 
 ### Community 0 - "Community 0"
-Cohesion: 0.14
+Cohesion: 0.13
 Nodes (5): AudioTrack, ByteArray, PreparedTtsAudio, StreamingTtsPlaybackSession, WavDataChunk
 
 ### Community 1 - "Community 1"
-Cohesion: 0.11
-Nodes (13): AgentLoop, StateFlow, MainAgentHarness, QueuedInput, State, CANCELLING, FAILED, IDLE (+5 more)
+Cohesion: 0.20
+Nodes (3): AgentLoop, AgentLoopTest, FakeRuntime
 
 ### Community 2 - "Community 2"
-Cohesion: 0.14
-Nodes (16): ChatCompletion, ChatRequest, ChatStreamAccumulator, ChatStreamEvent, ContentDelta, Finished, ImageInput, LlmMessage (+8 more)
+Cohesion: 0.10
+Nodes (22): ChatCompletion, ChatRequest, ChatStreamAccumulator, ChatStreamEvent, ChatUsage, ContentDelta, Finished, ImageInput (+14 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.06
 Nodes (21): StoredLocation, android, Job, LocationProvider, LocationTimeoutException, RefreshSnapshot, RefreshState, COOLDOWN (+13 more)
 
 ### Community 4 - "Community 4"
-Cohesion: 0.22
-Nodes (3): JsonObject, MainToolRegistry, JsonPrimitive
+Cohesion: 0.05
+Nodes (23): JsonObject, StepFunRealtimeProtocol, ByteArray, ShortArray, WavUtil, EncryptedSecretStore, SecretKey, Execution (+15 more)
 
 ### Community 5 - "Community 5"
-Cohesion: 0.16
-Nodes (3): AgentFactory, AgentTools, Assistant
+Cohesion: 0.08
+Nodes (3): CloudSpeechClient, JsonElement, NoopRuntime
 
 ### Community 6 - "Community 6"
-Cohesion: 0.08
-Nodes (12): AndroidExecutionEnvInstrumentedTest, AndroidExecutionEnv, CredentialProfileStore, ExecResult, HttpResult, ByteArray, SecretKey, LogEntry (+4 more)
+Cohesion: 0.19
+Nodes (3): CredentialProfileStore, okhttp3, SecretKey
 
 ### Community 7 - "Community 7"
-Cohesion: 0.30
-Nodes (4): CodeGraphIndex, Link, Node, Snapshot
+Cohesion: 0.27
+Nodes (5): CodeGraphIndex, Link, Node, Snapshot, Snapshot
 
 ### Community 8 - "Community 8"
-Cohesion: 0.07
-Nodes (17): ActivitySkillEditorBinding, Registration, Skill, SkillFile, SkillRegistry, Holder, intent(), AppCompatActivity (+9 more)
+Cohesion: 0.27
+Nodes (4): ActivitySkillEditorBinding, AppCompatActivity, Bundle, SkillEditorActivity
 
 ### Community 9 - "Community 9"
-Cohesion: 0.11
-Nodes (10): EventBus, ServiceLog, ServiceState, DORMANT, FAILED, IDLE, INITIALIZING, LISTENING (+2 more)
+Cohesion: 0.15
+Nodes (4): EventBus, StateFlow, ServiceLog, SharedFlow
 
 ### Community 10 - "Community 10"
 Cohesion: 0.06
 Nodes (18): DispatchedTask, TaskStatus, completed, failed, in_progress, pending, PendingResult, CoroutineScope (+10 more)
 
 ### Community 11 - "Community 11"
-Cohesion: 0.07
-Nodes (16): MultimodalTranscriber, SpeechSegmenter, State, CODE_FENCE, DISPLAY_DETAIL, MARKDOWN_TABLE, REPLY, TAG (+8 more)
+Cohesion: 0.05
+Nodes (19): LongDetailsPolicy, Result, MultimodalTranscriber, SpeechSegmenter, State, CODE_FENCE, DISPLAY_DETAIL, MARKDOWN_TABLE (+11 more)
 
 ### Community 12 - "Community 12"
 Cohesion: 0.13
@@ -265,7 +308,7 @@ Cohesion: 0.12
 Nodes (10): FrameProcessor, CoroutineScope, Job, Frame, FrameDirection, DOWNSTREAM, UPSTREAM, ASRProcessor (+2 more)
 
 ### Community 14 - "Community 14"
-Cohesion: 0.08
+Cohesion: 0.09
 Nodes (13): Holder, ActivityWorkspaceBinding, AppCompatActivity, Bundle, Holder, RecyclerView, ViewGroup, TrashAdapter (+5 more)
 
 ### Community 15 - "Community 15"
@@ -273,84 +316,84 @@ Cohesion: 0.16
 Nodes (19): BotStartedSpeakingFrame, BotStoppedSpeakingFrame, CancelFrame, DataFrame, EndFrame, FunctionCallResultFrame, InputAudioRawFrame, InterruptionFrame (+11 more)
 
 ### Community 16 - "Community 16"
-Cohesion: 0.23
-Nodes (7): DebugBridgeRequest, DebugBridgeReceiver, Context, Intent, JsonObject, BroadcastReceiver, JsonArray
+Cohesion: 0.08
+Nodes (21): ActivityLlmProviderEditorBinding, DebugBridgeProtocol, DebugBridgeRequest, DebugBridgeReceiver, Context, Intent, JsonArray, JsonObject (+13 more)
 
 ### Community 17 - "Community 17"
 Cohesion: 0.06
 Nodes (20): ActivityWorkspacePreviewBinding, Holder, ActivityWorkspaceBinding, AppCompatActivity, Bundle, Holder, RecyclerView, ViewGroup (+12 more)
 
 ### Community 18 - "Community 18"
-Cohesion: 0.19
-Nodes (19): AgentEvent, AgentFailed, AgentFinished, AgentStarted, AutomaticThinkingEscalated, ContentDelta, FinalResponseRetry, MessageFinished (+11 more)
+Cohesion: 0.07
+Nodes (32): ActiveBudgetStarted, ActiveToolBudgetExceeded, AgentEvent, AgentFailed, AgentFinished, AgentInterrupted, AgentStarted, AutomaticThinkingEscalated (+24 more)
 
 ### Community 19 - "Community 19"
 Cohesion: 0.22
 Nodes (4): CoroutineScope, Job, UserIdleDetector, UserIdleListener
 
 ### Community 20 - "Community 20"
-Cohesion: 0.14
-Nodes (14): Action, CONTINUE, SLEEP, WARN, CaptureResult, InactivitySleep, InactivityWarning, ShortArray (+6 more)
+Cohesion: 0.11
+Nodes (16): Action, CONTINUE, SLEEP, WARN, CaptureResult, InactivitySleep, InactivityWarning, AudioRecord (+8 more)
 
 ### Community 21 - "Community 21"
 Cohesion: 0.33
 Nodes (3): AudioOutputProcessor, AudioTrack, Job
 
 ### Community 22 - "Community 22"
-Cohesion: 0.14
-Nodes (7): DetailExtraction, ReplyDetailPolicy, ChatAdapter, Markwon, RecyclerView, ViewGroup, VH
+Cohesion: 0.09
+Nodes (11): DetailExtraction, ReplyDetailPolicy, AppCompatActivity, Bundle, RealtimeActivity, ChatAdapter, Markwon, RecyclerView (+3 more)
 
 ### Community 24 - "Community 24"
 Cohesion: 0.33
 Nodes (3): AudioInputProcessor, AudioRecord, Job
 
 ### Community 26 - "Community 26"
-Cohesion: 0.31
-Nodes (4): App, FileLogTree, Application, Timber
+Cohesion: 0.16
+Nodes (3): AgentFactory, AgentTools, Assistant
 
 ### Community 27 - "Community 27"
 Cohesion: 0.47
 Nodes (3): AudioConfig, ShortArray, FloatArray
 
 ### Community 29 - "Community 29"
-Cohesion: 0.06
-Nodes (22): ActivityMainBinding, ConversationSummary, android, AppCompatActivity, Bundle, Intent, Uri, MainActivity (+14 more)
+Cohesion: 0.14
+Nodes (7): ActivityMainBinding, AppCompatActivity, Uri, MainActivity, PageHomeBinding, PageHubBinding, PageTasksBinding
 
 ### Community 30 - "Community 30"
-Cohesion: 0.02
-Nodes (83): Communities (119 total, 33 thin omitted), Community 0 - "Community 0", Community 100 - "六、模型清单与能力", Community 106 - "十一、流式输出", Community 107 - "十五、计费与配额消耗估算", Community 108 - "二、Token Plan 概述", Community 109 - "三、套餐档位与额度", Community 10 - "Community 10" (+75 more)
+Cohesion: 0.01
+Nodes (137): Communities (218 total, 77 thin omitted), Community 0 - "Community 0", Community 100 - "六、模型清单与能力", Community 106 - "十一、流式输出", Community 107 - "十五、计费与配额消耗估算", Community 108 - "二、Token Plan 概述", Community 109 - "三、套餐档位与额度", Community 10 - "Community 10" (+129 more)
+
+### Community 31 - "Community 31"
+Cohesion: 0.10
+Nodes (14): Audio, AudioDone, Drain, Event, Interrupt, AudioRecord, AudioTrack, ByteArray (+6 more)
 
 ### Community 32 - "Community 32"
 Cohesion: 0.33
 Nodes (3): VoiceBarView, Canvas, View
 
 ### Community 33 - "Community 33"
-Cohesion: 0.09
-Nodes (22): 10. 仓库维护规则, 11. Pi 风格 Harness 与 Android 执行环境, 12. 工具链实机反馈修复, 14. 思考反馈与 MiMo TTS 音色统一, 15. 工具协议、批量读取和正文防护, 16. 标准媒体入口、冷启动注册与通知合并, 18. 去 Telecom 化与纯媒体语音会话, 19. 语义休眠与蓝牙按键边界 (+14 more)
+Cohesion: 0.08
+Nodes (25): 0.1 2026-10-01 工具写入与恢复修复, 10. 仓库维护规则, 11. Pi 风格 Harness 与 Android 执行环境, 12. 工具链实机反馈修复, 14. 思考反馈与 MiMo TTS 音色统一, 15. 工具协议、批量读取和正文防护, 16. 标准媒体入口、冷启动注册与通知合并, 18. 去 Telecom 化与纯媒体语音会话 (+17 more)
 
 ### Community 34 - "Community 34"
 Cohesion: 0.40
-Nodes (3): Activity, AssistEntryActivity, Bundle
+Nodes (3): AssistEntryActivity, Activity, Bundle
 
 ### Community 35 - "Community 35"
 Cohesion: 0.60
 Nodes (4): fromAssets(), fromContext(), Context, ModelPaths
 
 ### Community 37 - "Community 37"
-Cohesion: 0.11
-Nodes (11): ActivityReflectionsBinding, Holder, AppCompatActivity, Bundle, Holder, RecyclerView, ViewGroup, ReflectionActivity (+3 more)
+Cohesion: 0.12
+Nodes (12): ActivityReflectionsBinding, Holder, AppCompatActivity, Bundle, Holder, RecyclerView, ViewGroup, ReflectionActivity (+4 more)
 
 ### Community 38 - "Community 38"
-Cohesion: 0.25
-Nodes (5): ReflectionValidator, ReflectionAnalysis, BoundedSourceReader, Result, BufferedSource
+Cohesion: 0.50
+Nodes (3): BoundedSourceReader, Result, BufferedSource
 
 ### Community 39 - "Community 39"
 Cohesion: 0.23
 Nodes (4): Mount, VirtualPathResolver, VirtualPathResolverTest, java
-
-### Community 40 - "Community 40"
-Cohesion: 0.15
-Nodes (3): ConversationMemoryDraft, ConversationStore, StoredMemory
 
 ### Community 44 - "Community 44"
 Cohesion: 0.83
@@ -373,92 +416,96 @@ Cohesion: 0.18
 Nodes (15): ArgumentParser, CompletedProcess, Namespace, RuntimeError, Adb, bridge_command(), build_parser(), CliError (+7 more)
 
 ### Community 53 - "VoiceAgentService"
-Cohesion: 0.08
-Nodes (6): TurnReflectionRecord, AssistantDraft, Job, VoiceAgentService, VoiceReplyPresentation, Service
+Cohesion: 0.07
+Nodes (7): AgentKeepAlive, com, Job, VoiceAgentService, VoiceReplyPresentation, SpeechPreferences, Service
 
 ### Community 55 - "LlmProviderRepository"
-Cohesion: 0.11
-Nodes (12): buildCurrentTurnUserContent(), buildMainSystemPrompt(), buildTurnGuidance(), LLMConfig, LlmProviderMode, MIMO, OPENAI_COMPATIBLE, mimo() (+4 more)
+Cohesion: 0.07
+Nodes (17): FirstEventTimeoutException, StreamIdleTimeoutException, EmptyLlmResponseException, FallbackLlmClient, IOException, firstEventTimeoutMs(), IOException, JsonObject (+9 more)
 
 ### Community 56 - "Main Agent 下一版修复改进方案"
 Cohesion: 0.07
 Nodes (27): 10. 需要用户确认, 1. 背景与实机证据, 2. 本版目标, 3.1 聊天窗口, 3.2 摘要规则, 3. 工具调用记录改造, 4.1 计数范围, 4.2 自动升级流程 (+19 more)
 
 ### Community 57 - "Runtime"
-Cohesion: 0.11
-Nodes (9): buildFinalFormatRepairInstruction(), buildToolCallRepairInstruction(), Completed, Config, ModelTurn, Outcome, Runtime, TerminalExecution (+1 more)
+Cohesion: 0.19
+Nodes (7): AppCapabilities, AppCapabilityResolver, detectKeyType(), MimoApiRepository, MimoKeyType, PAY_AS_YOU_GO, TOKEN_PLAN
 
 ### Community 58 - ".requestTts"
-Cohesion: 0.18
-Nodes (8): AudioPayload, FirstAudioTimeoutException, ByteArray, IOException, JsonObject, okhttp3, NetworkTimeoutException, VoiceReplyOptions
-
-### Community 59 - "TaskDao"
-Cohesion: 0.09
-Nodes (3): Flow, TaskDao, TaskReportActionEntity
+Cohesion: 0.22
+Nodes (4): Flow, TaskEntity, Diff, DiffUtil
 
 ### Community 60 - "CloudSpeechClient"
-Cohesion: 0.08
-Nodes (3): CloudSpeechClient, JsonElement, NoopRuntime
+Cohesion: 0.07
+Nodes (14): buildFinalFormatRepairInstruction(), buildToolCallRepairInstruction(), CheckpointPhase, RUNNING, WAITING_NETWORK, WAITING_RECOVERY, Completed, Config (+6 more)
 
 ### Community 61 - "LLMConfig"
-Cohesion: 0.12
-Nodes (17): StoredAttachment, StoredMessage, ChatPresentation, PERSONALIZED_VOICE, STANDARD, ChatRole, BOT, SYSTEM (+9 more)
+Cohesion: 0.11
+Nodes (21): StoredAttachment, toUi(), ChatPresentation, PERSONALIZED_VOICE, STANDARD, ChatRole, BOT, SYSTEM (+13 more)
 
 ### Community 62 - ".onCreate"
-Cohesion: 0.16
+Cohesion: 0.18
 Nodes (4): AsyncTaskCoordinator, TaskExecutor, DelayedTestExecutor, TaskExecutionResult
 
 ### Community 63 - "VoiceAgentService.kt"
-Cohesion: 0.18
-Nodes (21): bootstrap(), cancelTask(), compactConversation(), deleteConversation(), Context, Intent, newConversation(), renameConversation() (+13 more)
+Cohesion: 0.17
+Nodes (24): bootstrap(), cancelAgent(), cancelTask(), compactConversation(), deleteConversation(), Context, Intent, newConversation() (+16 more)
 
 ### Community 64 - ".playAudio"
-Cohesion: 0.21
-Nodes (5): MediaPlayer, PcmChunk, AudioAttributes, AudioFocusRequest, IllegalStateException
+Cohesion: 0.18
+Nodes (8): AudioPayload, FirstAudioTimeoutException, ByteArray, IOException, JsonObject, okhttp3, NetworkTimeoutException, VoiceReplyOptions
 
 ### Community 65 - "MimoSettingsFragment"
-Cohesion: 0.10
-Nodes (18): ActivitySettingsBinding, SettingsActivityInstrumentedTest, AboutSettingsFragment, bindLightDialogInput(), HubSettingsFragment, AppCompatActivity, Bundle, LlmProvidersFragment (+10 more)
+Cohesion: 0.23
+Nodes (4): SettingsActivityInstrumentedTest, CredentialProfilesFragment, Bundle, LlmProvidersFragment
 
 ### Community 66 - "MimoApiRepository"
-Cohesion: 0.09
-Nodes (9): AgentAction, AgentOutput, BodyToolCall, BodyToolCallStreamGate, BodyToolCallTooLargeException, JsonElement, StructuredOutputParser, Update (+1 more)
+Cohesion: 0.07
+Nodes (11): AgentAction, AgentOutput, BodyToolCall, BodyToolCallMatch, BodyToolCallStreamGate, BodyToolCallTooLargeException, JsonElement, StructuredOutputParser (+3 more)
 
 ### Community 67 - "TaskRepository"
-Cohesion: 0.12
-Nodes (6): TaskEntity, TaskEventEntity, Flow, TaskRepository, Diff, DiffUtil
+Cohesion: 0.11
+Nodes (4): TaskEventEntity, TaskSubmission, Flow, TaskRepository
 
 ### Community 68 - "EarconPlayer"
 Cohesion: 0.24
 Nodes (3): EarconPlayer, AudioTrack, ByteArray
 
-### Community 69 - "高级 TTS 导演"
-Cohesion: 0.15
-Nodes (12): 使用边界, 原创音色设计, 唱歌, 导演提示格式, 当前封装, 模式选择, 示例：动作与环境, 示例：导演模式 (+4 more)
-
 ### Community 70 - "TextEditorActivity.kt"
-Cohesion: 0.11
-Nodes (18): ActivityTextEditorBinding, AppCompatActivity, Bundle, Context, Markwon, memoryIntent(), newMemoryIntent(), newRuleIntent() (+10 more)
+Cohesion: 0.23
+Nodes (6): ActivityTextEditorBinding, AppCompatActivity, Bundle, Markwon, TextEditorActivity, Source
 
 ### Community 71 - "TaskEntity"
-Cohesion: 0.13
-Nodes (12): JsonObject, MalformedToolCallException, ToolCallSafety, VoicePerformance, SINGING, SPEECH, VoiceReplyDirective, VoiceReplyDirectiveParser (+4 more)
+Cohesion: 0.21
+Nodes (3): Bundle, Intent, TabLayoutMediator
 
 ### Community 72 - "TaskModels.kt"
 Cohesion: 0.13
-Nodes (13): TaskArtifactEntity, TaskOrigin, HUB, LOCAL, TaskPriority, NORMAL, URGENT, TaskReportState (+5 more)
+Nodes (12): TaskArtifactEntity, TaskOrigin, HUB, LOCAL, TaskPriority, NORMAL, URGENT, TaskReportState (+4 more)
 
 ### Community 73 - "Hanwo（喊我）"
-Cohesion: 0.11
-Nodes (17): Hanwo Agent 调试 CLI, 命令, 安全边界, 快速开始, Agent 执行环境, Agent 调试 CLI, Hanwo（喊我）, 下一步 (+9 more)
+Cohesion: 0.12
+Nodes (17): Agent 执行环境, Agent 调试 CLI, Hanwo（喊我）, 下一步, 主要代码结构, 代码图谱, 会话提示词边界, 使用 (+9 more)
 
 ### Community 74 - ".client"
-Cohesion: 0.16
-Nodes (7): Execution, JsonObject, Profile, CONNECTED, DIAGNOSTIC, STANDALONE, TaskToolContext
+Cohesion: 0.12
+Nodes (10): AssistantDraft, CompletableDeferred, Job, StepFunRealtimePipeline, TextSource, AUDIO_TRANSCRIPT, TEXT, ToolOutput (+2 more)
 
-### Community 79 - "TaskStatus"
-Cohesion: 0.22
-Nodes (9): TaskStatus, BLOCKED, CANCELLED, COMPLETED, CREATED, FAILED, INTERRUPTED, QUEUED (+1 more)
+### Community 76 - "VoiceReplyDirective.kt"
+Cohesion: 0.09
+Nodes (21): 1. 背景, 2.1 目标, 2.2 约束, 2. 目标与约束, 3.1 改名, 3.2 提示词原则, 3.3 第一阶段改动范围, 3.4 实机验证用例 (+13 more)
+
+### Community 77 - "TaskAdapter"
+Cohesion: 0.31
+Nodes (5): ConversationAdapter, RecyclerView, ViewGroup, ViewHolder, ViewHolder
+
+### Community 78 - "SimpleVadRecorder"
+Cohesion: 0.12
+Nodes (12): ConnectionState, CONNECTED, CONNECTING, DISCONNECTED, FAILED, ByteArray, CompletableDeferred, Flow (+4 more)
+
+### Community 79 - ".append"
+Cohesion: 0.21
+Nodes (8): Holder, intent(), Context, Holder, RecyclerView, ViewGroup, newIntent(), SkillFileAdapter
 
 ### Community 80 - "5.1 OpenAI 兼容协议"
 Cohesion: 0.22
@@ -466,11 +513,11 @@ Nodes (9): 5.1 OpenAI 兼容协议, 5.2 Anthropic 兼容协议, Token Plan Base 
 
 ### Community 82 - "HubClient"
 Cohesion: 0.20
-Nodes (8): from(), HubClient, Job, JsonObject, StateFlow, HubTaskFact, CompletableDeferred, Json
+Nodes (8): from(), HubClient, CompletableDeferred, Job, JsonObject, StateFlow, HubTaskFact, Json
 
 ### Community 83 - "Route"
-Cohesion: 0.20
-Nodes (6): Route, ACTIVE_AUDIO, DEFER, DORMANT_EXTERNAL_AUDIO, NOTIFICATION, TaskReportPolicy
+Cohesion: 0.18
+Nodes (7): Route, ACTIVE_AUDIO, DEFER, DORMANT_EXTERNAL_AUDIO, NOTIFICATION, REALTIME, TaskReportPolicy
 
 ### Community 85 - "小米 MiMo API 接入调研文档"
 Cohesion: 0.25
@@ -481,28 +528,24 @@ Cohesion: 0.38
 Nodes (4): Command, NEW_TOPIC, SLEEP, LocalConversationCommandPolicy
 
 ### Community 87 - "MimoApiRepository"
-Cohesion: 0.19
-Nodes (7): AppCapabilities, AppCapabilityResolver, detectKeyType(), MimoApiRepository, MimoKeyType, PAY_AS_YOU_GO, TOKEN_PLAN
+Cohesion: 0.22
+Nodes (8): VoicePerformance, SINGING, SPEECH, VoiceReplyDirective, VoiceReplyDirectiveParser, VoiceReplyMode, DESIGN, PRESET
 
 ### Community 88 - "Development Status"
-Cohesion: 0.29
-Nodes (6): Baseline, Current Audio Decisions, Development Status, Known Issues, Repository Scope, Working Flow
+Cohesion: 0.33
+Nodes (5): RecyclerView, ViewGroup, MainPage, MainPageAdapter, PageViewHolder
 
 ### Community 89 - "MultimodalImageEncoder"
-Cohesion: 0.47
-Nodes (3): CacheKey, MultimodalImageEncoder, Bitmap
+Cohesion: 0.13
+Nodes (7): RealtimePipelineRepository, StepFunRealtimeConfig, VoicePipeline, MIMO_STANDARD, STEPFUN_REALTIME, StepFunRealtimeSettingsFragment, StepFunRealtimeProtocolTest
 
 ### Community 90 - "TaskDatabase"
 Cohesion: 0.40
 Nodes (4): get(), Context, TaskDatabase, RoomDatabase
 
-### Community 91 - "StructuredOutputParserTest"
-Cohesion: 0.20
-Nodes (6): FirstEventTimeoutException, IOException, okhttp3, LlmClient, LlmHttpException, OpenAiCompatibleLlmClient
-
 ### Community 94 - "HubAgentFact"
-Cohesion: 0.18
-Nodes (9): HubAgentFact, areContentsTheSame(), areItemsTheSame(), HubAgentAdapter, ListAdapter, RecyclerView, ViewGroup, ViewHolder (+1 more)
+Cohesion: 0.29
+Nodes (6): HubAgentAdapter, ListAdapter, RecyclerView, ViewGroup, ViewHolder, ViewHolder
 
 ### Community 99 - "十六、完整接入示例"
 Cohesion: 0.40
@@ -556,53 +599,41 @@ Nodes (3): 4.1 登录与注册, 4.2 API Key 安全须知, 四、账号、认证�
 Cohesion: 0.67
 Nodes (3): 9.1 Token Plan 计费特点, 9.2 请求格式, 九、ASR 接入方式
 
-### Community 122 - "FallbackLlmClient"
-Cohesion: 0.22
-Nodes (5): EmptyLlmResponseException, FallbackLlmClient, IOException, FakeClient, FallbackLlmClientTest
-
 ### Community 123 - "Graph Report - audio-main-app  (2026-07-25)"
-Cohesion: 0.18
-Nodes (10): Community Hubs (Navigation), Corpus Check, God Nodes (most connected - your core abstractions), Graph Freshness, Graph Report - audio-main-app  (2026-07-26), Import Cycles, Knowledge Gaps, Suggested Questions (+2 more)
+Cohesion: 0.20
+Nodes (10): Community Hubs (Navigation), Corpus Check, God Nodes (most connected - your core abstractions), Graph Freshness, Graph Report - audio-main-app  (2026-10-08), Import Cycles, Knowledge Gaps, Suggested Questions (+2 more)
 
 ### Community 124 - "MimoWebSearchClient"
-Cohesion: 0.27
-Nodes (5): JsonElement, JsonObject, MimoWebSearchClient, SearchResult, Source
+Cohesion: 0.24
+Nodes (18): AudioDelta, AudioDone, AudioTranscriptDelta, Error, Event, FunctionArgumentsDone, ResponseCreated, ResponseDone (+10 more)
 
-### Community 125 - "TurnMetricsTracker"
-Cohesion: 0.22
-Nodes (5): Interval, StartedTool, TurnMetricsTracker, ToolCallMetric, TurnMetrics
-
-### Community 126 - "LlmProviderEditorActivity"
-Cohesion: 0.30
-Nodes (4): ActivityLlmProviderEditorBinding, AppCompatActivity, Bundle, LlmProviderEditorActivity
-
-### Community 127 - "ConversationStore.kt"
-Cohesion: 0.29
-Nodes (6): ConversationSession, defaultConversationTitle(), newConversation(), quarantineMalformedToolHistory(), SharedConversationState, StoreState
-
-### Community 128 - "HubConfigRepository"
-Cohesion: 0.18
-Nodes (5): HubAuthenticator, okhttp3, toHttpUrlOrThrow(), HubConfigRepository, Context
-
-### Community 130 - "ConversationMemoryCompactor"
-Cohesion: 0.31
-Nodes (3): ConversationMemoryCompactor, ConversationCompressionMessage, ConversationCompressionSource
+### Community 130 - ".executeBackgroundLlm"
+Cohesion: 0.20
+Nodes (5): BackgroundLlmResult, BackgroundLlmTask, Result, Memory, T
 
 ### Community 131 - "HubSettings"
-Cohesion: 0.24
-Nodes (3): buildHubWebSocketUrl(), HubSettings, HubProtocolModelsTest
+Cohesion: 0.15
+Nodes (4): buildHubWebSocketUrl(), HubConfigRepository, HubSettings, HubProtocolModelsTest
 
 ### Community 132 - "TaskAdapter"
 Cohesion: 0.25
 Nodes (6): ListAdapter, RecyclerView, ViewGroup, ViewHolder, TaskAdapter, ViewHolder
 
+### Community 133 - "HubRuntime"
+Cohesion: 0.17
+Nodes (6): HubAuthenticator, okhttp3, toHttpUrlOrThrow(), HubFacts, HubRuntime, Context
+
+### Community 134 - ".runAgentLoop"
+Cohesion: 0.12
+Nodes (5): IntentRoutingResult, VoiceReplyLengthGate, Deferred, TurnCheckpointContext, VoiceReplyLengthGateTest
+
 ### Community 135 - ".addLlmMessage"
-Cohesion: 0.25
-Nodes (3): StoredToolCall, StoredToolTrace, ToolHistoryPolicy
+Cohesion: 0.16
+Nodes (5): StoredMessage, StoredToolCall, StoredToolTrace, ToolHistoryPolicy, RealtimeContextProjection
 
 ### Community 136 - "Listener"
 Cohesion: 0.39
-Nodes (4): Listener, Response, WebSocket, WebSocketListener
+Nodes (4): WebSocket, Listener, Response, WebSocketListener
 
 ### Community 137 - "HubConnectionState"
 Cohesion: 0.22
@@ -611,6 +642,14 @@ Nodes (8): HubConnectionState, AUTH_FAILED, CONNECTED, CONNECTING, DISABLED, DIS
 ### Community 138 - "ExaWebSearchClient"
 Cohesion: 0.39
 Nodes (3): ExaWebSearchClient, SearchResult, Source
+
+### Community 139 - ".error"
+Cohesion: 0.38
+Nodes (3): ConversationMemoryCompactor, Result, ConversationMemoryDraft
+
+### Community 140 - "TurnMetricsTrackerTest"
+Cohesion: 0.24
+Nodes (8): ExperimentalReplyParser, Result, Section, ANSWER, DETAILS, OUTSIDE, THINKING, Tag
 
 ### Community 141 - "HubModels.kt"
 Cohesion: 0.29
@@ -621,8 +660,8 @@ Cohesion: 0.29
 Nodes (7): 4.1 最小语音闭环, 4.2 后台运行和休眠, 4.3 音频路由, 4.4 当前 App 包大小, 4.5 Agent 框架与工具调用, 4.6 流式 TTS 首尾噪声修复, 4. 当前已实现
 
 ### Community 145 - ".pcm16ToWav"
-Cohesion: 0.40
-Nodes (3): ByteArray, ShortArray, WavUtil
+Cohesion: 0.14
+Nodes (14): ConversationCompressionMessage, ConversationCompressionSource, ConversationDomain, REALTIME, STANDARD, ConversationSession, defaultConversationTitle(), newConversation() (+6 more)
 
 ### Community 146 - "13. 语音时延、上下文和单回合思考协议"
 Cohesion: 0.33
@@ -632,33 +671,145 @@ Nodes (6): 13.1 统一 5 秒首响应时限, 13.2 KV 缓存友好的上下文顺
 Cohesion: 0.33
 Nodes (6): 7.1 延迟波动, 7.2 Hub 工具尚未接入, 7.3 流式 TTS 需要专项验证, 7.4 音量问题, 7.5 第三方通话蓝牙路由待验证, 7. 当前已知问题
 
+### Community 149 - "SpeechSegmenter"
+Cohesion: 0.18
+Nodes (4): Deferred, StateFlow, MainAgentHarness, QueuedInput
+
 ### Community 151 - "0. 2026-07-21 本轮更新"
 Cohesion: 0.40
 Nodes (5): 0. 2026-07-21 本轮更新, Skills 与记忆, 工作区、附件和图片, 本地命令与提示音, 音频生命周期和播放音量域
+
+### Community 152 - "DeviceContextProvider"
+Cohesion: 0.43
+Nodes (3): JsonObject, MalformedToolCallException, ToolCallSafety
 
 ### Community 158 - "17. 可扩展设置中心、模型解耦与个性化播报"
 Cohesion: 0.50
 Nodes (4): 17.1 多级设置中心, 17.2 模型与语音客户端解耦, 17.3 终止型个性化 TTS, 17. 可扩展设置中心、模型解耦与个性化播报
 
+### Community 161 - ".playAudio"
+Cohesion: 0.22
+Nodes (5): MediaPlayer, PcmChunk, AudioAttributes, AudioFocusRequest, IllegalStateException
+
+### Community 166 - ".client"
+Cohesion: 0.50
+Nodes (4): 29.1 两套提示词, 29.2 Realtime 工具边界, 29.3 验证, 29. 主会话与 Realtime 提示词分层
+
+### Community 167 - ".use"
+Cohesion: 0.18
+Nodes (7): ByteArray, Registration, Residency, CONVERSATION, TURN, SkillFile, UseResult
+
+### Community 168 - "README.md"
+Cohesion: 0.12
+Nodes (12): Hanwo Agent 调试 CLI, 命令, 安全边界, 快速开始, Baseline, Current Boundaries, Current Capabilities, Development Status (+4 more)
+
+### Community 171 - "TextEditorActivity.kt"
+Cohesion: 0.22
+Nodes (12): Context, memoryIntent(), newMemoryIntent(), newRuleIntent(), ruleIntent(), skillIntent(), Source, MEMORY (+4 more)
+
+### Community 172 - "AppVisibility"
+Cohesion: 0.27
+Nodes (4): AppVisibility, Activity, Application, Bundle
+
+### Community 173 - "JsonElement"
+Cohesion: 0.22
+Nodes (8): http_request 参数, HTTP 工具与凭证, URL 安全规则, 凭证引用, 响应处理, 完整调用示例, 指导用户配置凭证, 适用范围
+
+### Community 174 - "IntentRouting.kt"
+Cohesion: 0.17
+Nodes (8): IntentCategory, CHAT, QUICK_ANSWER, TASK, IntentRoutingParser, IntentRoutingPrompt, Result, withoutPrivateReasoning()
+
+### Community 175 - "Gitea.Common.psm1"
+Cohesion: 0.60
+Nodes (3): Get-GiteaContext(), Import-GiteaDotEnv(), Invoke-GiteaRequest()
+
+### Community 176 - "27. 渐进式 Skill、回合韧性与委派约束"
+Cohesion: 0.40
+Nodes (5): 27.1 固定工具表与系统 Skill, 27.2 上下文与语音摘要, 27.3 有效时间预算、网络等待与恢复, 27.4 快速检索、任务委派与反思, 27. 渐进式 Skill、回合韧性与委派约束
+
+### Community 177 - "28. 跨设备签名、手动恢复与长详情转储"
+Cohesion: 0.40
+Nodes (5): 28.1 共享 Debug 签名, 28.2 Subagent 路由与 Skill 使用, 28.3 回合恢复与超时口径, 28.4 长详情与流式界面, 28. 跨设备签名、手动恢复与长详情转储
+
+### Community 178 - "HubSettingsFragment"
+Cohesion: 0.22
+Nodes (10): AboutSettingsFragment, bindLightDialogInput(), HubSettingsFragment, MimoSettingsFragment, RootSettingsFragment, VoiceSettingsFragment, EditTextPreference, Preference (+2 more)
+
+### Community 181 - "26. 空正文重试、详情折叠与代码图谱同步"
+Cohesion: 0.50
+Nodes (4): 26.1 空正文重试, 26.2 聊天详情折叠, 26.3 Graphify 和实机验证, 26. 空正文重试、详情折叠与代码图谱同步
+
+### Community 187 - ".write"
+Cohesion: 0.21
+Nodes (5): ExecResult, HttpResult, ByteArray, ReadResult, WriteResult
+
+### Community 188 - "ChatAdapter"
+Cohesion: 0.33
+Nodes (3): HubAgentFact, areContentsTheSame(), areItemsTheSame()
+
+### Community 189 - "AndroidExecutionEnv.kt"
+Cohesion: 0.28
+Nodes (3): LogEntry, LogFilterPolicy, Profile
+
+### Community 190 - "State"
+Cohesion: 0.22
+Nodes (8): State, CANCELLING, FAILED, IDLE, RUNNING, WAITING_NETWORK, WAITING_RECOVERY, WAITING_RETRY
+
+### Community 191 - "FileLogTree"
+Cohesion: 0.31
+Nodes (4): App, FileLogTree, Application, Timber
+
+### Community 198 - "VoiceReplyLengthGate"
+Cohesion: 0.33
+Nodes (6): ActiveTurnCheckpointStore, decode(), encode(), Message, Snapshot, ToolCall
+
+### Community 199 - "TaskStatus"
+Cohesion: 0.22
+Nodes (9): TaskStatus, BLOCKED, CANCELLED, COMPLETED, CREATED, FAILED, INTERRUPTED, QUEUED (+1 more)
+
+### Community 200 - "SettingsActivity"
+Cohesion: 0.32
+Nodes (4): ActivitySettingsBinding, AppCompatActivity, SettingsActivity, Fragment
+
+### Community 202 - "LongDetailsPolicy"
+Cohesion: 0.47
+Nodes (3): CacheKey, MultimodalImageEncoder, Bitmap
+
+### Community 203 - "buildCurrentTurnUserContent"
+Cohesion: 0.12
+Nodes (9): buildCurrentTurnUserContent(), buildMainSystemPrompt(), buildRealtimeSystemPrompt(), LLMConfig, mimo(), unconfigured(), LLMConfigTest, ChatStreamAccumulatorTest (+1 more)
+
+### Community 205 - "ServiceState"
+Cohesion: 0.25
+Nodes (7): ServiceState, DORMANT, FAILED, IDLE, INITIALIZING, LISTENING, READY
+
+### Community 206 - "ProcessScrollView"
+Cohesion: 0.33
+Nodes (3): ProcessScrollView, MotionEvent, ScrollView
+
+### Community 210 - "RealtimeState"
+Cohesion: 0.33
+Nodes (5): RealtimeState, CONNECTING, FAILED, READY, STOPPED
+
 ## Knowledge Gaps
-- **384 isolated node(s):** `MIMO`, `OPENAI_COMPATIBLE`, `NEW_TOPIC`, `SLEEP`, `IDLE` (+379 more)
+- **511 isolated node(s):** `ExperimentConfig`, `OUTSIDE`, `THINKING`, `ANSWER`, `DETAILS` (+506 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **55 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **71 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `VoiceAgentService` connect `VoiceAgentService` to `Community 0`, `DeviceContextProvider`, `Community 3`, `Community 4`, `.runAgentLoop`, `Community 6`, `Community 8`, `Community 11`, `Community 12`, `Community 37`, `Community 40`, `RuleStore`, `.emitLog`, `CloudSpeechClient`, `.onCreate`, `VoiceAgentService.kt`, `.playAudio`, `MimoSettingsFragment`, `TaskRepository`, `EarconPlayer`, `VoiceReplyDirective.kt`, `MimoApiRepository`, `MultimodalImageEncoder`, `LlmProviderRepository`?**
-  _High betweenness centrality (0.237) - this node is a cross-community bridge._
-- **Why does `ChatMessage` connect `.emitLog` to `ChatDetailsExpansionPolicy`, `.`expands details in the three most recent user rounds``, `Community 40`, `Community 9`, `VoiceAgentService`, `Community 22`, `Community 25`, `LLMConfig`?**
-  _High betweenness centrality (0.110) - this node is a cross-community bridge._
-- **Why does `CloudSpeechClient` connect `CloudSpeechClient` to `Community 0`, `Community 1`, `Community 2`, `Community 4`, `.runAgentLoop`, `.addLlmMessage`, `Community 11`, `TurnMetricsTrackerTest`, `Community 40`, `VoiceAgentService`, `.emitLog`, `LlmProviderRepository`, `Runtime`, `.requestTts`, `.playAudio`, `TaskEntity`, `.client`, `TaskAdapter`, `MultimodalImageEncoder`, `StructuredOutputParserTest`, `FallbackLlmClient`?**
+- **Why does `VoiceAgentService` connect `VoiceAgentService` to `SkillRegistry`, `Community 0`, `.executeBackgroundLlm`, `Community 3`, `Community 4`, `Community 5`, `.runAgentLoop`, `Community 11`, `Community 12`, `Community 16`, `Community 17`, `Community 20`, `.playAudio`, `Community 40`, `RuleStore`, `.emitLog`, `Runtime`, `.requestTts`, `.onCreate`, `VoiceAgentService.kt`, `TaskRepository`, `EarconPlayer`, `高级 TTS 导演`, `VoiceReplyLengthGate`, `LongDetailsPolicy`, `.client`, `MultimodalImageEncoder`, `ConversationStore.kt`?**
+  _High betweenness centrality (0.205) - this node is a cross-community bridge._
+- **Why does `CloudSpeechClient` connect `Community 5` to `Community 0`, `Community 1`, `Community 2`, `.executeBackgroundLlm`, `Community 4`, `.runAgentLoop`, `.addLlmMessage`, `Community 11`, `Community 18`, `DeviceContextProvider`, `.playAudio`, `Community 40`, `IntentRouting.kt`, `VoiceAgentService`, `.emitLog`, `LlmProviderRepository`, `CloudSpeechClient`, `LLMConfig`, `.playAudio`, `MimoApiRepository`, `State`, `高级 TTS 导演`, `VoiceReplyLengthGate`, `LongDetailsPolicy`, `.client`, `buildCurrentTurnUserContent`, `SimpleVadRecorder`?**
   _High betweenness centrality (0.090) - this node is a cross-community bridge._
+- **Why does `ConversationStore` connect `Community 40` to `Community 3`, `TextEditorActivity.kt`, `.addLlmMessage`, `TaskEntity`, `MainRealtimeIntegrationTest`, `Community 16`, `.pcm16ToWav`, `Community 29`, `RuleStore`, `VoiceAgentService`, `Community 22`, `LLMConfig`?**
+  _High betweenness centrality (0.070) - this node is a cross-community bridge._
 - **Are the 6 inferred relationships involving `CloudSpeechClient` (e.g. with `.`deep tool history passes reasoning content and omits temperature`()` and `.`payload explicitly disables thinking for fast turns`()`) actually correct?**
   _`CloudSpeechClient` has 6 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 5 inferred relationships involving `ConversationStore` (e.g. with `.clearConversations()` and `.conversations()`) actually correct?**
-  _`ConversationStore` has 5 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 7 inferred relationships involving `SkillRegistry` (e.g. with `.`creates a standard editable single file skill`()` and `.`disabled skill leaves active directory and reports unavailable`()`) actually correct?**
-  _`SkillRegistry` has 7 INFERRED edges - model-reasoned connections that need verification._
-- **What connects `MIMO`, `OPENAI_COMPATIBLE`, `NEW_TOPIC` to the rest of the system?**
-  _384 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Are the 6 inferred relationships involving `ConversationStore` (e.g. with `.longTranscriptIsTransferredOnceAndSurvivesLaterMainTurns()` and `.clearConversations()`) actually correct?**
+  _`ConversationStore` has 6 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 10 inferred relationships involving `SkillRegistry` (e.g. with `.`creates a standard editable single file skill`()` and `.`disabled skill leaves active directory and reports unavailable`()`) actually correct?**
+  _`SkillRegistry` has 10 INFERRED edges - model-reasoned connections that need verification._
+- **What connects `ExperimentConfig`, `OUTSIDE`, `THINKING` to the rest of the system?**
+  _511 weakly-connected nodes found - possible documentation gaps or missing edges._

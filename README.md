@@ -31,8 +31,13 @@ Debug 构建固定使用 `app/keystore/hanwo-debug.keystore`，用于不同开�
 - TTS SSE 只解析真实音频字段，忽略文本预览和用量等控制事件；PCM 使用边界淡入淡出，避免首尾爆音。
 - 使用原生 `tool_calls`、JSON Schema 和 `role=tool` 运行多轮 AgentLoop。
 - 原生工具表固定为记忆、休眠、Hub 委派、深度思考、`skill_use` 和快速网络检索；本地执行能力由系统 Skill 渐进披露，避免破坏请求前缀和工具 Schema 的 KV 缓存。
+- Realtime 启动时静默注入主会话最近 10 轮、最多 1200 字的完整轮次快照，排除思考与工具结果正文；挂断或重连时直接持久化尚未移交的通话记录，不再走 LLM 提炼。
+- 主会话完成或最终失败优先通过 Realtime 汇报，等待用户发言、当前回复和音频播放结束；无通话时，后台发带正文的通知，前台保持安静。
+- 凭据设置支持多键值编辑和已有配置枚举；HTTP 工具支持相对地址、凭据引用、超时和响应头，写入请求不自动重试。
+- 主会话和 StepFun Realtime 语音会话使用两套独立系统提示词：主会话负责完整任务执行、Skill 和 Hub 委派；Realtime 只负责即时语音交流，并提供查询主会话、查询记忆、转交主会话和结束通话四类工具。
 - 空正文、伪工具协议和工具故障不会生成本地兜底答复；AgentLoop 必须取得有效正文并完成必要摘要后才结束。网络超时进入等待重试状态，保留相同 `turnId` 和当前回合上下文。
 - 工具型任务从模型首个有效事件开始累计 30 秒有效执行时间，模型请求的首事件等待不计入；超限后停止新增本地工具，但仍允许总结或 Hub 委派。
+- Agent Loop 或 Realtime 活动期间，Service 持有短生命周期 CPU WakeLock；前台页面同步请求屏幕常亮，活动结束、取消或失败后释放。断线续写和 checkpoint 仍作为网络中断后的恢复兜底。
 - 未完成回合在关键边界写入最小原子检查点，进程重启后继续原会话和 `turnId`；正常完成即删除。路由反思只在异常条件下后台执行。
 - 聊天气泡将 `<DETAILS>...</DETAILS>` 与正文分开渲染，带分隔线和展开/折叠控件；最近三轮默认展开，更早详情自动折叠。
 - AgentLoop 已从语音 Service 抽离；Harness 提供串行回合、取消、`steer`/`followUp` 队列和统一事件。
@@ -166,6 +171,12 @@ app/src/main/java/com/agent/voiceassistant/
 - 延迟已有关键埋点，但仍需持续采集实机数据调优。
 - `/source` 和 `/logs` 的只读限制由虚拟文件工具强制执行；`exec` 仍拥有 Android App UID 沙箱内的完整权限，不能把它当作独立安全沙箱。
 
+## 会话提示词边界
+
+主会话通过 `buildMainSystemPrompt()` 提供完整 Agent 身份、记忆、Skill、快速检索、Hub 委派和本地执行规则。StepFun Realtime 通过 `buildRealtimeSystemPrompt()` 使用独立的语音提示词，不加载主会话的 Skill、`hub_dispatch_task` 或 `agent_sleep` 规则；需要复杂任务时，Realtime 只能把请求转交主会话处理。
+
+Realtime 的提示词要求适合朗读的自然中文纯文本，不输出 Markdown、XML、`DETAILS` 或伪工具协议。主会话的应用层仍支持屏幕详情，并由聊天 UI 单独渲染；二者的展示约束不能混用。
+
 ## 开发文档
 
 - [开发日志](开发日志.md)：按日期记录架构、实机验证和已知边界。
@@ -187,10 +198,12 @@ Skill 目录不属于通用虚拟文件系统；`read`、`write` 和 `exec` 均�
 核心工具：
 
 - `read(path, offset?, limit?, tail_lines?)`，文件读取、目录列表和日志尾读共用一个入口
-- `write(path, content, mode?)`，只允许写 `/workspace`
+- `write(path, content, mode?)`，只允许写 `/workspace`；大文本或诊断报告优先按每段不超过 50 行、8 KiB 分段，先 `overwrite/create` 再 `append`。超过建议值仍会写入成功，但结果会返回警告
 - `exec(argv, cwd?, timeout_seconds?)`，`cwd` 使用虚拟目录，默认 30 秒、最大 120 秒
 - `http_request(method, url, body?, credential_profile?)`
 - `agent_sleep()`，仅用于用户明确要求助手离开或休眠的终止型操作
+
+语音输入会优先选择真实外部麦克风或内置麦克风；Remote Submix 等虚拟输入不会覆盖内置麦克风。
 
 `exec` 默认工作目录是 `/workspace` 对应的物理目录，也可把 `cwd` 设为 `/source` 或 `/logs`。命令参数禁止用 `..` 离开授权目录；命令有超时和输出上限，不支持交互式或长期驻留任务。
 

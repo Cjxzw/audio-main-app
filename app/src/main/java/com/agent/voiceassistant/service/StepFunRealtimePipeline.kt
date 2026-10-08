@@ -1,6 +1,6 @@
 package com.agent.voiceassistant.service
 
-import com.agent.voiceassistant.agent.buildMainSystemPrompt
+import com.agent.voiceassistant.agent.buildRealtimeSystemPrompt
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.audio.RealtimeAudioRecorder
 import com.agent.voiceassistant.audio.RealtimePcmPlayer
@@ -32,6 +32,8 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeout
 
 /**
  * The StepFun realtime path intentionally does not use AgentLoop. It owns a persistent WebSocket
@@ -45,9 +47,11 @@ class StepFunRealtimePipeline(
     private val settings: RealtimePipelineRepository,
     private val tools: MainToolRegistry,
     private val conversationId: String,
+    private val mainSnapshot: () -> String,
     private val queryMainConversation: (String, Int) -> String,
     private val delegateToMain: suspend (String) -> String,
-    private val onSessionFinished: (String) -> Unit,
+    private val onUndeliveredMainReply: (String, String, Boolean) -> Unit,
+    private val onSessionFinished: () -> Unit,
     private val instructions: () -> String,
     private val onLog: (String) -> Unit,
     private val onDisconnected: (String) -> Unit,
@@ -69,18 +73,30 @@ class StepFunRealtimePipeline(
     private var nextUserTurnId = 0L
     private var transcriptFallbackJob: Job? = null
     private var activeAssistantItemId: String? = null
-    private var responseDone = false
-    private var pendingToolCount = 0
-    private var awaitingToolFollowUp = false
+    @Volatile private var responseDone = false
+    @Volatile private var pendingToolCount = 0
+    @Volatile private var awaitingToolFollowUp = false
     private var toolFollowUpRetryCount = 0
     private var toolFollowUpRetryJob: Job? = null
     @Volatile private var stopping = false
     private val sessionGeneration = AtomicLong(0L)
     private val sessionBoundaryLock = Any()
     private var acceptingVoiceTranscripts = false
+    @Volatile private var warmingUp = true
+    private var warmupReady: CompletableDeferred<Unit>? = null
+    private var warmupResponseDone: CompletableDeferred<Unit>? = null
     private val disconnectReported = AtomicBoolean(false)
     private val sessionFinishedNotified = AtomicBoolean(false)
+    @Volatile private var userSpeaking = false
+    @Volatile private var responseInFlight = false
+    @Volatile private var awaitingUserResponse = false
+    private val pendingMainReplies = linkedMapOf<String, Pair<String, Boolean>>()
+    private val reportedMainTurns = linkedSetOf<String>()
+    private var mainReplyJob: Job? = null
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+
+    val isReady: Boolean
+        get() = isStarted && !warmingUp && !stopping && warmupReady == null
 
     val isStarted: Boolean
         get() = client.state.value == StepFunRealtimeClient.ConnectionState.CONNECTED
@@ -93,12 +109,31 @@ class StepFunRealtimePipeline(
         val apiKey = settings.stepFunApiKey()
         disconnectReported.set(false)
         sessionFinishedNotified.set(false)
+        onLog("Realtime 正在连接，开始预热")
         client.connect(apiKey, config)
-        client.updateSession(config, instructions(), realtimeToolDefinitions())
         eventsJob = scope.launch {
             client.events.collect(::handleEvent)
         }
+        client.updateSession(config, instructions(), realtimeToolDefinitions())
+        warmingUp = true
+        warmupReady = CompletableDeferred()
+        warmupResponseDone = CompletableDeferred()
+        client.sendText("[系统预热] 连接初始化检查。只返回 READY，不要调用工具，不要输出其他内容。")
+        runCatching { withTimeout(15_000L) { warmupReady?.await(); warmupResponseDone?.await() } }
+            .onFailure {
+                warmingUp = false
+                warmupReady = null
+                warmupResponseDone = null
+                throw IllegalStateException("Realtime 预热失败：${it.message ?: it.javaClass.simpleName}", it)
+            }
+        warmupReady = null
+        warmupResponseDone = null
+        val snapshot = mainSnapshot()
+        client.sendContext("这是通话开始时的主会话快照，可能已过期；需要更早或更细的内容请调用 main_conversation_query。\n" +
+            snapshot.ifBlank { "最近没有可注入的完整轮次。" })
+        warmingUp = false
         if (captureAudio) startAudioCapture()
+        flushMainReplies()
         onLog(
             if (captureAudio) "StepFun Realtime 已连接，持续聆听中" else "StepFun Realtime 已连接，等待文字输入或唤醒",
         )
@@ -123,6 +158,7 @@ class StepFunRealtimePipeline(
         val stored = store.addMessageToConversation(conversationId, "user", normalized)
         EventBus.emitChatMessage(ChatMessage(ChatRole.USER, normalized, stored.timestamp, stored.id, conversationId = conversationId))
         try {
+            responseInFlight = true
             client.sendText(normalized)
         } catch (error: Throwable) {
             store.deleteMessage(stored.id)
@@ -139,6 +175,8 @@ class StepFunRealtimePipeline(
             pendingToolCount = 0
             awaitingToolFollowUp = false
             responseDone = false
+            pendingMainReplies.forEach { (id, result) -> onUndeliveredMainReply(id, result.first, result.second) }
+            pendingMainReplies.clear()
             toolStatusMessageIds.values.toList().also { toolStatusMessageIds.clear() }
         }
         staleToolStatusIds.forEach { messageId ->
@@ -146,11 +184,18 @@ class StepFunRealtimePipeline(
             EventBus.emitChatRemoval(messageId)
         }
         if (sessionFinishedNotified.compareAndSet(false, true)) {
-            val transcript = store.conversationProjection(conversationId, recentTurns = 50)
-            if (transcript.isNotBlank()) onSessionFinished(transcript)
+            userDraft?.takeIf { !it.completed }?.let {
+                if (it.text.isBlank()) it.text.append(it.candidateTranscript.orEmpty())
+                persistUserDraft(it, ChatStreamState.INTERRUPTED)
+                it.completed = true
+            }
+            assistantDraft?.let { persistAssistantDraft(it, ChatStreamState.INTERRUPTED) }
+            onSessionFinished()
         }
         acceptingVoiceTranscripts = false
         recorder.stop()
+        mainReplyJob?.cancel()
+        mainReplyJob = null
         captureJob?.cancel()
         captureJob = null
         toolFollowUpRetryJob?.cancel()
@@ -164,16 +209,19 @@ class StepFunRealtimePipeline(
         EventBus.emitVolume(0f)
     }
 
-    private suspend fun handleEvent(event: StepFunRealtimeProtocol.Event) {
+    private fun handleEvent(event: StepFunRealtimeProtocol.Event) = synchronized(sessionBoundaryLock) {
+        if (stopping) return@synchronized
         when (event) {
             StepFunRealtimeProtocol.Event.SessionCreated,
             StepFunRealtimeProtocol.Event.SessionUpdated,
             is StepFunRealtimeProtocol.Event.Unknown -> Unit
             StepFunRealtimeProtocol.Event.UserSpeechStarted -> {
+                synchronized(sessionBoundaryLock) { userSpeaking = true; responseInFlight = true; awaitingUserResponse = true }
                 interruptAssistantForBargeIn()
                 beginUserTranscriptTurn()
             }
             StepFunRealtimeProtocol.Event.UserSpeechStopped -> {
+                userSpeaking = false
                 markUserSpeechStopped()
                 onLog("Realtime 检测到用户语音结束")
             }
@@ -186,10 +234,17 @@ class StepFunRealtimePipeline(
             is StepFunRealtimeProtocol.Event.UserTranscriptDone -> if (acceptingVoiceTranscripts) {
                 finishUserTranscript(event.itemId, event.text)
             }
-            is StepFunRealtimeProtocol.Event.TextDelta -> appendAssistantText(event.itemId, event.text, TextSource.TEXT)
-            is StepFunRealtimeProtocol.Event.AudioTranscriptDelta -> appendAssistantText(event.itemId, event.text, TextSource.AUDIO_TRANSCRIPT)
-            is StepFunRealtimeProtocol.Event.ThinkingDelta -> appendThinking(event.itemId, event.text)
+            is StepFunRealtimeProtocol.Event.TextDelta -> {
+                if (warmingUp) {
+                    if (event.text.contains("READY", ignoreCase = true)) warmupReady?.complete(Unit)
+                } else {
+                    appendAssistantText(event.itemId, event.text, TextSource.TEXT)
+                }
+            }
+            is StepFunRealtimeProtocol.Event.AudioTranscriptDelta -> if (!warmingUp) appendAssistantText(event.itemId, event.text, TextSource.AUDIO_TRANSCRIPT)
+            is StepFunRealtimeProtocol.Event.ThinkingDelta -> if (!warmingUp) appendThinking(event.itemId, event.text)
             is StepFunRealtimeProtocol.Event.AudioDelta -> {
+                if (warmingUp) return@synchronized
                 activeAssistantItemId = event.itemId ?: activeAssistantItemId
                 runCatching { player.enqueue(Base64.getDecoder().decode(event.base64Audio)) }
                     .onFailure { error -> onLog("Realtime 音频入队失败：${error.message ?: error.javaClass.simpleName}") }
@@ -197,20 +252,32 @@ class StepFunRealtimePipeline(
             StepFunRealtimeProtocol.Event.AudioDone -> player.finishResponseAudio()
             is StepFunRealtimeProtocol.Event.FunctionArgumentsDone -> executeTool(event, sessionGeneration.get())
             StepFunRealtimeProtocol.Event.ResponseCreated -> {
+                awaitingUserResponse = false
+                responseInFlight = true
                 toolFollowUpRetryJob?.cancel()
                 toolFollowUpRetryJob = null
             }
             is StepFunRealtimeProtocol.Event.ResponseDone -> {
+                if (warmingUp) {
+                    responseInFlight = false
+                    warmupResponseDone?.complete(Unit)
+                    return@synchronized
+                }
                 finishAssistantResponse()
                 responseDone = true
+                responseInFlight = false
                 awaitingToolFollowUp = false
                 flushToolOutputsWhenPlaybackDrains()
+                flushMainReplies()
             }
             is StepFunRealtimeProtocol.Event.Error -> {
                 if (awaitingToolFollowUp && event.message.contains("ongoing response already exists", ignoreCase = true)) {
                     scheduleToolFollowUpRetry()
                 } else if (isStarted) {
+                    responseInFlight = false
+                    awaitingUserResponse = false
                     onLog(event.message)
+                    flushMainReplies()
                 } else {
                     notifyDisconnected(event.message)
                 }
@@ -409,6 +476,7 @@ class StepFunRealtimePipeline(
             return
         }
         val call = CloudSpeechClient.ToolCall(event.callId, event.name, event.arguments)
+        DiagLog.i("realtime.tool.call", "name=${call.name} callId=${call.id} argsChars=${call.arguments.length}")
         if (call.name == MainToolRegistry.TOOL_AGENT_SLEEP || call.name == MainToolRegistry.TOOL_REALTIME_HANGUP) {
             onSleepRequested()
             return
@@ -457,7 +525,7 @@ class StepFunRealtimePipeline(
                     }
                 }
                 synchronized(sessionBoundaryLock) {
-                    if (!isSessionCurrent(generation)) return@runCatching result
+                    if (!isSessionCurrent(generation)) { return@runCatching result }
                     store.addToolResultToConversation(
                         conversationId = conversationId,
                         turnId = "realtime-${UUID.randomUUID()}",
@@ -471,11 +539,12 @@ class StepFunRealtimePipeline(
                 ToolOutput(call.id, "工具执行失败：${error.message ?: error.javaClass.simpleName}", false)
             }
             synchronized(sessionBoundaryLock) {
-                if (!isSessionCurrent(generation)) return@launch
+                if (!isSessionCurrent(generation)) { return@launch }
                 finishToolStatus(call, output.success)
                 pendingToolOutputs += output.callId to output.content
                 pendingToolCount -= 1
             }
+            DiagLog.i("realtime.tool.result", "name=${call.name} callId=${call.id} success=${output.success} chars=${output.content.length}")
             flushToolOutputsWhenPlaybackDrains()
         }
     }
@@ -496,9 +565,10 @@ class StepFunRealtimePipeline(
         scope.launch {
             // Keep a short guard after response.done so tool follow-up cannot overlap spoken filler.
             delay(150)
-            if (!isSessionCurrent(generation)) return@launch
+            player.awaitPlaybackDrained()
+            if (!isSessionCurrent(generation)) { return@launch }
             val outputs = synchronized(sessionBoundaryLock) {
-                if (!isSessionCurrent(generation)) return@launch
+                if (!isSessionCurrent(generation)) { return@launch }
                 val copy = pendingToolOutputs.toList()
                 pendingToolOutputs.clear()
                 copy
@@ -508,9 +578,9 @@ class StepFunRealtimePipeline(
             awaitingToolFollowUp = true
             toolFollowUpRetryCount = 0
             runCatching {
-                if (!isSessionCurrent(generation)) return@runCatching
+                if (!isSessionCurrent(generation)) { return@runCatching }
                 outputs.forEach { (callId, content) -> client.sendFunctionOutput(callId, content) }
-                if (!isSessionCurrent(generation)) return@runCatching
+                if (!isSessionCurrent(generation)) { return@runCatching }
                 client.createResponse()
             }.onFailure { error ->
                 notifyDisconnected("工具结果发送失败：${error.message ?: error.javaClass.simpleName}")
@@ -536,11 +606,55 @@ class StepFunRealtimePipeline(
         }
     }
 
-    fun injectMainAssistantReply(text: String) {
+    fun injectMainAssistantReply(turnId: String, text: String, failed: Boolean = false): Boolean {
         val normalized = text.trim()
-        if (normalized.isBlank() || !isStarted) return
-        runCatching { client.sendContext("主会话后台进展（仅供当前通话了解，不需要复述这条上下文）：$normalized") }
-            .onFailure { onLog("主会话进展回灌失败：${it.message ?: it.javaClass.simpleName}") }
+        if (normalized.isBlank() || stopping) return false
+        synchronized(sessionBoundaryLock) {
+            if (stopping) return false
+            if (turnId in reportedMainTurns || turnId in pendingMainReplies) return true
+            pendingMainReplies[turnId] = normalized to failed
+        }
+        flushMainReplies()
+        return true
+    }
+
+    private fun canReportMainReply(): Boolean = synchronized(sessionBoundaryLock) {
+        RealtimeReportPolicy.canReport(isReady, userSpeaking, responseInFlight || awaitingUserResponse,
+            pendingToolCount, awaitingToolFollowUp || pendingToolOutputs.isNotEmpty())
+    }
+
+    private fun flushMainReplies() = synchronized(sessionBoundaryLock) {
+        if (stopping || mainReplyJob?.isActive == true || pendingMainReplies.isEmpty()) return@synchronized
+        val generation = sessionGeneration.get()
+        mainReplyJob = scope.launch {
+            try {
+                while (isSessionCurrent(generation)) {
+                    delay(200)
+                    if (!canReportMainReply()) continue
+                    player.awaitPlaybackDrained()
+                    synchronized(sessionBoundaryLock) {
+                        if (!isSessionCurrent(generation) || !canReportMainReply()) return@synchronized
+                        val entry = pendingMainReplies.entries.firstOrNull() ?: return@launch
+                        val (text, failed) = entry.value
+                        try {
+                            client.sendContext(if (failed) "主会话任务最终失败，请用自然中文向用户报告：$text" else
+                                "主会话任务已完成，请向用户汇报以下最终正文：$text")
+                            responseInFlight = true
+                            client.createResponse()
+                            pendingMainReplies.remove(entry.key)
+                            reportedMainTurns += entry.key
+                            if (reportedMainTurns.size > 128) reportedMainTurns.remove(reportedMainTurns.first())
+                        } catch (error: Exception) {
+                            responseInFlight = false
+                            onLog("主会话结果回灌失败：${error.message ?: error.javaClass.simpleName}")
+                            return@launch
+                        }
+                    }
+                }
+            } finally {
+                synchronized(sessionBoundaryLock) { mainReplyJob = null }
+            }
+        }
     }
 
     private fun realtimeToolDefinitions(): List<CloudSpeechClient.ToolDefinition> = tools.definitions(
@@ -549,8 +663,7 @@ class StepFunRealtimePipeline(
     )
 
     private fun defaultInstructions(): String = buildString {
-        append(buildMainSystemPrompt())
-        append("\n\n当前是全双工实时语音会话。回复应简洁自然；只能使用查询主会话、查询记忆和转交主会话工具。不要暴露内部思考。")
+        append(buildRealtimeSystemPrompt())
     }
 
     private data class UserDraft(

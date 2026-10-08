@@ -28,6 +28,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        registerActivityLifecycleCallbacks(AppVisibility)
         HubRuntime.initialize(this)
 
         if (BuildConfig.DEBUG) {

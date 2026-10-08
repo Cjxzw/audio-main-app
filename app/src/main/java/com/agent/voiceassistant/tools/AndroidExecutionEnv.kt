@@ -57,6 +57,7 @@ class AndroidExecutionEnv(
         val bytesWritten: Int,
         val mode: String,
         val sha256: String,
+        val warning: String? = null,
     )
 
     data class ExecResult(
@@ -73,6 +74,7 @@ class AndroidExecutionEnv(
         val contentType: String?,
         val body: String,
         val truncated: Boolean,
+        val headers: Map<String, List<String>> = emptyMap(),
     )
 
     private val appContext = context.applicationContext
@@ -173,10 +175,6 @@ class AndroidExecutionEnv(
         endLine: Int? = null,
         expectedSha256: String? = null,
     ): WriteResult {
-        require(content.toByteArray().size <= MAX_WRITE_BYTES) { "单次写入不能超过 $MAX_WRITE_BYTES 字节" }
-        require(content.split('\n').size <= MAX_WRITE_LINES) {
-            "单次写入最多 $MAX_WRITE_LINES 行；请先用 overwrite 写入首段，再用 append 分段追加"
-        }
         val file = pathResolver.resolve(path, write = true)
         file.parentFile?.mkdirs()
         val normalizedMode = mode.lowercase()
@@ -199,11 +197,19 @@ class AndroidExecutionEnv(
         }
         if (normalizedMode != "create") writeTextAtomically(file, updated)
         else file.writeText(updated, Charsets.UTF_8)
+        val bytes = content.toByteArray(Charsets.UTF_8).size
+        val lines = content.split('\n').size
+        val warning = if (lines > MAX_WRITE_LINES || bytes > MAX_WRITE_BYTES) {
+            "本次写入已成功，但内容为 $lines 行、$bytes 字节；下次建议分块写入，每段控制在 $MAX_WRITE_LINES 行和 $MAX_WRITE_BYTES 字节以内。"
+        } else {
+            null
+        }
         return WriteResult(
             path = pathResolver.normalize(path),
-            bytesWritten = content.toByteArray().size,
+            bytesWritten = bytes,
             mode = normalizedMode,
             sha256 = sha256(updated.toByteArray()),
+            warning = warning,
         )
     }
 
@@ -297,7 +303,9 @@ class AndroidExecutionEnv(
         contentType: String? = null,
         credentialProfile: String? = null,
         headers: Map<String, String> = emptyMap(),
+        timeoutMs: Int = 5_000,
     ): HttpResult = withContext(Dispatchers.IO) {
+        require(timeoutMs in 1_000..120_000) { "timeout_ms 必须在 1000 到 120000 之间" }
         val resolvedUrl = credentialProfile
             ?.takeIf(String::isNotBlank)
             ?.let { credentialStore.resolveUrl(it, url) }
@@ -317,15 +325,20 @@ class AndroidExecutionEnv(
             else -> null
         }
         val builder = Request.Builder().url(resolvedUrl).method(normalizedMethod, requestBody)
-        credentialProfile?.takeIf(String::isNotBlank)?.let { profile ->
-            if (expandedHeaders.isEmpty()) credentialStore.headers(profile).forEach(builder::addHeader)
-        }
-        expandedHeaders.forEach { (name, value) -> builder.addHeader(name, value) }
+        val savedHeaders = credentialProfile?.takeIf(String::isNotBlank)?.let(credentialStore::headers).orEmpty()
+        HttpRequestPolicy.headers(savedHeaders, expandedHeaders).forEach { (name, value) -> builder.header(name, value) }
         val request = builder.build()
         var lastTimeout: IOException? = null
-        repeat(MAX_HTTP_ATTEMPTS) {
+        val requestClient = httpClient.newBuilder()
+            .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .writeTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .retryOnConnectionFailure(normalizedMethod in setOf("GET", "HEAD"))
+            .build()
+        repeat(HttpRequestPolicy.attempts(normalizedMethod)) {
             try {
-                httpClient.newCall(request).execute().use { response ->
+                requestClient.newCall(request).execute().use { response ->
                     val responseBody = response.body
                     val bounded = responseBody?.source()?.let {
                         BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
@@ -335,6 +348,9 @@ class AndroidExecutionEnv(
                         contentType = responseBody?.contentType()?.toString(),
                         body = bounded.bytes.toString(Charsets.UTF_8),
                         truncated = bounded.truncated,
+                        headers = response.headers.toMultimap().filterKeys {
+                            !it.equals("set-cookie", true) && !it.equals("authorization", true)
+                        },
                     )
                 }
             } catch (error: InterruptedIOException) {
@@ -513,7 +529,6 @@ class AndroidExecutionEnv(
         private const val MAX_EXEC_ARG_CHARS = 4_000
         private const val MAX_EXEC_OUTPUT_CHARS = 40_000
         private const val MAX_HTTP_BODY_BYTES = 512 * 1024
-        private const val MAX_HTTP_ATTEMPTS = 2
         private val HTTP_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
     }
 }
@@ -586,16 +601,24 @@ class CredentialProfileStore(context: Context) {
         preferences.edit().putString(profile, encrypt(plaintext)).apply()
     }
 
-    fun putEntries(profile: String, entries: Map<String, String>, allowedUrlPrefixes: List<String>) {
+    fun putEntries(profile: String, entries: Map<String, String>, allowedUrlPrefixes: List<String>, baseUrl: String? = null) {
         require(profile.matches(Regex("[a-zA-Z0-9._-]{1,64}"))) { "凭据配置名称无效" }
         require(entries.isNotEmpty()) { "凭据至少需要一个键值" }
         entries.forEach { (name, value) ->
             require(name.matches(Regex("[A-Za-z0-9._-]{1,80}"))) { "凭据键名称无效" }
             require(!value.contains('\r') && !value.contains('\n')) { "凭据值不能换行" }
         }
+        val legacyHeaders = headers(profile)
         val plaintext = entries.entries.joinToString("\n") { (name, value) -> "$name=$value" }
-        preferences.edit()
+        val editor = preferences.edit()
+        if (legacyHeaders.isNotEmpty()) {
+            val updatedHeaders = entries.filterKeys { key -> legacyHeaders.keys.any { it.equals(key, true) } }
+            if (updatedHeaders.isEmpty()) editor.remove(profile) else editor.putString(profile,
+                encrypt(updatedHeaders.entries.joinToString("\n") { (key, value) -> "$key:$value" }))
+        }
+        editor
             .putString(entriesKey(profile), encrypt(plaintext))
+            .putString(baseUrlKey(profile), baseUrl?.trimEnd('/'))
             .putString(prefixesKey(profile), allowedUrlPrefixes.joinToString("\n") { it.trimEnd('/') + "/" })
             .apply()
     }
@@ -637,16 +660,8 @@ class CredentialProfileStore(context: Context) {
         }
     }
 
-    fun expandReferences(profile: String?, text: String?): String? {
-        if (text == null) return null
-        val pattern = Regex("\\{\\{credential\\.([A-Za-z0-9._-]+)\\.([A-Za-z0-9._-]+)}}")
-        return pattern.replace(text) { match ->
-            val referencedProfile = match.groupValues[1]
-            require(profile == referencedProfile) { "凭证引用的 profile 与请求 profile 不一致" }
-            entries(referencedProfile)[match.groupValues[2]]
-                ?: throw IOException("凭据 profile $referencedProfile 缺少键 ${match.groupValues[2]}")
-        }
-    }
+    fun expandReferences(profile: String?, text: String?): String? =
+        HttpRequestPolicy.expand(profile, text) { name, key -> entries(name)[key] }
 
     fun resolveUrl(profile: String, url: String): String {
         if (url.startsWith("https://") || url.startsWith("http://")) return url
@@ -656,9 +671,7 @@ class CredentialProfileStore(context: Context) {
         return "${baseUrl.trimEnd('/')}/${url.trimStart('/')}"
     }
 
-    fun availableProfiles(): List<Profile> = preferences.all.keys
-        .filterNot { it.endsWith(BASE_URL_SUFFIX) || it.endsWith(ENTRIES_SUFFIX) || it.endsWith(PREFIXES_SUFFIX) }
-        .sorted()
+    fun availableProfiles(): List<Profile> = HttpRequestPolicy.profileNames(preferences.all.keys)
         .map { name -> Profile(name, preferences.getString(baseUrlKey(name), null)) }
 
     fun delete(profile: String) {

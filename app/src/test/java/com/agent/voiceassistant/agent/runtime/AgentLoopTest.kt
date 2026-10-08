@@ -48,6 +48,46 @@ class AgentLoopTest {
     }
 
     @Test
+    fun `transport interruption automatically resumes once before completing`() = runBlocking {
+        val runtime = FakeRuntime(
+            responses = ArrayDeque(),
+            completions = ArrayDeque(
+                listOf(
+                    CloudSpeechClient.ChatCompletion(
+                        message = message(content = "网络中断前的内容。"),
+                        finishReason = null,
+                        modelId = "mimo-v2.5-pro",
+                        streamDiagnostics = CloudSpeechClient.StreamDiagnostics(
+                            protocolObserved = true,
+                            interruptionReason = "transport_InterruptedIOException",
+                        ),
+                    ),
+                    CloudSpeechClient.ChatCompletion(
+                        message = message(content = "恢复后的总结。"),
+                        finishReason = "stop",
+                        modelId = "mimo-v2.5-pro",
+                        streamDiagnostics = CloudSpeechClient.StreamDiagnostics(
+                            protocolObserved = true,
+                            receivedFinishEvent = true,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val outcome = AgentLoop(runtime).run(config())
+
+        assertEquals(AgentLoop.Outcome.Completed("网络中断前的内容。恢复后的总结。", true), outcome)
+        assertEquals(2, runtime.requests.size)
+        assertTrue(runtime.requests.last().messages.any {
+            it.role == "assistant" && it.content == "网络中断前的内容。"
+        })
+        assertTrue(runtime.requests.last().messages.any {
+            it.role == "system" && it.content.orEmpty().contains("连接中断")
+        })
+    }
+
+    @Test
     fun `reasoning only streamed response retries once with thinking disabled`() = runBlocking {
         val runtime = FakeRuntime(
             responses = ArrayDeque(),
@@ -138,7 +178,7 @@ class AgentLoopTest {
         )
 
         assertEquals(
-            AgentLoop.Outcome.Completed("这次没有生成可用回复，请再试一次。", true),
+            AgentLoop.Outcome.Completed("这次没有生成可用回复，请再试一次。", true, successful = false),
             outcome,
         )
         assertEquals(3, runtime.requests.size)

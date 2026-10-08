@@ -7,6 +7,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
@@ -46,14 +47,17 @@ internal class LlmHttpException(
     val responseBody: String,
 ) : IOException("LLM HTTP $statusCode: ${responseBody.take(500)}")
 
+internal class LlmTransportException(cause: IOException) : IOException("模型网络连接中断", cause)
+
 class OpenAiCompatibleLlmClient(
     private val config: LLMConfig,
 ) : LlmClient {
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(config.timeoutSeconds, TimeUnit.SECONDS)
+        .readTimeout(STREAM_IDLE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .writeTimeout(5, TimeUnit.SECONDS)
         .callTimeout(0, TimeUnit.SECONDS)
+        .pingInterval(30, TimeUnit.SECONDS)
         .build()
 
     override suspend fun streamChat(
@@ -125,10 +129,12 @@ class OpenAiCompatibleLlmClient(
         put("stream", true)
         val supportsNativeThinking = config.providerMode == LlmProviderMode.MIMO ||
             config.modelName.startsWith("deepseek", ignoreCase = true)
-        if (config.providerMode == LlmProviderMode.MIMO) {
-            put("max_completion_tokens", request.maxCompletionTokens)
-        } else {
-            put("max_tokens", request.maxCompletionTokens)
+        request.maxCompletionTokens?.let { limit ->
+            if (config.providerMode == LlmProviderMode.MIMO) {
+                put("max_completion_tokens", limit)
+            } else {
+                put("max_tokens", limit)
+            }
         }
         if (supportsNativeThinking) {
             putJsonObject("thinking") {
@@ -184,8 +190,8 @@ class OpenAiCompatibleLlmClient(
         var malformedEventCount = 0
         var streamingProtocol = false
         val call = newJsonCall(buildChatPayload(request)).also {
-            // The read timeout remains an idle-stream limit. A continuously streaming reply
-            // gets a longer bounded budget so it is not cancelled at the old 60-second mark.
+            // The watchdog below enforces the idle limit. This is only the total budget for
+            // one continuously streaming model response.
             it.timeout().timeout(STREAM_HARD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         }
         val receivedEvent = AtomicBoolean(false)
@@ -274,9 +280,11 @@ class OpenAiCompatibleLlmClient(
                     }
                 }
             }
-            val completion = accumulator.complete()
-            withDiagnostics(completion)
+            val interruptedEof = streamingProtocol && reachedEof && !receivedDoneMarker
+            val completion = accumulator.complete(discardToolCalls = interruptedEof)
+            withDiagnostics(completion, if (interruptedEof && !completion.streamDiagnostics.receivedFinishEvent) "transport_eof" else null)
         } catch (error: IOException) {
+            coroutineContext.ensureActive()
             if (firstEventTimedOut.get() && !receivedEvent.get()) {
                 throw FirstEventTimeoutException(error)
             }
@@ -284,18 +292,19 @@ class OpenAiCompatibleLlmClient(
                 val interruption = if (streamIdleTimedOut.get()) {
                     "idle_watchdog"
                 } else {
-                    "transport_${error.javaClass.simpleName}"
+                    "transport_${error.javaClass.simpleName}:${error.message.orEmpty().take(120)}"
                 }
                 Timber.w(
                     "LLM stream interrupted after output requestId=${request.requestId} " +
                         "reason=$interruption; returning partial completion for continuation",
                 )
-                return@coroutineScope withDiagnostics(accumulator.complete(), interruption)
+                return@coroutineScope withDiagnostics(accumulator.complete(discardToolCalls = true), interruption)
             }
             if (streamIdleTimedOut.get()) {
                 throw StreamIdleTimeoutException(error)
             }
-            throw error
+            if (error is LlmHttpException) throw error
+            throw LlmTransportException(error)
         } finally {
             watchdog.cancelAndJoin()
             cancellation?.dispose()
@@ -369,8 +378,10 @@ class OpenAiCompatibleLlmClient(
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         const val FIRST_EVENT_TIMEOUT_MS = 15_000L
-        const val STREAM_HARD_TIMEOUT_SECONDS = 120L
-        const val STREAM_IDLE_TIMEOUT_MS = 45_000L
+        // Long agent turns can legitimately run for several minutes on a phone. Keep a
+        // finite guard against a stuck request, but do not terminate normal long work early.
+        const val STREAM_HARD_TIMEOUT_SECONDS = 600L
+        const val STREAM_IDLE_TIMEOUT_MS = 120_000L
         const val STREAM_WATCHDOG_POLL_MS = 250L
         const val MAX_NETWORK_ATTEMPTS = 2
 

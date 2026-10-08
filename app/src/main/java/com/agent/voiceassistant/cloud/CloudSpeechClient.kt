@@ -94,7 +94,7 @@ class CloudSpeechClient(
         val messages: List<LlmMessage>,
         val tools: List<ToolDefinition>,
         val thinkingMode: ThinkingMode,
-        val maxCompletionTokens: Int,
+        val maxCompletionTokens: Int? = null,
         val responseFormat: ResponseFormat = ResponseFormat.TEXT,
         val transportAttemptLimit: Int = 2,
         val requestId: String = UUID.randomUUID().toString(),
@@ -707,8 +707,8 @@ internal class ChatStreamAccumulator {
         return events
     }
 
-    fun complete(): CloudSpeechClient.ChatCompletion {
-        val completedCalls = toolCalls.map { (index, pending) ->
+    fun complete(discardToolCalls: Boolean = false): CloudSpeechClient.ChatCompletion {
+        val completedCalls = (if (discardToolCalls) emptyMap() else toolCalls).map { (index, pending) ->
             val id = pending.id.trim()
             val name = pending.name.toString().trim()
             if (id.isEmpty() || name.isEmpty()) {

@@ -19,9 +19,9 @@
 
     <TextView
         android:id="@+id/tvToolState"
-        android:layout_width="32dp"
+        android:layout_width="40dp"
         android:layout_height="wrap_content"
-        android:gravity="end"
+        android:gravity="center"
         android:maxLines="1"
         android:textColor="@color/gray_500"
         android:textSize="12sp" />

@@ -36,7 +36,7 @@ class MainMediaLibraryService : MediaLibraryService() {
     private lateinit var assistantPlayer: AssistantMediaPlayer
     private lateinit var librarySession: MediaLibrarySession
     private var currentActive = false
-    private var currentStatus = "休眠中，等待唤醒"
+    private var currentStatus = "Realtime 已挂断"
 
     override fun onCreate() {
         super.onCreate()
@@ -128,7 +128,7 @@ class MainMediaLibraryService : MediaLibraryService() {
             .build()
         addSession(librarySession)
         activeInstance = this
-        assistantPlayer.setAssistantState(active = false, status = "休眠中")
+        assistantPlayer.setAssistantState(active = false, status = "Realtime 已挂断")
         publishUnifiedNotification()
         DiagLog.i("media3.service.ready", "session=$SESSION_ID", showInUi = true)
     }
@@ -179,7 +179,7 @@ class MainMediaLibraryService : MediaLibraryService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val controlIntent = Intent(this, VoiceAgentService::class.java)
-            .setAction(if (active) VoiceAgentService.ACTION_SLEEP else VoiceAgentService.ACTION_WAKE)
+            .setAction(if (active) VoiceAgentService.ACTION_REALTIME_STOP else VoiceAgentService.ACTION_REALTIME_START)
         val controlAction = PendingIntent.getService(
             this,
             if (active) 42 else 41,
@@ -187,7 +187,7 @@ class MainMediaLibraryService : MediaLibraryService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val actionIcon = if (active) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-        val actionText = if (active) "休眠" else "唤醒"
+        val actionText = if (active) "暂停" else "播放"
 
         return NotificationCompat.Builder(this, AssistantNotificationContract.CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
@@ -243,9 +243,9 @@ class MainMediaLibraryService : MediaLibraryService() {
             startServiceCompat(context, Intent(context, MainMediaLibraryService::class.java))
         }
 
-        fun buildForegroundNotification(active: Boolean, status: String): Notification? {
+        fun buildForegroundNotification(): Notification? {
             val service = activeInstance ?: return null
-            return service.buildUnifiedNotification(active, status)
+            return service.buildUnifiedNotification(service.currentActive, service.currentStatus)
         }
 
         fun publishState(context: android.content.Context, active: Boolean, status: String) {

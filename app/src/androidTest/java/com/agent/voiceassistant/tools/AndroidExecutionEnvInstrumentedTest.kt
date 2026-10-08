@@ -22,7 +22,7 @@ class AndroidExecutionEnvInstrumentedTest {
         env.write("/workspace/instrumentation-check.txt", "ok")
         assertEquals("ok", env.read("/workspace/instrumentation-check.txt").content)
 
-        val command = env.exec("pwd", cwd = "/source", timeoutSeconds = 5)
+        val command = env.exec(listOf("pwd"), cwd = "/source", timeoutSeconds = 5)
         assertEquals(0, command.exitCode)
         assertTrue(command.output.endsWith("/agent-runtime/source"))
     }

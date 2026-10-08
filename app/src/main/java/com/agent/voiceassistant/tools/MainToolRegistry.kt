@@ -506,7 +506,7 @@ class MainToolRegistry(
 
     private fun delegateToMain() = tool(
         name = TOOL_DELEGATE_TO_MAIN,
-        description = "把一段用户意图插入主会话，交由主会话在下一次文本回合处理。主会话忙碌时不会排队，会直接返回繁忙。不能直接委派到远端。",
+        description = "异步把一段用户意图提交给主会话处理。调用会立即返回受理状态，不等待任务完成；主会话完成后系统会把结果送回当前 Realtime 通话。主会话忙碌时可能返回繁忙。不能直接委派到远端。",
         required = listOf("content"),
     ) {
         putJsonObject("content") {
@@ -696,7 +696,7 @@ class MainToolRegistry(
 
     private fun writeFile() = tool(
         name = TOOL_WRITE,
-        description = "在 /workspace 中创建、覆盖、追加或按行补丁 UTF-8 文本文件。不得写入源码、日志或 Skill 目录；单次 content 最多 50 行且不超过 8 KiB。大文本必须分段写入。",
+        description = "在 /workspace 中创建、覆盖、追加或按行补丁 UTF-8 文本文件。大文本或诊断报告应优先分段写入：先 overwrite/create 首段，再用 append 续写；每段建议最多 50 行且不超过 8 KiB。即使一次写入超过建议值，工具仍会完成写入并返回警告；不得写入源码、日志或 Skill 目录。",
         required = listOf("path", "content"),
     ) {
         putJsonObject("path") {
@@ -705,7 +705,7 @@ class MainToolRegistry(
         }
         putJsonObject("content") {
             put("type", "string")
-            put("description", "写入文本；单次最多 50 行且不超过 8 KiB。大文本先用 overwrite 写首段，后续使用 append，每段最多 50 行。多数已有文件复制请用 exec 的 cp argv")
+            put("description", "写入文本。最佳实践是每段最多 50 行且不超过 8 KiB：第一段用 overwrite（新文件可用 create），后续用 append；超过建议值仍会写入成功，但结果会给出警告。多数已有文件复制请用 exec 的 cp argv。")
         }
         putJsonObject("mode") {
             put("type", "string")
@@ -786,6 +786,12 @@ class MainToolRegistry(
             put("type", "object")
             put("additionalProperties", buildJsonObject { put("type", "string") })
             put("description", "完整请求 Header；敏感值使用 {{credential.profile.key}} 引用")
+        }
+        putJsonObject("timeout_ms") {
+            put("type", "integer")
+            put("minimum", 1000)
+            put("maximum", 120000)
+            put("description", "单次请求超时毫秒数，默认 5000；POST 等写入请求不自动重试")
         }
         putJsonObject("credential_profile") {
             put("type", "string")

@@ -9,6 +9,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.service.EventBus
+import com.agent.voiceassistant.service.RealtimeState
 import com.agent.voiceassistant.service.VoiceAgentService
 import com.agent.voiceassistant.service.ServiceState
 import com.agent.voiceassistant.ui.ChatAdapter
@@ -55,8 +56,23 @@ class RealtimeActivity : AppCompatActivity() {
             EventBus.volumeEvents.collectLatest { level -> voiceBar.setLevel(level) }
         }
         lifecycleScope.launch {
+            EventBus.realtimeStates.collectLatest { state ->
+                findViewById<android.widget.TextView>(R.id.tvRealtimeStatus).text = when (state) {
+                    RealtimeState.CONNECTING -> "正在连接 Realtime…"
+                    RealtimeState.READY -> "StepFun Realtime · 已连接"
+                    RealtimeState.FAILED -> "Realtime 连接失败"
+                    RealtimeState.STOPPED -> "Realtime 已挂断"
+                }
+            }
+        }
+        lifecycleScope.launch {
             EventBus.states.collectLatest { state ->
                 if (state == ServiceState.LISTENING) sessionObserved = true
+                if (state == ServiceState.LISTENING) {
+                    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else if (state in setOf(ServiceState.IDLE, ServiceState.DORMANT, ServiceState.FAILED)) {
+                    window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
                 if (sessionObserved && state in setOf(ServiceState.IDLE, ServiceState.DORMANT, ServiceState.FAILED)) {
                     finish()
                 }
@@ -67,6 +83,11 @@ class RealtimeActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         bindConversation()
+    }
+
+    override fun onDestroy() {
+        window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        super.onDestroy()
     }
 
     private fun bindConversation() {

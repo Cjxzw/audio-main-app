@@ -20,4 +20,12 @@ class AudioInputRoutePolicyTest {
                 AudioInputRoutePolicy.priority(AudioDeviceInfo.TYPE_BUILTIN_MIC, Int.MIN_VALUE),
         )
     }
+
+    @Test
+    fun `remote submix never wins over built in microphone`() {
+        assertTrue(
+            AudioInputRoutePolicy.priority(AudioDeviceInfo.TYPE_REMOTE_SUBMIX, Int.MIN_VALUE) >
+                AudioInputRoutePolicy.priority(AudioDeviceInfo.TYPE_BUILTIN_MIC, Int.MIN_VALUE),
+        )
+    }
 }

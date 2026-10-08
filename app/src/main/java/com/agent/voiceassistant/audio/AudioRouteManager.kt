@@ -443,6 +443,7 @@ internal object AudioInputRoutePolicy {
         AudioDeviceInfo.TYPE_USB_ACCESSORY -> 5
         AudioDeviceInfo.TYPE_BUILTIN_MIC -> 50
         AudioDeviceInfo.TYPE_TELEPHONY -> 60
-        else -> 40
+        // Unknown and virtual sources such as REMOTE_SUBMIX must not outrank a real microphone.
+        else -> 100
     }
 }

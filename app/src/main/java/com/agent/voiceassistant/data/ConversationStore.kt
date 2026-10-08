@@ -343,6 +343,25 @@ class ConversationStore(context: Context) {
         }.trim()
     }
 
+    fun realtimeStartupSnapshot(conversationId: String): String = synchronized(lock) {
+        val messages = state.sessions.firstOrNull { it.id == conversationId }?.messages.orEmpty()
+        RealtimeContextProjection.snapshot(messages)
+    }
+
+    /** Persist the handover and its cursor together, including across reconnects/process restarts. */
+    fun transferRealtimeTranscript(sourceId: String, targetId: String) = synchronized(lock) {
+        val source = state.sessions.firstOrNull { it.id == sourceId } ?: return@synchronized
+        val target = state.sessions.firstOrNull { it.id == targetId } ?: return@synchronized
+        val transcript = RealtimeContextProjection.transcript(source.messages.drop(source.realtimeHandoverCount))
+        if (transcript.isNotBlank()) {
+            val endedAt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())
+            target.pendingContextNotes += "Realtime 通话记录（$endedAt）：\n$transcript"
+            target.updatedAt = System.currentTimeMillis()
+        }
+        source.realtimeHandoverCount = source.messages.size
+        persistLocked()
+    }
+
     fun appendPendingContextNote(conversationId: String, note: String) = synchronized(lock) {
         val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized
         val normalized = note.trim().takeIf { it.isNotBlank() } ?: return@synchronized
@@ -351,13 +370,14 @@ class ConversationStore(context: Context) {
         persistLocked()
     }
 
-    fun consumePendingContextNotes(conversationId: String = currentConversationId): List<String> = synchronized(lock) {
+    fun realtimeContextNotes(conversationId: String = currentConversationId): List<String> = synchronized(lock) {
         val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized emptyList()
-        if (session.pendingContextNotes.isEmpty()) return@synchronized emptyList()
-        val notes = session.pendingContextNotes.toList()
-        session.pendingContextNotes.clear()
-        persistLocked()
-        notes
+        if (session.pendingContextNotes.isNotEmpty()) {
+            session.realtimeContextNotes.addAll(session.pendingContextNotes)
+            session.pendingContextNotes.clear()
+            persistLocked()
+        }
+        session.realtimeContextNotes.toList()
     }
 
     fun setLlmContent(messageId: String, content: String) = synchronized(lock) {
@@ -1190,6 +1210,8 @@ data class ConversationSession(
     var contextSnapshot: String? = null,
     var memoryCompressedAt: Long? = null,
     val pendingContextNotes: MutableList<String> = mutableListOf(),
+    var realtimeHandoverCount: Int = 0,
+    val realtimeContextNotes: MutableList<String> = mutableListOf(),
     var ruleLedger: ConversationRuleLedger? = null,
     val skillSnapshots: MutableList<StoredSkillSnapshot> = mutableListOf(),
 )
