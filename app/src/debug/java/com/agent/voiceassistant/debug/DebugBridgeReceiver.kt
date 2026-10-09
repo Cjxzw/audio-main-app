@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.agent.voiceassistant.BuildConfig
+import com.agent.voiceassistant.RealtimeActivity
 import com.agent.voiceassistant.agent.LlmProviderMode
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.service.EventBus
@@ -365,7 +366,16 @@ class DebugBridgeReceiver : BroadcastReceiver() {
     }
 
     private fun realtimeAction(context: Context, request: DebugBridgeRequest, startedAt: Long, start: Boolean): JsonObject {
-        if (start) VoiceAgentService.startRealtime(context) else VoiceAgentService.stopRealtime(context)
+        if (start) {
+            VoiceAgentService.startRealtime(context)
+            context.startActivity(
+                Intent(context, RealtimeActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                ),
+            )
+        } else {
+            VoiceAgentService.stopRealtime(context)
+        }
         return success(request, if (start) "realtime_start_requested" else "realtime_stop_requested",
             if (start) "已请求启动 Realtime" else "已请求停止 Realtime", startedAt)
     }
