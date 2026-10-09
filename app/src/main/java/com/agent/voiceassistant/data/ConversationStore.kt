@@ -663,10 +663,10 @@ class ConversationStore(context: Context) {
     fun conversationForCompression(id: String = currentConversationId): ConversationCompressionSource? =
         synchronized(lock) {
             val session = state.sessions.firstOrNull { it.id == id } ?: return@synchronized null
-            if (session.memoryCompressedAt != null && session.memoryCompressedAt!! >= session.updatedAt) {
-                return@synchronized null
-            }
+            val cursor = session.compactedUpToMessageId
+            val cursorIndex = cursor?.let { value -> session.messages.indexOfFirst { it.id == value } } ?: -1
             val messages = session.messages
+                .drop(cursorIndex + 1)
                 .filter { it.role == "user" || it.role == "assistant" }
                 .filter { it.content.isNotBlank() }
                 .map { ConversationCompressionMessage(it.id, it.role, it.content, it.timestamp) }
@@ -725,6 +725,9 @@ class ConversationStore(context: Context) {
                 )
             }
         }
+        // Advance even when the model returned an empty memory list. This is a
+        // message cursor, so the next compaction only sends new content.
+        session.compactedUpToMessageId = session.messages.lastOrNull()?.id
         session.memoryCompressedAt = compressedAt
         trimMemoriesLocked()
         persistLocked()
@@ -1209,6 +1212,7 @@ data class ConversationSession(
     val messages: MutableList<StoredMessage> = mutableListOf(),
     var contextSnapshot: String? = null,
     var memoryCompressedAt: Long? = null,
+    var compactedUpToMessageId: String? = null,
     val pendingContextNotes: MutableList<String> = mutableListOf(),
     var realtimeHandoverCount: Int = 0,
     val realtimeContextNotes: MutableList<String> = mutableListOf(),

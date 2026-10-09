@@ -3459,9 +3459,6 @@ class VoiceAgentService : Service() {
         speakReplies: Boolean = true,
     ): Boolean {
         val previousConversationId = store.currentConversationId
-        val memorySource = store.conversationForCompression(previousConversationId)
-        val memorySnapshot = memorySource?.let { buildBackgroundSnapshot(previousConversationId) }
-        val memoryProvider = llmProviderRepository.activeProfile()
         store.startNewConversation(
             reason = text,
             domain = ConversationDomain.STANDARD,
@@ -3469,16 +3466,6 @@ class VoiceAgentService : Service() {
         locationProvider.refreshInBackground("new_topic")
         EventBus.emitChatReset(emptyList())
         EventBus.emitConversationUpdate()
-        if (memorySource != null && memorySnapshot != null) {
-            enqueueBackgroundTask(
-                BackgroundLlmTask.Memory(
-                    taskId = UUID.randomUUID().toString(),
-                    provider = memoryProvider,
-                    snapshot = memorySnapshot,
-                    source = memorySource,
-                ),
-            )
-        }
         if (!greet) {
             emitLog("已开启新会话")
             return true

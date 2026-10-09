@@ -42,6 +42,28 @@ class RealtimeContextProjectionTest {
         assertEquals(60, transcript.windowed(longText.length).count { it == longText })
     }
 
+    @Test fun transcriptKeepsOnlyUserAndFinalAssistant正文() {
+        val messages = listOf(
+            message("user", "查一下"),
+            message("assistant", "我先查一下").copy(reasoningText = "隐藏思考", toolCalls = listOf(StoredToolCall("c", "search", "秘密参数"))),
+            message("tool", "秘密工具结果").copy(toolCallId = "c", toolStatus = "SUCCEEDED"),
+            message("assistant", "最终答案"),
+        )
+        val transcript = RealtimeContextProjection.transcript(messages)
+        assertTrue(transcript.contains("用户：查一下"))
+        assertTrue(transcript.contains("助手：我先查一下"))
+        assertTrue(transcript.contains("助手：最终答案"))
+        assertFalse(transcript.contains("秘密工具结果"))
+        assertFalse(transcript.contains("[工具调用]"))
+    }
+
+    @Test fun transcriptCollapsesEchoedUserLines() {
+        val transcript = RealtimeContextProjection.transcript(
+            listOf(message("user", "你好"), message("assistant", "你好"), message("user", "你好")),
+        )
+        assertEquals(2, transcript.lines().size)
+    }
+
     @Test fun taggedThinkingIsExcludedFromContextAndReports() {
         val raw = "<thinking>内部思考</thinking><answer>最终正文</answer><DETAILS>用户可见详情</DETAILS>"
         val projected = RealtimeContextProjection.transcript(listOf(message("assistant", raw)))
