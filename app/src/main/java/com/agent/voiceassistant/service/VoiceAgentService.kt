@@ -1257,6 +1257,7 @@ class VoiceAgentService : Service() {
     }
 
     private fun invalidateRealtimePipeline(reason: String) {
+        if (!realtimeActive) return
         MainMediaLibraryService.publishState(this, active = realtimeActive,
             status = if (realtimeActive) "Realtime 正在重连" else "Realtime 已挂断")
         stepFunRealtimePipeline?.stop()
@@ -1347,6 +1348,9 @@ class VoiceAgentService : Service() {
                 MainMediaLibraryService.publishState(this@VoiceAgentService, active = true, status = "Realtime 聆听中")
                 updateNotification("Realtime 聆听中...")
             }.onFailure {
+                // A user initiated stop cancels the warmup coroutine; never report that stale
+                // cancellation or schedule another reconnect after the call has ended.
+                if (it is CancellationException || !realtimeActive) return@onFailure
                 EventBus.emitRealtimeState(RealtimeState.FAILED)
                 invalidateRealtimePipeline("启动失败：${it.message ?: it.javaClass.simpleName}")
             }

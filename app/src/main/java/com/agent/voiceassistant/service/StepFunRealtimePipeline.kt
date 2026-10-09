@@ -85,6 +85,7 @@ class StepFunRealtimePipeline(
     @Volatile private var warmingUp = true
     private var warmupReady: CompletableDeferred<Unit>? = null
     private var warmupResponseDone: CompletableDeferred<Unit>? = null
+    private var warmupStopped: CompletableDeferred<Unit>? = null
     private val disconnectReported = AtomicBoolean(false)
     private val sessionFinishedNotified = AtomicBoolean(false)
     @Volatile private var userSpeaking = false
@@ -118,16 +119,26 @@ class StepFunRealtimePipeline(
         warmingUp = true
         warmupReady = CompletableDeferred()
         warmupResponseDone = CompletableDeferred()
+        warmupStopped = CompletableDeferred()
         client.sendText("[系统预热] 连接初始化检查。只返回 READY，不要调用工具，不要输出其他内容。")
-        runCatching { withTimeout(15_000L) { warmupReady?.await(); warmupResponseDone?.await() } }
-            .onFailure {
-                warmingUp = false
-                warmupReady = null
-                warmupResponseDone = null
-                throw IllegalStateException("Realtime 预热失败：${it.message ?: it.javaClass.simpleName}", it)
+        runCatching {
+            withTimeout(15_000L) {
+                kotlinx.coroutines.selects.select<Unit> {
+                    warmupResponseDone!!.onAwait { }
+                    warmupStopped!!.onAwait { throw kotlinx.coroutines.CancellationException("Realtime 预热已停止") }
+                }
             }
+        }.onFailure {
+            warmingUp = false
+            warmupReady = null
+            warmupResponseDone = null
+            warmupStopped = null
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            throw IllegalStateException("Realtime 预热失败：${it.message ?: it.javaClass.simpleName}", it)
+        }
         warmupReady = null
         warmupResponseDone = null
+        warmupStopped = null
         val snapshot = mainSnapshot()
         client.sendContext("这是通话开始时的主会话快照，可能已过期；需要更早或更细的内容请调用 main_conversation_query。\n" +
             snapshot.ifBlank { "最近没有可注入的完整轮次。" })
@@ -183,6 +194,7 @@ class StepFunRealtimePipeline(
             store.deleteMessage(messageId)
             EventBus.emitChatRemoval(messageId)
         }
+        warmupStopped?.complete(Unit)
         if (sessionFinishedNotified.compareAndSet(false, true)) {
             userDraft?.takeIf { !it.completed }?.let {
                 if (it.text.isBlank()) it.text.append(it.candidateTranscript.orEmpty())
@@ -249,7 +261,9 @@ class StepFunRealtimePipeline(
                 runCatching { player.enqueue(Base64.getDecoder().decode(event.base64Audio)) }
                     .onFailure { error -> onLog("Realtime 音频入队失败：${error.message ?: error.javaClass.simpleName}") }
             }
-            StepFunRealtimeProtocol.Event.AudioDone -> player.finishResponseAudio()
+            StepFunRealtimeProtocol.Event.AudioDone -> {
+                if (!warmingUp && !stopping) player.finishResponseAudio()
+            }
             is StepFunRealtimeProtocol.Event.FunctionArgumentsDone -> executeTool(event, sessionGeneration.get())
             StepFunRealtimeProtocol.Event.ResponseCreated -> {
                 awaitingUserResponse = false
@@ -260,6 +274,9 @@ class StepFunRealtimePipeline(
             is StepFunRealtimeProtocol.Event.ResponseDone -> {
                 if (warmingUp) {
                     responseInFlight = false
+                    // response.done is authoritative: Realtime may return the warmup reply
+                    // on audio_transcript/audio tracks instead of response.text.delta.
+                    warmupReady?.complete(Unit)
                     warmupResponseDone?.complete(Unit)
                     return@synchronized
                 }
