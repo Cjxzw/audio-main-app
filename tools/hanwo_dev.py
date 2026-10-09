@@ -257,6 +257,8 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_clear.add_argument("--confirm", action="store_true", required=True)
     realtime_actions.add_parser("start", help="请求启动 Realtime")
     realtime_actions.add_parser("stop", help="请求停止 Realtime")
+    realtime_text = realtime_actions.add_parser("text", help="向当前 Realtime 会话提交文本")
+    realtime_text.add_argument("text")
 
     credentials = commands.add_parser("credentials", help="凭据 profile（仅显示脱敏摘要）")
     credentials.add_subparsers(dest="action", required=True).add_parser("list", help="列出 profile")
@@ -348,6 +350,8 @@ def bridge_command(args: argparse.Namespace) -> tuple[str, dict[str, object], fl
             return "realtime.set", arguments, None
         if args.action in {"start", "stop"}:
             return f"realtime.{args.action}", {}, None
+        if args.action == "text":
+            return "realtime.text", {"text": args.text}, 15.0
         return "realtime.clear", {"confirm": args.confirm}, None
     if args.group == "http":
         headers: dict[str, str] = {}

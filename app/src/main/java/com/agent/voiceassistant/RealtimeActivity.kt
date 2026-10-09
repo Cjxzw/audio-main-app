@@ -1,6 +1,8 @@
 package com.agent.voiceassistant
 
 import android.os.Bundle
+import android.view.inputmethod.EditorInfo
+import android.widget.EditText
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -31,9 +33,28 @@ class RealtimeActivity : AppCompatActivity() {
         adapter = ChatAdapter()
         val list = findViewById<RecyclerView>(R.id.rvRealtimeChat)
         val voiceBar = findViewById<VoiceBarView>(R.id.realtimeVoiceBar)
+        val textInput = findViewById<EditText>(R.id.etRealtimeTextInput)
+        val sendButton = findViewById<View>(R.id.btnRealtimeSendText)
         list.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
         list.itemAnimator = null
         list.adapter = adapter
+        fun sendText() {
+            val text = textInput.text?.toString()?.trim().orEmpty()
+            if (text.isBlank()) return
+            textInput.setText("")
+            VoiceAgentService.sendText(this, text)
+        }
+        sendButton.setOnClickListener { sendText() }
+        textInput.setOnEditorActionListener { _, actionId, event ->
+            if (actionId == EditorInfo.IME_ACTION_SEND ||
+                (event?.keyCode == android.view.KeyEvent.KEYCODE_ENTER && event.isShiftPressed.not())
+            ) {
+                sendText()
+                true
+            } else {
+                false
+            }
+        }
         findViewById<View>(R.id.btnRealtimeClose).setOnClickListener {
             VoiceAgentService.stopRealtime(this)
             finish()

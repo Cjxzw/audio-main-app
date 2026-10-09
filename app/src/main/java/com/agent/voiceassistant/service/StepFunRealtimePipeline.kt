@@ -495,6 +495,7 @@ class StepFunRealtimePipeline(
         val call = CloudSpeechClient.ToolCall(event.callId, event.name, event.arguments)
         DiagLog.i("realtime.tool.call", "name=${call.name} callId=${call.id} argsChars=${call.arguments.length}")
         if (call.name == MainToolRegistry.TOOL_AGENT_SLEEP || call.name == MainToolRegistry.TOOL_REALTIME_HANGUP) {
+            recordTerminalToolCall(call)
             onSleepRequested()
             return
         }
@@ -563,6 +564,33 @@ class StepFunRealtimePipeline(
             }
             DiagLog.i("realtime.tool.result", "name=${call.name} callId=${call.id} success=${output.success} chars=${output.content.length}")
             flushToolOutputsWhenPlaybackDrains()
+        }
+    }
+
+    /** Persist terminal controls so the transcript proves that the model used the tool. */
+    private fun recordTerminalToolCall(call: CloudSpeechClient.ToolCall) {
+        synchronized(sessionBoundaryLock) {
+            if (stopping) return
+            val summary = tools.displaySummary(call) ?: tools.displayName(call.name)
+            val stored = store.addMessageToConversation(
+                conversationId = conversationId,
+                role = "system",
+                content = summary,
+                toolCallId = call.id,
+                toolStatus = ToolDisplayStatus.SUCCEEDED,
+                llmVisible = false,
+            )
+            EventBus.emitChatMessage(
+                ChatMessage(
+                    role = ChatRole.SYSTEM,
+                    text = summary,
+                    timestamp = stored.timestamp,
+                    messageId = stored.id,
+                    toolCallId = call.id,
+                    toolStatus = ToolDisplayStatus.SUCCEEDED,
+                    conversationId = conversationId,
+                ),
+            )
         }
     }
 

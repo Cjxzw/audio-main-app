@@ -106,6 +106,7 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         "agent.sleep" -> serviceAction(context, request, startedAt, wake = false)
         "realtime.start" -> realtimeAction(context, request, startedAt, start = true)
         "realtime.stop" -> realtimeAction(context, request, startedAt, start = false)
+        "realtime.text" -> realtimeText(context, request, startedAt)
         "http.request" -> httpRequest(context, request, startedAt)
         "turn.run" -> runTurn(context, request, startedAt)
         else -> error("未知调试命令：${request.command}")
@@ -367,6 +368,15 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         if (start) VoiceAgentService.startRealtime(context) else VoiceAgentService.stopRealtime(context)
         return success(request, if (start) "realtime_start_requested" else "realtime_stop_requested",
             if (start) "已请求启动 Realtime" else "已请求停止 Realtime", startedAt)
+    }
+
+    private fun realtimeText(context: Context, request: DebugBridgeRequest, startedAt: Long): JsonObject {
+        val text = request.arguments.string("text")?.trim().orEmpty()
+        require(text.isNotBlank()) { "缺少非空 text" }
+        VoiceAgentService.sendText(context, text)
+        return success(request, "realtime_text_accepted", "Realtime 文本已提交", startedAt, buildJsonObject {
+            put("text", text)
+        })
     }
 
     private fun httpRequest(context: Context, request: DebugBridgeRequest, startedAt: Long): JsonObject {

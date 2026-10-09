@@ -37,6 +37,12 @@ class StepFunRealtimeProtocolTest {
     }
 
     @Test
+    fun `encodes startup context with an accepted conversation role`() {
+        val event = StepFunRealtimeProtocol.createContextMessage("主会话快照")
+        assertEquals("assistant", event["item"]!!.jsonObject["role"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `parses text audio reasoning and a finished function call`() {
         assertEquals(
             StepFunRealtimeProtocol.Event.TextDelta("item_1", "你好"),

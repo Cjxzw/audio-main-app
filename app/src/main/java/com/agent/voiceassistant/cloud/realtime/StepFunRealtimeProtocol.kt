@@ -115,7 +115,10 @@ object StepFunRealtimeProtocol {
     fun createContextMessage(text: String): JsonObject = clientEvent("conversation.item.create") {
         putJsonObject("item") {
             put("type", "message")
-            put("role", "system")
+            // Step Realtime accepts only user/assistant conversation items. The
+            // startup snapshot is context supplied by the app, so encode it as
+            // an assistant-side context message instead of the rejected system role.
+            put("role", "assistant")
             putJsonArray("content") {
                 add(buildJsonObject {
                     put("type", "input_text")
