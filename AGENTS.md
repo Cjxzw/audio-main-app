@@ -14,3 +14,9 @@
 ## Android 无线 ADB 连接约定
 
 排查或验证 Android App 前，先执行 `adb devices -l` 和 `adb mdns services` 自动发现无线调试服务；发现 `_adb-tls-connect._tcp` 后，优先使用发现的服务连接并再次确认 `adb devices -l` 显示状态为 `device`。如果自动发现或连接失败，先执行 `adb kill-server`、`adb start-server`，再重新执行 mDNS 发现。只有用户提供了明确的新连接端口且自动发现仍不可用时，才执行 `ADB_MDNS=0 adb connect <IP>:<端口>`；不要假设旧 IP 或端口仍有效。
+
+## Debug CLI 与模拟器约定
+
+- 读取状态、日志、会话、凭据摘要、Realtime 生命周期或 HTTP 工具时，优先使用 `tools/hanwo-dev`，避免逐步点击 UI。组合诊断使用 `./tools/hanwo-dev inspect all`，日志使用 `logs tail|grep|snapshot`。
+- HTTP 回归使用 `./tools/hanwo-dev http request ...`，它复用 App 的正式 URL 前缀、凭据和响应截断策略；不得在命令行写入真实密钥。
+- 本机 Apple Silicon 模拟器使用 AVD `hanwo-api34`。启动命令为 `$ANDROID_HOME/emulator/emulator -avd hanwo-api34 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect`；模拟器用于生命周期、持久化和网络验证，蓝牙、真实音频路由和厂商后台策略仍需无线 ADB 手机实测。

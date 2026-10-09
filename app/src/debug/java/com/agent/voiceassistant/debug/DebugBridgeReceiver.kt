@@ -15,14 +15,17 @@ import com.agent.voiceassistant.settings.MimoApiRepository
 import com.agent.voiceassistant.settings.RealtimePipelineRepository
 import com.agent.voiceassistant.settings.StepFunRealtimeConfig
 import com.agent.voiceassistant.settings.VoicePipeline
+import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.ui.ChatRole
 import com.agent.voiceassistant.ui.ChatStreamState
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -73,6 +76,9 @@ class DebugBridgeReceiver : BroadcastReceiver() {
     ): JsonObject = when (request.command) {
         "status" -> success(request, "status", "Hanwo 调试状态已读取", startedAt, status(context))
         "config.show" -> success(request, "config", "配置状态已读取", startedAt, config(context))
+        "credentials.list" -> success(request, "credentials", "凭据 profile 已读取", startedAt, buildJsonObject {
+            put("profiles", AndroidExecutionEnv(context).credentialProfileSummary())
+        })
         "key.set" -> setMimoKey(context, request, startedAt)
         "key.clear" -> clearMimoKey(context, request, startedAt)
         "realtime.set" -> setRealtime(context, request, startedAt)
@@ -98,6 +104,9 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         "conversation.clear" -> clearConversations(context, request, startedAt)
         "agent.wake" -> serviceAction(context, request, startedAt, wake = true)
         "agent.sleep" -> serviceAction(context, request, startedAt, wake = false)
+        "realtime.start" -> realtimeAction(context, request, startedAt, start = true)
+        "realtime.stop" -> realtimeAction(context, request, startedAt, start = false)
+        "http.request" -> httpRequest(context, request, startedAt)
         "turn.run" -> runTurn(context, request, startedAt)
         else -> error("未知调试命令：${request.command}")
     }
@@ -352,6 +361,38 @@ class DebugBridgeReceiver : BroadcastReceiver() {
             if (wake) "已请求唤醒" else "已请求休眠",
             startedAt,
         )
+    }
+
+    private fun realtimeAction(context: Context, request: DebugBridgeRequest, startedAt: Long, start: Boolean): JsonObject {
+        if (start) VoiceAgentService.startRealtime(context) else VoiceAgentService.stopRealtime(context)
+        return success(request, if (start) "realtime_start_requested" else "realtime_stop_requested",
+            if (start) "已请求启动 Realtime" else "已请求停止 Realtime", startedAt)
+    }
+
+    private fun httpRequest(context: Context, request: DebugBridgeRequest, startedAt: Long): JsonObject {
+        val args = request.arguments
+        val headers = args["headers"]?.let { value ->
+            require(value is JsonObject) { "headers 必须是 JSON 对象" }
+            value.mapValues { (_, item) -> item.jsonPrimitive.contentOrNull ?: error("headers 的值必须是字符串") }
+        }.orEmpty()
+        val result = runBlocking {
+            AndroidExecutionEnv(context).httpRequest(
+                method = args.string("method") ?: "GET",
+                url = args.string("url") ?: error("缺少 url"),
+                body = args.string("body"),
+                contentType = args.string("content_type"),
+                credentialProfile = args.string("credential_profile"),
+                headers = headers,
+                timeoutMs = (args.long("timeout_ms")?.toInt() ?: 5_000).coerceIn(1_000, 120_000),
+            )
+        }
+        return success(request, "http_completed", "HTTP 请求已完成", startedAt, buildJsonObject {
+            put("status", result.status)
+            result.contentType?.let { put("content_type", it) }
+            put("body", result.body)
+            put("truncated", result.truncated)
+            putJsonObject("headers") { result.headers.forEach { (name, values) -> put(name, buildJsonArray { values.forEach { add(JsonPrimitive(it)) } }) } }
+        })
     }
 
     private fun runTurn(

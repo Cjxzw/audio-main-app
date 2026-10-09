@@ -235,6 +235,11 @@ def build_parser() -> argparse.ArgumentParser:
     config = commands.add_parser("config", help="配置状态")
     config.add_subparsers(dest="action", required=True).add_parser("show", help="读取脱敏配置")
 
+    inspect = commands.add_parser("inspect", help="组合读取运行状态、配置和诊断信息")
+    inspect_actions = inspect.add_subparsers(dest="action", required=True)
+    inspect_actions.add_parser("all", help="一次读取 App 状态、配置、会话、日志和退出记录")
+    inspect_actions.add_parser("runtime", help="读取运行日志和进程退出记录")
+
     key = commands.add_parser("key", help="MiMo Key")
     key_actions = key.add_subparsers(dest="action", required=True)
     key_actions.add_parser("set", help="从 stdin 写入 MiMo Key")
@@ -250,6 +255,31 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_set.add_argument("--no-activate", action="store_true")
     realtime_clear = realtime_actions.add_parser("clear", help="清除 StepFun Realtime Key")
     realtime_clear.add_argument("--confirm", action="store_true", required=True)
+    realtime_actions.add_parser("start", help="请求启动 Realtime")
+    realtime_actions.add_parser("stop", help="请求停止 Realtime")
+
+    credentials = commands.add_parser("credentials", help="凭据 profile（仅显示脱敏摘要）")
+    credentials.add_subparsers(dest="action", required=True).add_parser("list", help="列出 profile")
+
+    logs = commands.add_parser("logs", help="读取应用诊断日志")
+    logs_actions = logs.add_subparsers(dest="action", required=True)
+    tail = logs_actions.add_parser("tail", help="读取日志尾部")
+    tail.add_argument("--lines", type=int, default=120)
+    grep = logs_actions.add_parser("grep", help="在日志中筛选文本")
+    grep.add_argument("pattern")
+    grep.add_argument("--lines", type=int, default=200)
+    logs_actions.add_parser("snapshot", help="读取日志和 Android 退出记录")
+
+    http = commands.add_parser("http", help="直接调用 App 的受控 HTTP 工具")
+    http_actions = http.add_subparsers(dest="action", required=True)
+    http_request = http_actions.add_parser("request", help="执行一次 HTTP 请求")
+    http_request.add_argument("url")
+    http_request.add_argument("--method", default="GET")
+    http_request.add_argument("--body")
+    http_request.add_argument("--content-type")
+    http_request.add_argument("--credential-profile")
+    http_request.add_argument("--header", action="append", default=[], metavar="NAME=VALUE")
+    http_request.add_argument("--timeout-ms", type=int, default=5000)
 
     provider = commands.add_parser("provider", help="LLM 供应商")
     provider_actions = provider.add_subparsers(dest="action", required=True)
@@ -294,6 +324,14 @@ def bridge_command(args: argparse.Namespace) -> tuple[str, dict[str, object], fl
         return "status", {}, None
     if args.group == "config":
         return "config.show", {}, None
+    if args.group == "inspect":
+        if args.action == "runtime":
+            return "__local.inspect.runtime", {}, None
+        return "__local.inspect.all", {}, None
+    if args.group == "credentials":
+        return "credentials.list", {}, None
+    if args.group == "logs":
+        return f"__local.logs.{args.action}", {key: value for key, value in vars(args).items() if key in {"lines", "pattern"}}, None
     if args.group == "key":
         if args.action == "set":
             return "key.set", {"api_key": read_secret_from_stdin("MiMo Key")}, None
@@ -308,7 +346,23 @@ def bridge_command(args: argparse.Namespace) -> tuple[str, dict[str, object], fl
             if args.api_key_stdin:
                 arguments["api_key"] = read_secret_from_stdin("StepFun API Key")
             return "realtime.set", arguments, None
+        if args.action in {"start", "stop"}:
+            return f"realtime.{args.action}", {}, None
         return "realtime.clear", {"confirm": args.confirm}, None
+    if args.group == "http":
+        headers: dict[str, str] = {}
+        for item in args.header:
+            if "=" not in item:
+                raise CliError("--header 必须使用 NAME=VALUE 格式")
+            name, value = item.split("=", 1)
+            if not name.strip():
+                raise CliError("--header 名称不能为空")
+            headers[name.strip()] = value
+        return "http.request", {
+            "method": args.method, "url": args.url, "body": args.body,
+            "content_type": args.content_type, "credential_profile": args.credential_profile,
+            "headers": headers, "timeout_ms": args.timeout_ms,
+        }, max(15.0, args.timeout_ms / 1000 + 5)
     if args.group == "provider":
         if args.action == "list":
             return "provider.list", {}, None
@@ -360,6 +414,32 @@ def device_list_payload() -> dict[str, object]:
     }
 
 
+def local_diagnostics(adb: Adb, command: str, arguments: dict[str, object]) -> dict[str, object]:
+    if command.startswith("__local.logs"):
+        lines = max(1, min(int(arguments.get("lines", 120)), 2000))
+        raw = adb.command("exec-out", "run-as", PACKAGE, "cat", "files/agent-runtime/logs/voice-agent.log", check=False).stdout.decode("utf-8", errors="replace")
+        if command.endswith("tail"):
+            output = "\n".join(raw.splitlines()[-lines:])
+        elif command.endswith("grep"):
+            pattern = str(arguments.get("pattern", ""))
+            try:
+                regex = re.compile(pattern, re.IGNORECASE)
+                output = "\n".join(line for line in raw.splitlines() if regex.search(line))
+            except re.error as error:
+                raise CliError(f"日志正则无效：{error}") from error
+            output = "\n".join(output.splitlines()[-lines:])
+        else:
+            output = "\n".join(raw.splitlines()[-lines:])
+        return {"ok": True, "code": "logs", "data": {"text": output, "lines": len(output.splitlines())}}
+    if command.startswith("__local.inspect"):
+        status = DebugBridgeClient(adb).request("status")
+        config = DebugBridgeClient(adb).request("config.show")
+        logs = local_diagnostics(adb, "__local.logs.tail", {"lines": 120})
+        exits = adb.shell("dumpsys", "activity", "exit-info", PACKAGE, check=False)
+        return {"ok": True, "code": "inspection", "data": {"status": status.get("data"), "config": config.get("data"), "logs": logs.get("data"), "exit_info": exits}}
+    raise CliError(f"未知本地诊断命令：{command}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -369,11 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             command, arguments, timeout = bridge_command(args)
             adb = Adb(args.serial)
-            result = DebugBridgeClient(adb, args.timeout).request(
-                command,
-                arguments,
-                timeout_seconds=timeout,
-            )
+            result = local_diagnostics(adb, command, arguments) if command.startswith("__local.") else DebugBridgeClient(adb, args.timeout).request(command, arguments, timeout_seconds=timeout)
         print(
             json.dumps(
                 result,

@@ -99,6 +99,24 @@ alias-two device product:p model:m device:d
         self.assertEqual("provider.delete", command)
         self.assertEqual({"id": "custom-id", "confirm": True}, arguments)
 
+    def test_http_request_builds_composable_tool_arguments(self):
+        args = hanwo_dev.build_parser().parse_args([
+            "http", "request", "https://example.test/api", "--method", "POST",
+            "--body", '{"q":"hi"}', "--header", "X-Test=yes",
+        ])
+        command, arguments, timeout = hanwo_dev.bridge_command(args)
+        self.assertEqual("http.request", command)
+        self.assertEqual("POST", arguments["method"])
+        self.assertEqual({"X-Test": "yes"}, arguments["headers"])
+        self.assertGreaterEqual(timeout, 15)
+
+    def test_inspect_and_logs_are_local_compositions(self):
+        parser = hanwo_dev.build_parser()
+        self.assertEqual("__local.inspect.all", hanwo_dev.bridge_command(parser.parse_args(["inspect", "all"]))[0])
+        command, arguments, _ = hanwo_dev.bridge_command(parser.parse_args(["logs", "grep", "realtime", "--lines", "20"]))
+        self.assertEqual("__local.logs.grep", command)
+        self.assertEqual({"pattern": "realtime", "lines": 20}, arguments)
+
     def test_main_reads_secret_before_starting_adb(self):
         events = []
         fake_adb = object()

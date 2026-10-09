@@ -14,6 +14,9 @@ printf '%s' "$MIMO_API_KEY" | ./tools/hanwo-dev key set
   --model mimo-v2.5-pro \
   --mode mimo
 ./tools/hanwo-dev turn run "查询今天的重要新闻"
+./tools/hanwo-dev inspect all
+./tools/hanwo-dev logs grep realtime --lines 80
+./tools/hanwo-dev http request https://example.com/health --timeout-ms 3000
 ```
 
 多个无线 ADB 条目指向同一台物理设备时，CLI 会通过 `ro.serialno` 自动合并。存在多台物理设备时必须使用 `--serial`。
@@ -45,6 +48,11 @@ conversation clear --confirm
 agent wake
 agent sleep
 turn run TEXT [--turn-timeout SECONDS]
+realtime start|stop
+credentials list
+inspect all|runtime
+logs tail|grep PATTERN|snapshot
+http request URL [--method METHOD] [--body BODY] [--credential-profile PROFILE]
 ```
 
-所有命令输出结构化 JSON。`turn run` 会返回最终助手正文、本轮可见消息和模型消息中的原生工具调用，供 Agent 继续判断。
+所有命令输出结构化 JSON。`inspect` 和 `logs` 在本机组合 ADB、Bridge、应用日志与 Android 退出记录；`http request` 复用 App 正式的 `AndroidExecutionEnv`，因此会执行同样的 URL 前缀、凭据和响应截断策略。`turn run` 会返回最终助手正文、本轮可见消息和模型消息中的原生工具调用，供 Agent 继续判断。
