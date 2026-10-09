@@ -36,6 +36,11 @@ class HttpRequestPolicyTest {
         }
     }
 
+    @Test fun legacyPrefixCanActAsSafeRelativeUrlBase() {
+        val prefix = "https://metaso.cn/".trimEnd('/')
+        assertEquals("https://metaso.cn/api/open/search", "$prefix/api/open/search")
+    }
+
     @Test fun mutationsAreNeverAutomaticallyRetried() {
         listOf("POST", "PUT", "PATCH", "DELETE").forEach { assertEquals(1, HttpRequestPolicy.attempts(it)) }
         assertEquals(2, HttpRequestPolicy.attempts("GET"))

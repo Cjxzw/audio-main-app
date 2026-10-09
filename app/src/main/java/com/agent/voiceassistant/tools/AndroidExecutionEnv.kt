@@ -665,8 +665,11 @@ class CredentialProfileStore(context: Context) {
 
     fun resolveUrl(profile: String, url: String): String {
         if (url.startsWith("https://") || url.startsWith("http://")) return url
+        // Profiles created before the base_url field was introduced only persisted
+        // url_prefixes. The first allowlisted prefix is the safe legacy base.
         val baseUrl = preferences.getString(baseUrlKey(profile), null)
             ?.takeIf(String::isNotBlank)
+            ?: allowedUrlPrefixes(profile).firstOrNull()?.trimEnd('/')
             ?: throw IOException("凭据配置 $profile 没有基础地址，必须传入完整 URL")
         return "${baseUrl.trimEnd('/')}/${url.trimStart('/')}"
     }
