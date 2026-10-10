@@ -26,6 +26,9 @@ object EventBus {
     private val _realtimeStates = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 8)
     val realtimeStates: SharedFlow<RealtimeState> = _realtimeStates.asSharedFlow()
 
+    private val _realtimeUi = MutableSharedFlow<RealtimeUiState>(replay = 1, extraBufferCapacity = 8)
+    val realtimeUi: SharedFlow<RealtimeUiState> = _realtimeUi.asSharedFlow()
+
     private val _pendingCounts = MutableSharedFlow<Int>(
         replay = 1,
         extraBufferCapacity = 8
@@ -95,6 +98,10 @@ object EventBus {
         _realtimeStates.tryEmit(state)
     }
 
+    fun emitRealtimeUi(state: RealtimeUiState) {
+        _realtimeUi.tryEmit(state)
+    }
+
     fun emitPendingCount(count: Int) {
         _pendingCounts.tryEmit(count)
     }
@@ -156,3 +163,5 @@ enum class RealtimeState {
     FAILED,
     STOPPED,
 }
+
+data class RealtimeUiState(val active: Boolean, val hidden: Boolean)

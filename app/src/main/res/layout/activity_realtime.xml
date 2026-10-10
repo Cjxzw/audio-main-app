@@ -21,6 +21,13 @@
             android:textSize="20sp"
             android:textStyle="bold" />
         <ImageButton
+            android:id="@+id/btnRealtimeHide"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="隐藏实时语音界面"
+            android:src="@drawable/ic_chevron_down_24" />
+        <ImageButton
             android:id="@+id/btnRealtimeClose"
             android:layout_width="48dp"
             android:layout_height="48dp"

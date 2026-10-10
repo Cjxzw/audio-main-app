@@ -344,8 +344,9 @@ class ConversationStore(context: Context) {
     }
 
     fun realtimeStartupSnapshot(conversationId: String): String = synchronized(lock) {
-        val messages = state.sessions.firstOrNull { it.id == conversationId }?.messages.orEmpty()
-        RealtimeContextProjection.snapshot(messages)
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized ""
+        val notes = session.realtimeContextNotes + session.pendingContextNotes
+        RealtimeContextProjection.snapshotWithRealtimeNotes(session.messages, notes)
     }
 
     /** Persist the handover and its cursor together, including across reconnects/process restarts. */

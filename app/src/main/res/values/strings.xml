@@ -18,6 +18,7 @@
     <string name="btn_stop_agent">停止当前任务</string>
     <string name="voice_start">开始语音会话</string>
     <string name="voice_stop">结束语音会话</string>
+    <string name="realtime_restore">打开 Realtime 界面</string>
     <string name="voice_level">语音输入音量</string>
     <string name="page_home">首页</string>
     <string name="page_tasks">任务</string>

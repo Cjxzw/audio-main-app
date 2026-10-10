@@ -94,6 +94,8 @@ class StepFunRealtimePipeline(
     private val pendingMainReplies = linkedMapOf<String, Pair<String, Boolean>>()
     private val reportedMainTurns = linkedSetOf<String>()
     private var mainReplyJob: Job? = null
+    private var hangupJob: Job? = null
+    @Volatile private var hangupRequested = false
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     val isReady: Boolean
@@ -106,6 +108,7 @@ class StepFunRealtimePipeline(
         check(eventsJob == null && captureJob == null) { "Realtime 管线已经启动" }
         sessionGeneration.incrementAndGet()
         stopping = false
+        hangupRequested = false
         val config = settings.stepFunConfig()
         val apiKey = settings.stepFunApiKey()
         disconnectReported.set(false)
@@ -210,6 +213,8 @@ class StepFunRealtimePipeline(
         mainReplyJob = null
         captureJob?.cancel()
         captureJob = null
+        hangupJob?.cancel()
+        hangupJob = null
         toolFollowUpRetryJob?.cancel()
         toolFollowUpRetryJob = null
         transcriptFallbackJob?.cancel()
@@ -496,7 +501,7 @@ class StepFunRealtimePipeline(
         DiagLog.i("realtime.tool.call", "name=${call.name} callId=${call.id} argsChars=${call.arguments.length}")
         if (call.name == MainToolRegistry.TOOL_AGENT_SLEEP || call.name == MainToolRegistry.TOOL_REALTIME_HANGUP) {
             recordTerminalToolCall(call)
-            onSleepRequested()
+            requestModelHangup()
             return
         }
         synchronized(sessionBoundaryLock) {
@@ -564,6 +569,24 @@ class StepFunRealtimePipeline(
             }
             DiagLog.i("realtime.tool.result", "name=${call.name} callId=${call.id} success=${output.success} chars=${output.content.length}")
             flushToolOutputsWhenPlaybackDrains()
+        }
+    }
+
+    /** Model-requested hangup: stop input immediately, then drain server and local audio. */
+    private fun requestModelHangup() {
+        if (hangupRequested || stopping) return
+        hangupRequested = true
+        acceptingVoiceTranscripts = false
+        recorder.stop()
+        val generation = sessionGeneration.get()
+        hangupJob = scope.launch {
+            val deadline = System.currentTimeMillis() + MODEL_HANGUP_DRAIN_TIMEOUT_MS
+            while (isSessionCurrent(generation) && !responseDone && System.currentTimeMillis() < deadline) {
+                delay(25)
+            }
+            if (!isSessionCurrent(generation)) return@launch
+            runCatching { player.awaitPlaybackDrained() }
+            if (isSessionCurrent(generation)) onSleepRequested()
         }
     }
 
@@ -738,5 +761,6 @@ class StepFunRealtimePipeline(
         const val TOOL_FOLLOW_UP_RETRY_DELAY_MS = 750L
         const val MAX_TOOL_FOLLOW_UP_RETRIES = 3
         const val FINAL_TRANSCRIPT_FALLBACK_MS = 1_500L
+        const val MODEL_HANGUP_DRAIN_TIMEOUT_MS = 10_000L
     }
 }

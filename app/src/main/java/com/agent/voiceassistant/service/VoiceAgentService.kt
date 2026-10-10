@@ -237,6 +237,7 @@ class VoiceAgentService : Service() {
         const val ACTION_SLEEP = "com.agent.voiceassistant.SLEEP"
         const val ACTION_REALTIME_START = "com.agent.voiceassistant.REALTIME_START"
         const val ACTION_REALTIME_STOP = "com.agent.voiceassistant.REALTIME_STOP"
+        const val ACTION_REALTIME_HIDE_UI = "com.agent.voiceassistant.REALTIME_HIDE_UI"
         const val ACTION_TEXT_INPUT = "com.agent.voiceassistant.TEXT_INPUT"
         const val ACTION_NEW_CONVERSATION = "com.agent.voiceassistant.NEW_CONVERSATION"
         const val ACTION_SWITCH_CONVERSATION = "com.agent.voiceassistant.SWITCH_CONVERSATION"
@@ -251,6 +252,7 @@ class VoiceAgentService : Service() {
         const val EXTRA_CONVERSATION_ID = "conversation_id"
         private const val EXTRA_CONVERSATION_TITLE = "conversation_title"
         private const val EXTRA_TASK_ID = "task_id"
+        private const val EXTRA_SHOW_REALTIME_UI = "show_realtime_ui"
 
         fun start(ctx: Context) {
             DiagLog.i("api.start", "ctx=${ctx.javaClass.simpleName}")
@@ -278,9 +280,15 @@ class VoiceAgentService : Service() {
             ctx.startService(intent)
         }
 
-        fun startRealtime(ctx: Context) {
-            val intent = Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_REALTIME_START)
+        fun startRealtime(ctx: Context, showUi: Boolean = false) {
+            val intent = Intent(ctx, VoiceAgentService::class.java)
+                .setAction(ACTION_REALTIME_START)
+                .putExtra(EXTRA_SHOW_REALTIME_UI, showUi)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent) else ctx.startService(intent)
+        }
+
+        fun hideRealtimeUi(ctx: Context) {
+            ctx.startService(Intent(ctx, VoiceAgentService::class.java).setAction(ACTION_REALTIME_HIDE_UI))
         }
 
         fun stopRealtime(ctx: Context) {
@@ -405,6 +413,7 @@ class VoiceAgentService : Service() {
     private val pendingRealtimeResults = ConcurrentHashMap<String, Pair<String, Boolean>>()
     private var stepFunRealtimePipeline: StepFunRealtimePipeline? = null
     @Volatile private var realtimeActive = false
+    @Volatile private var realtimeUiHidden = false
     private var mainConversationId: String = ""
     private var realtimeConversationId: String = ""
     private var lastThinkingFeedbackAudio: Int? = null
@@ -539,8 +548,18 @@ class VoiceAgentService : Service() {
             }
             ACTION_START, ACTION_WAKE -> startRealtimeSession()
             ACTION_SLEEP -> sleepAgent()
-            ACTION_REALTIME_START -> startRealtimeSession()
+            ACTION_REALTIME_START -> {
+                if (!realtimeActive) {
+                    realtimeUiHidden = !intent.getBooleanExtra(EXTRA_SHOW_REALTIME_UI, false)
+                }
+                EventBus.emitRealtimeUi(RealtimeUiState(realtimeActive, realtimeUiHidden))
+                startRealtimeSession()
+            }
             ACTION_REALTIME_STOP -> stopRealtimeSession()
+            ACTION_REALTIME_HIDE_UI -> {
+                realtimeUiHidden = true
+                EventBus.emitRealtimeUi(RealtimeUiState(realtimeActive, true))
+            }
             ACTION_TEXT_INPUT -> {
                 ensureForegroundForCurrentState()
                 val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
@@ -1334,6 +1353,7 @@ class VoiceAgentService : Service() {
             return
         }
         realtimeActive = true
+        EventBus.emitRealtimeUi(RealtimeUiState(active = true, hidden = realtimeUiHidden))
         EventBus.emitRealtimeState(RealtimeState.CONNECTING)
         MainMediaLibraryService.publishState(this, active = true, status = "Realtime 正在连接")
         agentKeepAlive.acquire("realtime")
@@ -1342,6 +1362,7 @@ class VoiceAgentService : Service() {
         serviceScope.launch {
             runCatching {
                 ensureRealtimePipeline(captureAudio = true)
+                runCatching { earcons.listening() }
                 EventBus.emitRealtimeState(RealtimeState.READY)
                 _state.value = State.LISTENING
                 emitState(ServiceState.LISTENING)
@@ -1358,7 +1379,10 @@ class VoiceAgentService : Service() {
     }
 
     private fun stopRealtimeSession() {
+        runCatching { serviceScope.launch { earcons.sleep() } }
         realtimeActive = false
+        realtimeUiHidden = false
+        EventBus.emitRealtimeUi(RealtimeUiState(active = false, hidden = false))
         EventBus.emitRealtimeState(RealtimeState.STOPPED)
         agentKeepAlive.release("realtime_stopped")
         stepFunRealtimePipeline?.stop()

@@ -228,6 +228,10 @@ class MainActivity : AppCompatActivity() {
                     toggleVoiceSession()
                     true
                 }
+                R.id.action_realtime_restore -> {
+                    startActivity(Intent(this, RealtimeActivity::class.java))
+                    true
+                }
                 else -> false
             }
         }
@@ -536,7 +540,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startAgentService() {
         appendLog("正在启动 Agent…")
-        VoiceAgentService.startRealtime(this)
+        VoiceAgentService.startRealtime(this, showUi = true)
         startActivity(Intent(this, RealtimeActivity::class.java))
     }
 
@@ -549,6 +553,12 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             EventBus.states.collectLatest { state ->
                 updateStateDisplay(state)
+            }
+        }
+        lifecycleScope.launch {
+            EventBus.realtimeUi.collectLatest { state ->
+                binding.topAppBar.menu.findItem(R.id.action_realtime_restore)?.isVisible =
+                    state.active && state.hidden
             }
         }
         lifecycleScope.launch {

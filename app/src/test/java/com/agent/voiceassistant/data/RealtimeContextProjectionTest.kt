@@ -4,7 +4,8 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RealtimeContextProjectionTest {
-    private fun message(role: String, content: String, id: String = content) = StoredMessage(id, role, content, timestamp = 0)
+    private fun message(role: String, content: String, id: String = content, timestamp: Long = 0) =
+        StoredMessage(id, role, content, timestamp = timestamp)
 
     @Test fun snapshotKeepsWholeTurnsAndUsesLatestTen() {
         val messages = (1..12).flatMap { listOf(message("user", "问$it"), message("assistant", "答$it")) }
@@ -76,5 +77,22 @@ class RealtimeContextProjectionTest {
         val messages = listOf(message("user", "问题"), message("assistant", "未完成").copy(streamState = "STREAMING"))
         assertEquals("", RealtimeContextProjection.snapshot(messages))
         assertTrue(RealtimeContextProjection.transcript(messages).contains("未完成"))
+    }
+
+    @Test fun realtimeNotesCountAsIndependentTurnsAndAreOrderedByEndTime() {
+        val messages = listOf(
+            message("user", "问题一", timestamp = 1_000),
+            message("assistant", "回答一", timestamp = 1_001),
+            message("user", "问题二", timestamp = 3_000),
+            message("assistant", "回答二", timestamp = 3_001),
+        )
+        val notes = listOf(
+            "Realtime 通话记录（1970-01-01 00:00）：通话一",
+            "Realtime 通话记录（1970-01-01 00:00）：通话二",
+        )
+        val snapshot = RealtimeContextProjection.snapshotWithRealtimeNotes(messages, notes, maxTurns = 4, maxChars = 500)
+        assertTrue(snapshot.contains("通话一"))
+        assertTrue(snapshot.contains("通话二"))
+        assertEquals(4, listOf("问题一", "通话一", "问题二", "通话二").count { snapshot.contains(it) })
     }
 }

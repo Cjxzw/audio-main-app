@@ -59,6 +59,10 @@ class RealtimeActivity : AppCompatActivity() {
             VoiceAgentService.stopRealtime(this)
             finish()
         }
+        findViewById<View>(R.id.btnRealtimeHide).setOnClickListener {
+            VoiceAgentService.hideRealtimeUi(this)
+            finish()
+        }
         bindConversation()
         lifecycleScope.launch {
             EventBus.chatMessages.collectLatest { message ->
