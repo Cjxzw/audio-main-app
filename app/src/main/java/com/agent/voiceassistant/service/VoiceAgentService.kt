@@ -180,6 +180,7 @@ class VoiceAgentService : Service() {
         private const val INTENT_ROUTE_HIGH_CONFIDENCE = 0.85
         private const val INTENT_ROUTE_TIMEOUT_MS = 5_000L
         private const val INTENT_ROUTE_MAX_TOKENS = 192
+        private const val REALTIME_READY_WAIT_TIMEOUT_MS = 15_000L
         private const val VOICE_REPLY_SUMMARY_TIMEOUT_MS = 6_000L
         private const val VOICE_REPLY_SUMMARY_MAX_TOKENS = 256
         private const val VOICE_REPLY_SUMMARY_INPUT_CHARS = 24_000
@@ -1241,7 +1242,9 @@ class VoiceAgentService : Service() {
             return
         }
         try {
-            ensureRealtimePipeline(captureAudio = !dormant).submitText(text)
+            val pipeline = ensureRealtimePipeline(captureAudio = !dormant)
+            awaitRealtimeReady(pipeline)
+            pipeline.submitText(text)
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
             invalidateRealtimePipeline("文本发送失败：${error.message ?: error.javaClass.simpleName}")
@@ -1274,6 +1277,16 @@ class VoiceAgentService : Service() {
             created.stop()
             if (stepFunRealtimePipeline === created) stepFunRealtimePipeline = null
             throw error
+        }
+    }
+
+    private suspend fun awaitRealtimeReady(pipeline: StepFunRealtimePipeline) {
+        val deadline = SystemClock.elapsedRealtime() + REALTIME_READY_WAIT_TIMEOUT_MS
+        while (realtimeActive && pipeline.isStarted && !pipeline.isReady && SystemClock.elapsedRealtime() < deadline) {
+            delay(50L)
+        }
+        if (!pipeline.isReady) {
+            throw IllegalStateException("Realtime 正在预热，请稍候再发送文本")
         }
     }
 

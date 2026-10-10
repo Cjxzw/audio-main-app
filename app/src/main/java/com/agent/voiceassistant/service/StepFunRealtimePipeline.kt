@@ -72,6 +72,13 @@ class StepFunRealtimePipeline(
     private var userDraft: UserDraft? = null
     private var nextUserTurnId = 0L
     private var transcriptFallbackJob: Job? = null
+    private var assistantPersistJob: Job? = null
+    private var responseStartedAtMs = 0L
+    private var firstAudioDeltaAtMs = 0L
+    private var firstTextDeltaAtMs = 0L
+    private var audioDeltaCount = 0
+    private var lastAudioDeltaAtMs = 0L
+    private var maxAudioDeltaGapMs = 0L
     private var activeAssistantItemId: String? = null
     private val cancelledAssistantItemIds = mutableSetOf<String>()
     @Volatile private var responseDone = false
@@ -211,6 +218,8 @@ class StepFunRealtimePipeline(
                 }
                 it.completed = true
             }
+            assistantPersistJob?.cancel()
+            assistantPersistJob = null
             assistantDraft?.let { persistAssistantDraft(it, ChatStreamState.INTERRUPTED) }
             onSessionFinished()
         }
@@ -226,6 +235,8 @@ class StepFunRealtimePipeline(
         toolFollowUpRetryJob = null
         transcriptFallbackJob?.cancel()
         transcriptFallbackJob = null
+        assistantPersistJob?.cancel()
+        assistantPersistJob = null
         eventsJob?.cancel()
         eventsJob = null
         player.release()
@@ -267,10 +278,16 @@ class StepFunRealtimePipeline(
                 if (warmingUp) {
                     if (event.text.contains("READY", ignoreCase = true)) warmupReady?.complete(Unit)
                 } else {
+                    if (firstTextDeltaAtMs == 0L) firstTextDeltaAtMs = System.currentTimeMillis()
                     appendAssistantText(event.itemId, event.text, TextSource.TEXT)
                 }
             }
-            is StepFunRealtimeProtocol.Event.AudioTranscriptDelta -> if (!warmingUp) appendAssistantText(event.itemId, event.text, TextSource.AUDIO_TRANSCRIPT)
+            is StepFunRealtimeProtocol.Event.AudioTranscriptDelta -> if (!warmingUp) {
+                // StepFun commonly returns the spoken transcript on the audio track rather than
+                // response.text.delta. Count it as the first text event for stream diagnostics.
+                if (firstTextDeltaAtMs == 0L) firstTextDeltaAtMs = System.currentTimeMillis()
+                appendAssistantText(event.itemId, event.text, TextSource.AUDIO_TRANSCRIPT)
+            }
             is StepFunRealtimeProtocol.Event.ThinkingDelta -> if (!warmingUp) appendThinking(event.itemId, event.text)
             is StepFunRealtimeProtocol.Event.AudioDelta -> {
                 if (warmingUp) return@synchronized
@@ -278,17 +295,37 @@ class StepFunRealtimePipeline(
                     DiagLog.i("realtime.audio.discarded", "reason=cancelled_item item=${event.itemId}")
                     return@synchronized
                 }
+                audioDeltaCount += 1
+                val now = System.currentTimeMillis()
+                if (firstAudioDeltaAtMs == 0L) firstAudioDeltaAtMs = now
+                if (lastAudioDeltaAtMs != 0L) {
+                    maxAudioDeltaGapMs = maxOf(maxAudioDeltaGapMs, now - lastAudioDeltaAtMs)
+                }
+                lastAudioDeltaAtMs = now
                 activeAssistantItemId = event.itemId ?: activeAssistantItemId
                 runCatching { player.enqueue(Base64.getDecoder().decode(event.base64Audio), event.itemId) }
                     .onFailure { error -> onLog("Realtime 音频入队失败：${error.message ?: error.javaClass.simpleName}") }
             }
             StepFunRealtimeProtocol.Event.AudioDone -> {
-                if (!warmingUp && !stopping) player.finishResponseAudio()
+                if (!warmingUp && !stopping) {
+                    DiagLog.i(
+                        "realtime.audio.done",
+                        "deltas=$audioDeltaCount firstAudioMs=${elapsedFromResponseStart(firstAudioDeltaAtMs)} " +
+                            "firstTextMs=${elapsedFromResponseStart(firstTextDeltaAtMs)} maxDeltaGapMs=$maxAudioDeltaGapMs",
+                    )
+                    player.finishResponseAudio()
+                }
             }
             is StepFunRealtimeProtocol.Event.FunctionArgumentsDone -> executeTool(event, sessionGeneration.get())
             StepFunRealtimeProtocol.Event.ResponseCreated -> {
                 cancelledAssistantItemIds.clear()
                 player.beginResponse()
+                responseStartedAtMs = System.currentTimeMillis()
+                firstAudioDeltaAtMs = 0L
+                firstTextDeltaAtMs = 0L
+                audioDeltaCount = 0
+                lastAudioDeltaAtMs = 0L
+                maxAudioDeltaGapMs = 0L
                 awaitingUserResponse = false
                 responseInFlight = true
                 toolFollowUpRetryJob?.cancel()
@@ -324,6 +361,9 @@ class StepFunRealtimePipeline(
             }
         }
     }
+
+    private fun elapsedFromResponseStart(timestamp: Long): Long =
+        if (timestamp == 0L || responseStartedAtMs == 0L) -1L else timestamp - responseStartedAtMs
 
     private fun notifyDisconnected(reason: String) {
         if (stopping || !disconnectReported.compareAndSet(false, true)) return
@@ -439,7 +479,12 @@ class StepFunRealtimePipeline(
         draft.textSource = source
         draft.text.append(delta)
         activeAssistantItemId = itemId ?: activeAssistantItemId
-        persistAssistantDraft(draft, ChatStreamState.STREAMING)
+        if (draft.messageId == null) {
+            persistAssistantDraft(draft, ChatStreamState.STREAMING)
+        } else {
+            publishAssistantDraft(draft, ChatStreamState.STREAMING)
+            scheduleAssistantDraftPersist(draft)
+        }
     }
 
     private fun appendThinking(itemId: String?, delta: String) {
@@ -447,7 +492,12 @@ class StepFunRealtimePipeline(
         val draft = assistantDraft ?: AssistantDraft().also { assistantDraft = it }
         draft.reasoning.append(delta)
         activeAssistantItemId = itemId ?: activeAssistantItemId
-        persistAssistantDraft(draft, ChatStreamState.STREAMING)
+        if (draft.messageId == null) {
+            persistAssistantDraft(draft, ChatStreamState.STREAMING)
+        } else {
+            publishAssistantDraft(draft, ChatStreamState.STREAMING)
+            scheduleAssistantDraftPersist(draft)
+        }
     }
 
     private fun persistAssistantDraft(draft: AssistantDraft, state: ChatStreamState) {
@@ -477,6 +527,15 @@ class StepFunRealtimePipeline(
                 llmVisible = state != ChatStreamState.STREAMING,
             )
         }
+        publishAssistantDraft(draft, state)
+    }
+
+    private fun publishAssistantDraft(draft: AssistantDraft, state: ChatStreamState) {
+        val text = RealtimePlainTextPolicy.normalize(draft.text.toString())
+        val reasoning = draft.reasoning.toString().trim()
+        val items = reasoning.takeIf(String::isNotBlank)
+            ?.let { listOf(ReasoningDisplayItem(ReasoningItemKind.MARKDOWN, it)) }
+            .orEmpty()
         EventBus.emitChatMessage(
             ChatMessage(
                 role = ChatRole.BOT,
@@ -491,7 +550,22 @@ class StepFunRealtimePipeline(
         )
     }
 
+    private fun scheduleAssistantDraftPersist(draft: AssistantDraft) {
+        if (assistantPersistJob?.isActive == true) return
+        assistantPersistJob = scope.launch {
+            delay(80L)
+            synchronized(sessionBoundaryLock) {
+                assistantPersistJob = null
+                if (!stopping && assistantDraft === draft && draft.messageId != null) {
+                    persistAssistantDraft(draft, ChatStreamState.STREAMING)
+                }
+            }
+        }
+    }
+
     private fun finishAssistantResponse() {
+        assistantPersistJob?.cancel()
+        assistantPersistJob = null
         assistantDraft?.let { draft -> persistAssistantDraft(draft, ChatStreamState.COMPLETED) }
         assistantDraft = null
         activeAssistantItemId = null
@@ -504,6 +578,8 @@ class StepFunRealtimePipeline(
         runCatching { client.cancelResponse() }
         itemId?.let { active -> runCatching { client.truncateAssistantAudio(active, player.playedAudioMs()) } }
         player.interrupt(itemId)
+        assistantPersistJob?.cancel()
+        assistantPersistJob = null
         assistantDraft?.let { draft -> persistAssistantDraft(draft, ChatStreamState.INTERRUPTED) }
         assistantDraft = null
         activeAssistantItemId = null

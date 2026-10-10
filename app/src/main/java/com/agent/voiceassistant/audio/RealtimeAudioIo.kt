@@ -227,6 +227,7 @@ class RealtimePcmPlayer(
         }
 
         fun writeContinuous(pcm: ByteArray) {
+            if (released.get()) return
             val active = track ?: createTrack().also { track = it }
             val combined = if (heldTail.isEmpty()) pcm else heldTail + pcm
             if (combined.size <= FADE_BYTES) {
@@ -239,8 +240,19 @@ class RealtimePcmPlayer(
                 fadePcm16InPlace(body, fadeIn = true)
                 firstPacket = false
             }
-            if (active.playState != AudioTrack.PLAYSTATE_PLAYING) active.play()
-            writeFully(active, body)
+            try {
+                if (released.get()) return
+                if (active.playState != AudioTrack.PLAYSTATE_PLAYING) active.play()
+                writeFully(active, body)
+            } catch (error: Throwable) {
+                // release() can race with a final websocket packet. The worker must treat a
+                // released/invalid track as a cancelled playback, never as an app-fatal error.
+                if (released.get()) {
+                    Timber.i("RealtimePcmPlayer: drop audio after release: ${error.message}")
+                    return
+                }
+                throw error
+            }
             heldTail = combined.copyOfRange(bodyEnd, combined.size)
         }
 
@@ -251,13 +263,21 @@ class RealtimePcmPlayer(
         }
 
         fun finishAudio() {
+            if (released.get()) return
             if (!started && startupBuffer.isNotEmpty()) startBufferedAudio()
             val active = track
             if (active != null && heldTail.isNotEmpty()) {
-                fadePcm16InPlace(heldTail, fadeIn = false)
-                if (active.playState != AudioTrack.PLAYSTATE_PLAYING) active.play()
-                writeFully(active, heldTail)
-                writeFully(active, ByteArray(sampleRate * Short.SIZE_BYTES * FINAL_SILENCE_MS / 1_000))
+                try {
+                    fadePcm16InPlace(heldTail, fadeIn = false)
+                    if (released.get()) return
+                    if (active.playState != AudioTrack.PLAYSTATE_PLAYING) active.play()
+                    writeFully(active, heldTail)
+                    writeFully(active, ByteArray(sampleRate * Short.SIZE_BYTES * FINAL_SILENCE_MS / 1_000))
+                } catch (error: Throwable) {
+                    if (!released.get()) throw error
+                    Timber.i("RealtimePcmPlayer: drop audio.done after release: ${error.message}")
+                    return
+                }
             }
             Timber.i("RealtimePcmPlayer: audio.done drained started=$started")
             reset(dropTrackBuffer = false)
