@@ -47,7 +47,7 @@ class ConversationAdapter(
             onMore: (View, ConversationSummary) -> Unit,
         ) {
             val context = itemView.context
-            title.text = item.title
+            title.text = if (item.domain.name == "REALTIME") "[语音通话] ${item.title}" else item.title
             preview.text = item.preview.ifBlank { context.getString(R.string.conversation_empty_preview) }
             time.text = context.getString(
                 R.string.conversation_message_count,

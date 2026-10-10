@@ -73,6 +73,7 @@ class StepFunRealtimePipeline(
     private var nextUserTurnId = 0L
     private var transcriptFallbackJob: Job? = null
     private var activeAssistantItemId: String? = null
+    private val cancelledAssistantItemIds = mutableSetOf<String>()
     @Volatile private var responseDone = false
     @Volatile private var pendingToolCount = 0
     @Volatile private var awaitingToolFollowUp = false
@@ -169,6 +170,7 @@ class StepFunRealtimePipeline(
     fun submitText(text: String) {
         val normalized = text.trim()
         if (normalized.isBlank()) return
+        tools.resetTurnToolBudget()
         val stored = store.addMessageToConversation(conversationId, "user", normalized)
         EventBus.emitChatMessage(ChatMessage(ChatRole.USER, normalized, stored.timestamp, stored.id, conversationId = conversationId))
         try {
@@ -200,8 +202,13 @@ class StepFunRealtimePipeline(
         warmupStopped?.complete(Unit)
         if (sessionFinishedNotified.compareAndSet(false, true)) {
             userDraft?.takeIf { !it.completed }?.let {
-                if (it.text.isBlank()) it.text.append(it.candidateTranscript.orEmpty())
-                persistUserDraft(it, ChatStreamState.INTERRUPTED)
+                // A text turn is already persisted by submitText(). A draft without a
+                // message id is only a server-side candidate and must not create a
+                // duplicate user bubble when the session is stopped.
+                if (it.messageId != null) {
+                    if (it.text.isBlank()) it.text.append(it.candidateTranscript.orEmpty())
+                    persistUserDraft(it, ChatStreamState.INTERRUPTED)
+                }
                 it.completed = true
             }
             assistantDraft?.let { persistAssistantDraft(it, ChatStreamState.INTERRUPTED) }
@@ -234,6 +241,11 @@ class StepFunRealtimePipeline(
             is StepFunRealtimeProtocol.Event.Unknown -> Unit
             StepFunRealtimeProtocol.Event.UserSpeechStarted -> {
                 synchronized(sessionBoundaryLock) { userSpeaking = true; responseInFlight = true; awaitingUserResponse = true }
+                tools.resetTurnToolBudget()
+                DiagLog.i(
+                    "realtime.barge_in",
+                    "speech_started activeItem=${activeAssistantItemId ?: "none"} assistantDraft=${assistantDraft != null} responseInFlight=$responseInFlight",
+                )
                 interruptAssistantForBargeIn()
                 beginUserTranscriptTurn()
             }
@@ -262,8 +274,12 @@ class StepFunRealtimePipeline(
             is StepFunRealtimeProtocol.Event.ThinkingDelta -> if (!warmingUp) appendThinking(event.itemId, event.text)
             is StepFunRealtimeProtocol.Event.AudioDelta -> {
                 if (warmingUp) return@synchronized
+                if (event.itemId != null && cancelledAssistantItemIds.contains(event.itemId)) {
+                    DiagLog.i("realtime.audio.discarded", "reason=cancelled_item item=${event.itemId}")
+                    return@synchronized
+                }
                 activeAssistantItemId = event.itemId ?: activeAssistantItemId
-                runCatching { player.enqueue(Base64.getDecoder().decode(event.base64Audio)) }
+                runCatching { player.enqueue(Base64.getDecoder().decode(event.base64Audio), event.itemId) }
                     .onFailure { error -> onLog("Realtime 音频入队失败：${error.message ?: error.javaClass.simpleName}") }
             }
             StepFunRealtimeProtocol.Event.AudioDone -> {
@@ -271,6 +287,8 @@ class StepFunRealtimePipeline(
             }
             is StepFunRealtimeProtocol.Event.FunctionArgumentsDone -> executeTool(event, sessionGeneration.get())
             StepFunRealtimeProtocol.Event.ResponseCreated -> {
+                cancelledAssistantItemIds.clear()
+                player.beginResponse()
                 awaitingUserResponse = false
                 responseInFlight = true
                 toolFollowUpRetryJob?.cancel()
@@ -482,9 +500,10 @@ class StepFunRealtimePipeline(
     private fun interruptAssistantForBargeIn() {
         val itemId = activeAssistantItemId
         if (itemId == null && assistantDraft == null) return
+        itemId?.takeIf { it.isNotBlank() }?.let(cancelledAssistantItemIds::add)
         runCatching { client.cancelResponse() }
         itemId?.let { active -> runCatching { client.truncateAssistantAudio(active, player.playedAudioMs()) } }
-        player.interrupt()
+        player.interrupt(itemId)
         assistantDraft?.let { draft -> persistAssistantDraft(draft, ChatStreamState.INTERRUPTED) }
         assistantDraft = null
         activeAssistantItemId = null

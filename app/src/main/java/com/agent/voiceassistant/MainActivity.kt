@@ -675,11 +675,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshConversations() {
         if (!::conversationAdapter.isInitialized) return
-        val conversations = store.conversationSummaries(ConversationDomain.STANDARD)
+        val conversations = store.conversationSummaries()
         conversationAdapter.submitList(conversations)
     }
 
     private fun selectConversation(conversation: ConversationSummary) {
+        if (conversation.domain == ConversationDomain.REALTIME) {
+            startActivity(Intent(this, RealtimeActivity::class.java).putExtra(RealtimeActivity.EXTRA_CONVERSATION_ID, conversation.id))
+            binding.drawerLayout.closeDrawer(GravityCompat.START)
+            return
+        }
         if (!conversation.current) VoiceAgentService.switchConversation(this, conversation.id)
         binding.drawerLayout.closeDrawer(GravityCompat.START)
     }

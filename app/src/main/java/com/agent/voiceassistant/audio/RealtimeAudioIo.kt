@@ -22,6 +22,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.coroutineContext
 import kotlin.math.sqrt
 import timber.log.Timber
@@ -119,7 +120,7 @@ class RealtimePcmPlayer(
     private val sampleRate: Int = OUTPUT_SAMPLE_RATE,
 ) {
     private sealed interface Event {
-        data class Audio(val generation: Long, val pcm: ByteArray) : Event
+        data class Audio(val generation: Long, val itemId: String?, val pcm: ByteArray) : Event
         data class AudioDone(val generation: Long) : Event
         data class Interrupt(val generation: Long) : Event
         data class Drain(val done: CompletableDeferred<Unit>) : Event
@@ -129,13 +130,20 @@ class RealtimePcmPlayer(
     private val events = Channel<Event>(Channel.UNLIMITED)
     private val generation = AtomicLong(0L)
     private val released = AtomicBoolean(false)
+    private val cancelledItemIds = ConcurrentHashMap.newKeySet<String>()
+    @Volatile private var bypassStartupBuffer = false
     @Volatile private var track: AudioTrack? = null
     private val worker: Job = scope.launch(Dispatchers.IO) { playLoop() }
 
-    fun enqueue(pcm16Le: ByteArray) {
+    fun enqueue(pcm16Le: ByteArray, itemId: String? = null) {
         if (pcm16Le.isEmpty()) return
         check(!released.get()) { "Realtime PCM 播放器已释放" }
-        check(events.trySend(Event.Audio(generation.get(), pcm16Le)).isSuccess) { "Realtime PCM 队列不可用" }
+        check(events.trySend(Event.Audio(generation.get(), itemId, pcm16Le)).isSuccess) { "Realtime PCM 队列不可用" }
+    }
+
+    /** Starts a new server response. Audio from a previous cancelled item cannot cross this boundary. */
+    fun beginResponse() {
+        cancelledItemIds.clear()
     }
 
     fun finishResponseAudio() {
@@ -144,9 +152,17 @@ class RealtimePcmPlayer(
     }
 
     /** Drops pending packets promptly; the worker fades only its currently held tail. */
-    fun interrupt() {
+    fun interrupt(itemId: String? = null) {
         if (released.get()) return
-        events.trySend(Event.Interrupt(generation.incrementAndGet()))
+        itemId?.takeIf { it.isNotBlank() }?.let(cancelledItemIds::add)
+        bypassStartupBuffer = true
+        generation.incrementAndGet()
+        // Do this synchronously so a barge-in cannot wait behind a blocked WRITE_BLOCKING call.
+        track?.let { active ->
+            runCatching { active.pause() }
+            runCatching { active.flush() }
+        }
+        events.trySend(Event.Interrupt(generation.get()))
     }
 
     suspend fun awaitPlaybackDrained() {
@@ -188,7 +204,8 @@ class RealtimePcmPlayer(
             startupBuffer.clear()
             bufferedBytes = 0
             heldTail = ByteArray(0)
-            started = false
+            started = bypassStartupBuffer
+            bypassStartupBuffer = false
             firstPacket = true
             if (dropTrackBuffer) {
                 track?.let { active ->
@@ -251,6 +268,10 @@ class RealtimePcmPlayer(
                 when (event) {
                     is Event.Audio -> {
                         if (event.generation != generation.get()) continue
+                        if (event.itemId != null && cancelledItemIds.contains(event.itemId)) {
+                            Timber.i("RealtimePcmPlayer: discarded cancelled item audio item=${event.itemId}")
+                            continue
+                        }
                         activeGeneration = event.generation
                         if (!started) {
                             startupBuffer.addLast(event.pcm)

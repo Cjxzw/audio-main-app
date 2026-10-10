@@ -520,6 +520,7 @@ class VoiceAgentService : Service() {
                     silentAudio = activeTextTurnSilent,
                 )
             },
+            historicalConversationSearch = { keyword, limit -> store.searchHistoricalConversationTurns(keyword, limit) },
         )
         serviceScope.launch { taskCoordinator.recover() }
         serviceScope.launch { taskReportReviewLoop() }
@@ -1115,6 +1116,7 @@ class VoiceAgentService : Service() {
         }
         val speakReplies = false
         mainTurnActive.set(true)
+        toolRegistry.resetTurnToolBudget()
         turnMutex.withLock {
             activeTextTurnSilent = source == "text" && !speakReplies
             try {

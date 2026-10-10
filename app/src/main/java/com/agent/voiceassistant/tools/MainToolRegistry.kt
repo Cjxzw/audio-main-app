@@ -18,12 +18,14 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 
 class MainToolRegistry(
     private val executor: LocalToolExecutor,
     private val taskCoordinator: AsyncTaskCoordinator? = null,
     private val taskRepository: TaskRepository? = null,
     private val taskContext: () -> TaskToolContext = { TaskToolContext("default", "") },
+    private val historicalConversationSearch: ((String, Int) -> String)? = null,
 ) {
     data class TaskToolContext(
         val conversationId: String,
@@ -46,6 +48,11 @@ class MainToolRegistry(
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
+    }
+    private val historicalSearchCount = AtomicInteger(0)
+
+    fun resetTurnToolBudget() {
+        historicalSearchCount.set(0)
     }
 
     fun definitions(
@@ -111,6 +118,17 @@ class MainToolRegistry(
 
     suspend fun execute(call: CloudSpeechClient.ToolCall): Execution {
         val payload = parseArguments(call.arguments)
+        if (call.name == TOOL_MEMORY_SEARCH && payload.text("scope") == "history") {
+            val query = payload.text("query").orEmpty().trim()
+            if (query.isBlank()) {
+                return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索失败", "必须提供一个关键词。", shouldAskLlm = false, success = false))
+            }
+            if (historicalSearchCount.incrementAndGet() > 3) {
+                return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索已限流", "每个回合最多搜索 3 次，请合并关键词后再试。", shouldAskLlm = false))
+            }
+            val result = historicalConversationSearch?.invoke(query, 3) ?: "历史会话搜索暂不可用。"
+            return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索", result, shouldAskLlm = false))
+        }
         if (call.name == TOOL_HUB_DISPATCH_TASK) {
             return Execution(call, executeHubDispatch(payload))
         }
@@ -476,11 +494,16 @@ class MainToolRegistry(
 
     private fun memorySearch() = tool(
         name = TOOL_MEMORY_SEARCH,
-        description = "查询用户此前要求保存的本地记忆。",
+        description = "查询本地长期记忆；需要补充旧会话细节时，将 scope 设为 history，并提供一个明确关键词。历史会话搜索每回合最多 3 次，每次最多返回 3 轮。",
     ) {
         putJsonObject("query") {
             put("type", "string")
             put("description", "查询关键词；为空时返回最近记忆")
+        }
+        putJsonObject("scope") {
+            put("type", "string")
+            put("enum", buildJsonArray { add(JsonPrimitive("memory")); add(JsonPrimitive("history")) })
+            put("description", "memory 查询长期记忆；history 查询历史会话细节")
         }
         putJsonObject("limit") {
             put("type", "integer")

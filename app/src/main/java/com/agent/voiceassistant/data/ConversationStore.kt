@@ -71,6 +71,7 @@ class ConversationStore(context: Context) {
                 messageCount = session.messages.count { it.chatVisible != false },
                 current = session.id == state.currentConversationId,
                 memoryCompressedAt = session.memoryCompressedAt,
+                domain = session.domain,
             )
             }
             .toList()
@@ -87,6 +88,7 @@ class ConversationStore(context: Context) {
             messageCount = session.messages.count { it.chatVisible != false },
             current = true,
             memoryCompressedAt = session.memoryCompressedAt,
+            domain = session.domain,
         )
     }
 
@@ -767,6 +769,52 @@ class ConversationStore(context: Context) {
         }
     }
 
+    /** Returns at most three user/assistant turns from old sessions for a single keyword. */
+    fun searchHistoricalConversationTurns(keyword: String, maxTurns: Int = 3): String = synchronized(lock) {
+        val query = keyword.trim()
+        if (query.isBlank()) return@synchronized "历史会话搜索需要一个明确关键词。"
+        data class Candidate(
+            val user: String,
+            val assistant: String,
+            val updatedAt: Long,
+            val uncompressed: Boolean,
+        )
+        val candidates = mutableListOf<Candidate>()
+        state.sessions.filter { it.domain == ConversationDomain.STANDARD }.forEach { session ->
+            val cursorIndex = session.compactedUpToMessageId
+                ?.let { id -> session.messages.indexOfFirst { it.id == id } }
+                ?: -1
+            session.messages.forEachIndexed { index, message ->
+                if (message.role != "user" || message.content.isBlank()) return@forEachIndexed
+                val assistant = session.messages
+                    .drop(index + 1)
+                    .takeWhile { it.role != "user" }
+                    .lastOrNull { it.role == "assistant" && it.content.isNotBlank() && it.llmVisible != false }
+                    ?: return@forEachIndexed
+                if (!message.content.contains(query, ignoreCase = true) &&
+                    !assistant.content.contains(query, ignoreCase = true)
+                ) return@forEachIndexed
+                candidates += Candidate(
+                    user = message.content,
+                    assistant = assistant.content,
+                    updatedAt = maxOf(message.timestamp, assistant.timestamp),
+                    uncompressed = index > cursorIndex,
+                )
+            }
+        }
+        val selected = candidates
+            .sortedWith(compareByDescending<Candidate> { it.uncompressed }.thenByDescending { it.updatedAt })
+            .take(maxTurns.coerceIn(1, 3))
+        if (selected.isEmpty()) return@synchronized "没有找到包含“$query”的历史会话。"
+        buildString {
+            appendLine("历史会话搜索结果（关键词：$query）：")
+            selected.forEachIndexed { index, candidate ->
+                val body = "用户：${candidate.user}\n助手：${candidate.assistant}"
+                appendLine("${index + 1}. ${body.take(1000)}${if (body.length > 1000) "…（已截断）" else ""}")
+            }
+        }.trim()
+    }
+
     fun memories(): List<StoredMemory> = synchronized(lock) {
         state.memories.sortedByDescending { it.updatedAt }
     }
@@ -935,12 +983,6 @@ class ConversationStore(context: Context) {
             loaded.sessions.forEach { session ->
                 if (session.title.isBlank()) session.title = defaultConversationTitle(session.createdAt)
                 session.contextSnapshot = null
-                if (session.domain == ConversationDomain.STANDARD && session.messages.any { message ->
-                        message.modelId?.startsWith("stepaudio-") == true
-                    }
-                ) {
-                    session.domain = ConversationDomain.REALTIME
-                }
             }
         }
     }
@@ -1246,6 +1288,7 @@ data class ConversationSummary(
     val messageCount: Int,
     val current: Boolean,
     val memoryCompressedAt: Long?,
+    val domain: ConversationDomain = ConversationDomain.STANDARD,
 )
 
 data class ConversationCompressionSource(

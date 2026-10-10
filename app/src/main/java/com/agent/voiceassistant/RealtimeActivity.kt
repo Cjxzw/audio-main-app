@@ -28,6 +28,7 @@ class RealtimeActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID)
         setContentView(R.layout.activity_realtime)
         store = ConversationStore(this)
         adapter = ChatAdapter()
@@ -122,5 +123,9 @@ class RealtimeActivity : AppCompatActivity() {
         findViewById<RecyclerView>(R.id.rvRealtimeChat).post {
             if (adapter.itemCount > 0) findViewById<RecyclerView>(R.id.rvRealtimeChat).scrollToPosition(adapter.itemCount - 1)
         }
+    }
+
+    companion object {
+        const val EXTRA_CONVERSATION_ID = "realtime_conversation_id"
     }
 }
