@@ -95,4 +95,23 @@ class RealtimeContextProjectionTest {
         assertTrue(snapshot.contains("通话二"))
         assertEquals(4, listOf("问题一", "通话一", "问题二", "通话二").count { snapshot.contains(it) })
     }
+
+    @Test fun handoverDetailsAreSeparateFromTheVisibleTranscript() {
+        val messages = listOf(
+            message("user", "查一下天气"),
+            message("assistant", "北京今天晴。").copy(
+                reasoningItems = listOf(StoredReasoningDisplayItem("MARKDOWN", "先查询天气")),
+            ),
+            message("tool", "晴，25℃").copy(toolCallId = "call-1", toolStatus = "SUCCEEDED"),
+        )
+        val transcript = RealtimeContextProjection.transcript(messages)
+        assertTrue(transcript.contains("用户：查一下天气"))
+        assertTrue(transcript.contains("助手：北京今天晴。"))
+        assertFalse(transcript.contains("先查询天气"))
+        assertFalse(transcript.contains("晴，25℃"))
+        assertEquals(
+            "思考：先查询天气\n\n工具结果[SUCCEEDED]：晴，25℃",
+            RealtimeContextProjection.details(messages),
+        )
+    }
 }

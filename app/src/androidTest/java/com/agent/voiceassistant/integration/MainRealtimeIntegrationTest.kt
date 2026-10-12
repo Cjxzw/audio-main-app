@@ -10,6 +10,7 @@ import com.agent.voiceassistant.data.ConversationDomain
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.tools.CredentialProfileStore
+import com.agent.voiceassistant.ui.ChatPresentation
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
@@ -44,12 +45,18 @@ class MainRealtimeIntegrationTest {
             store.addMessageToConversation(realtime, "user", "问题$it")
             store.addMessageToConversation(realtime, "assistant", "完整正文$it " + "长".repeat(1000))
         }
-        store.transferRealtimeTranscript(realtime, main)
+        val inserted = store.transferRealtimeTranscript(realtime, main)
+        assertNotNull(inserted)
+        assertEquals(ChatPresentation.REALTIME_TRANSCRIPT, inserted!!.presentation)
+        assertTrue(store.recentChatMessagesForConversation(main).any {
+            it.presentation == ChatPresentation.REALTIME_TRANSCRIPT && it.text.contains("问题0")
+        })
+        assertFalse(store.llmHistoryForConversation(main).any { it.content?.contains("Realtime 通话记录") == true })
         val notes = store.realtimeContextNotes(main)
         assertEquals(1, notes.size)
         assertTrue(notes.single().contains("问题0"))
         assertTrue(notes.single().contains("完整正文59 " + "长".repeat(1000)))
-        store.transferRealtimeTranscript(realtime, main)
+        assertNull(store.transferRealtimeTranscript(realtime, main))
         assertEquals(notes, store.realtimeContextNotes(main))
         store.addMessageToConversation(realtime, "user", "重连后的新问题")
         store.transferRealtimeTranscript(realtime, main)

@@ -352,17 +352,31 @@ class ConversationStore(context: Context) {
     }
 
     /** Persist the handover and its cursor together, including across reconnects/process restarts. */
-    fun transferRealtimeTranscript(sourceId: String, targetId: String) = synchronized(lock) {
-        val source = state.sessions.firstOrNull { it.id == sourceId } ?: return@synchronized
-        val target = state.sessions.firstOrNull { it.id == targetId } ?: return@synchronized
+    fun transferRealtimeTranscript(sourceId: String, targetId: String): ChatMessage? = synchronized(lock) {
+        val source = state.sessions.firstOrNull { it.id == sourceId } ?: return@synchronized null
+        val target = state.sessions.firstOrNull { it.id == targetId } ?: return@synchronized null
         val transcript = RealtimeContextProjection.transcript(source.messages.drop(source.realtimeHandoverCount))
+        val details = RealtimeContextProjection.details(source.messages.drop(source.realtimeHandoverCount))
+        var inserted: StoredMessage? = null
         if (transcript.isNotBlank()) {
             val endedAt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())
             target.pendingContextNotes += "Realtime 通话记录（$endedAt）：\n$transcript"
+            val message = StoredMessage(
+                id = UUID.randomUUID().toString(),
+                role = "system",
+                content = transcript,
+                timestamp = System.currentTimeMillis(),
+                presentation = ChatPresentation.REALTIME_TRANSCRIPT.name,
+                llmVisible = false,
+                reasoningText = details.takeIf(String::isNotBlank),
+            )
+            target.messages.add(message)
+            inserted = message
             target.updatedAt = System.currentTimeMillis()
         }
         source.realtimeHandoverCount = source.messages.size
         persistLocked()
+        inserted?.toChatMessage(target.id)
     }
 
     fun appendPendingContextNote(conversationId: String, note: String) = synchronized(lock) {

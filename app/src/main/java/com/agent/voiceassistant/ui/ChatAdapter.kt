@@ -24,6 +24,7 @@ import kotlin.math.roundToInt
 
 class ChatAdapter(
     private val onWorkspaceFileOpen: (String) -> Unit = {},
+    private val onRealtimeTranscriptOpen: (ChatMessage) -> Unit = {},
 ) : RecyclerView.Adapter<ChatAdapter.VH>() {
 
     private val messages = mutableListOf<ChatMessage>()
@@ -95,6 +96,7 @@ class ChatAdapter(
                 reasoningOverrides[detailKey(message, position)] = expanded
             },
             onWorkspaceFileOpen = onWorkspaceFileOpen,
+            onRealtimeTranscriptOpen = onRealtimeTranscriptOpen,
         )
     }
 
@@ -121,6 +123,7 @@ class ChatAdapter(
         private val onDetailsToggle: (Int, Boolean) -> Unit,
         private val onReasoningToggle: (Int, Boolean) -> Unit,
         private val onWorkspaceFileOpen: (String) -> Unit,
+        private val onRealtimeTranscriptOpen: (ChatMessage) -> Unit,
     ) : RecyclerView.ViewHolder(view) {
         private val llBubble = view.findViewById<LinearLayout>(R.id.llBubble)
         private val tvRole = view.findViewById<TextView>(R.id.tvRole)
@@ -145,6 +148,11 @@ class ChatAdapter(
 
         fun bind(msg: ChatMessage, detailsExpanded: Boolean, reasoningExpanded: Boolean) {
             val ctx = itemView.context
+            if (msg.presentation == ChatPresentation.REALTIME_TRANSCRIPT) {
+                bindRealtimeTranscript(msg)
+                return
+            }
+            tvText.setOnClickListener(null)
             val isToolStatus = !msg.toolCallId.isNullOrBlank()
             tvRole.visibility = if (isToolStatus) View.GONE else View.VISIBLE
             tvTime.visibility = if (isToolStatus) View.GONE else View.VISIBLE
@@ -217,6 +225,23 @@ class ChatAdapter(
             bindText(msg, detailsExpanded)
             bindLiveReasoning(msg)
             bindReasoning(msg, reasoningExpanded)
+            tvTime.text = msg.metadataStr
+        }
+
+        private fun bindRealtimeTranscript(msg: ChatMessage) {
+            tvRole.visibility = View.VISIBLE
+            tvTime.visibility = View.VISIBLE
+            tvText.visibility = View.VISIBLE
+            llToolStatus.visibility = View.GONE
+            llDetails.visibility = View.GONE
+            llReasoning.visibility = View.GONE
+            svLiveReasoning.visibility = View.GONE
+            llBubble.gravity = android.view.Gravity.CENTER
+            tvRole.text = "Realtime 通话记录"
+            tvText.text = "点击查看本次通话内容"
+            tvText.background = ContextCompat.getDrawable(itemView.context, R.drawable.bubble_system)
+            tvText.setTextColor(ContextCompat.getColor(itemView.context, android.R.color.white))
+            tvText.setOnClickListener { onRealtimeTranscriptOpen(msg) }
             tvTime.text = msg.metadataStr
         }
 

@@ -79,6 +79,22 @@ class StepFunRealtimeProtocolTest {
     }
 
     @Test
+    fun `keeps input transcription deltas separate from the authoritative completed transcript`() {
+        assertEquals(
+            StepFunRealtimeProtocol.Event.UserTranscriptDelta("item_user", "请查"),
+            StepFunRealtimeProtocol.parse(
+                """{"type":"conversation.item.input_audio_transcription.delta","item_id":"item_user","delta":"请查"}""",
+            ),
+        )
+        assertEquals(
+            StepFunRealtimeProtocol.Event.UserTranscriptDone("item_user", "请查询天气"),
+            StepFunRealtimeProtocol.parse(
+                """{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_user","transcript":"请查询天气"}""",
+            ),
+        )
+    }
+
+    @Test
     fun `does not treat a text item echo as a second user transcript`() {
         val event = StepFunRealtimeProtocol.parse(
             """{"type":"conversation.item.created","item":{"id":"item_text","role":"user","content":[{"type":"input_text","transcript":"你好","text":"你好"}]}}""",

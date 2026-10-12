@@ -71,7 +71,7 @@ class StepFunRealtimePipeline(
     private var assistantDraft: AssistantDraft? = null
     private var userDraft: UserDraft? = null
     private var nextUserTurnId = 0L
-    private var transcriptFallbackJob: Job? = null
+    private var userPersistJob: Job? = null
     private var assistantPersistJob: Job? = null
     private var responseStartedAtMs = 0L
     private var firstAudioDeltaAtMs = 0L
@@ -207,6 +207,8 @@ class StepFunRealtimePipeline(
             EventBus.emitChatRemoval(messageId)
         }
         warmupStopped?.complete(Unit)
+        userPersistJob?.cancel()
+        userPersistJob = null
         if (sessionFinishedNotified.compareAndSet(false, true)) {
             userDraft?.takeIf { !it.completed }?.let {
                 // A text turn is already persisted by submitText(). A draft without a
@@ -233,8 +235,6 @@ class StepFunRealtimePipeline(
         hangupJob = null
         toolFollowUpRetryJob?.cancel()
         toolFollowUpRetryJob = null
-        transcriptFallbackJob?.cancel()
-        transcriptFallbackJob = null
         assistantPersistJob?.cancel()
         assistantPersistJob = null
         eventsJob?.cancel()
@@ -374,11 +374,13 @@ class StepFunRealtimePipeline(
     }
 
     private fun beginUserTranscriptTurn() {
-        if (userDraft?.completed == false) return
-        transcriptFallbackJob?.cancel()
-        transcriptFallbackJob = null
-        userDraft?.takeIf { !it.completed && it.text.isNotBlank() }?.let { interrupted ->
-            persistUserDraft(interrupted, ChatStreamState.INTERRUPTED)
+        userPersistJob?.cancel()
+        userPersistJob = null
+        userDraft?.takeIf { !it.completed }?.let { previous ->
+            if (previous.text.isNotBlank()) {
+                persistUserDraft(previous, ChatStreamState.INTERRUPTED)
+            }
+            previous.completed = true
         }
         userDraft = UserDraft(turnId = ++nextUserTurnId)
     }
@@ -387,16 +389,14 @@ class StepFunRealtimePipeline(
         val draft = userDraft ?: return
         if (draft.completed) return
         draft.awaitingFinal = true
-        scheduleTranscriptFallback(draft)
     }
 
     private fun appendUserTranscript(itemId: String?, delta: String) {
         if (delta.isBlank()) return
-        val draft = activeUserDraft() ?: return
+        val draft = activeUserDraft(itemId) ?: return
         if (draft.completed) return
         itemId?.let(draft.serverItemIds::add)
-        val merged = RealtimeTranscriptAccumulator.merge(draft.text.toString(), delta)
-        if (merged == draft.text.toString()) return
+        val merged = RealtimeTranscriptAccumulator.appendDelta(draft.text.toString(), delta)
         draft.text.setLength(0)
         draft.text.append(merged)
         persistUserDraft(draft, ChatStreamState.STREAMING)
@@ -405,22 +405,29 @@ class StepFunRealtimePipeline(
 
     private fun recordUserTranscriptCandidate(itemId: String?, transcript: String) {
         if (transcript.isBlank()) return
-        val draft = activeUserDraft() ?: return
+        val draft = activeUserDraft(itemId) ?: return
         if (draft.completed) return
         itemId?.let(draft.serverItemIds::add)
         draft.candidateTranscript = transcript
-        scheduleTranscriptFallback(draft)
+        // A candidate is provisional but should be visible immediately. Never overwrite a
+        // literal delta stream with a candidate snapshot that arrived later.
+        if (draft.text.isBlank()) {
+            draft.text.append(transcript)
+            persistUserDraft(draft, ChatStreamState.STREAMING)
+        } else {
+            publishUserDraft(draft, ChatStreamState.STREAMING)
+        }
         DiagLog.i("realtime.asr.candidate", "turn=${draft.turnId} item=${itemId ?: "none"} chars=${transcript.length}")
     }
 
     private fun finishUserTranscript(itemId: String?, transcript: String) {
-        val draft = activeUserDraft() ?: return
+        val draft = activeUserDraft(itemId) ?: return
         if (draft.completed) return
         itemId?.let(draft.serverItemIds::add)
         val finalText = transcript.ifBlank { draft.candidateTranscript.orEmpty() }
         if (finalText.isBlank()) return
-        transcriptFallbackJob?.cancel()
-        transcriptFallbackJob = null
+        userPersistJob?.cancel()
+        userPersistJob = null
         draft.text.setLength(0)
         draft.text.append(finalText)
         draft.completed = true
@@ -428,26 +435,20 @@ class StepFunRealtimePipeline(
         DiagLog.i("realtime.asr.final", "turn=${draft.turnId} item=${itemId ?: "none"} chars=${finalText.length}")
     }
 
-    private fun activeUserDraft(): UserDraft? {
+    private fun activeUserDraft(itemId: String? = null): UserDraft? {
         val current = userDraft
-        if (current != null) return current
-        // Server VAD normally emits speech_started first; this protects partial compatibility.
-        return UserDraft(turnId = ++nextUserTurnId).also { userDraft = it }
-    }
-
-    private fun scheduleTranscriptFallback(draft: UserDraft) {
-        if (!draft.awaitingFinal || draft.candidateTranscript.isNullOrBlank() || transcriptFallbackJob?.isActive == true) return
-        transcriptFallbackJob = scope.launch {
-            delay(FINAL_TRANSCRIPT_FALLBACK_MS)
-            if (userDraft !== draft || draft.completed) return@launch
-            val candidate = draft.candidateTranscript.orEmpty()
-            if (candidate.isBlank()) return@launch
-            draft.text.setLength(0)
-            draft.text.append(candidate)
-            draft.completed = true
-            persistUserDraft(draft, ChatStreamState.COMPLETED)
-            DiagLog.w("realtime.asr.fallback", "turn=${draft.turnId} chars=${candidate.length}")
+        if (current != null && !current.completed &&
+            (itemId.isNullOrBlank() || current.serverItemId.isNullOrBlank() || current.serverItemId == itemId)
+        ) {
+            if (!itemId.isNullOrBlank()) current.serverItemId = itemId
+            return current
         }
+        if (current != null && !current.completed && current.text.isNotBlank()) {
+            persistUserDraft(current, ChatStreamState.INTERRUPTED)
+            current.completed = true
+        }
+        // Server VAD normally emits speech_started first; this protects partial compatibility.
+        return UserDraft(turnId = ++nextUserTurnId, serverItemId = itemId).also { userDraft = it }
     }
 
     private fun persistUserDraft(draft: UserDraft, state: ChatStreamState) {
@@ -457,9 +458,22 @@ class StepFunRealtimePipeline(
             val stored = store.addMessageToConversation(conversationId, "user", text, streamState = state)
             draft.messageId = stored.id
             draft.timestamp = stored.timestamp
-        } else {
-            store.updateMessageInConversation(conversationId, requireNotNull(draft.messageId), text, streamState = state)
+        } else if (state != ChatStreamState.STREAMING) {
+            persistUserDraftNow(draft, state)
         }
+        publishUserDraft(draft, state)
+        if (state == ChatStreamState.STREAMING) scheduleUserDraftPersist(draft)
+    }
+
+    private fun persistUserDraftNow(draft: UserDraft, state: ChatStreamState) {
+        val text = draft.text.toString().trim()
+        if (text.isBlank() || draft.messageId == null) return
+        store.updateMessageInConversation(conversationId, requireNotNull(draft.messageId), text, streamState = state)
+    }
+
+    private fun publishUserDraft(draft: UserDraft, state: ChatStreamState) {
+        val text = draft.text.toString().trim()
+        if (text.isBlank()) return
         EventBus.emitChatMessage(
             ChatMessage(
                 role = ChatRole.USER,
@@ -470,6 +484,17 @@ class StepFunRealtimePipeline(
                 conversationId = conversationId,
             ),
         )
+    }
+
+    private fun scheduleUserDraftPersist(draft: UserDraft) {
+        if (userPersistJob?.isActive == true) return
+        userPersistJob = scope.launch {
+            delay(80L)
+            userPersistJob = null
+            if (!stopping && userDraft === draft && draft.messageId != null && !draft.completed) {
+                persistUserDraftNow(draft, ChatStreamState.STREAMING)
+            }
+        }
     }
 
     private fun appendAssistantText(itemId: String?, delta: String, source: TextSource) {
@@ -833,6 +858,7 @@ class StepFunRealtimePipeline(
         val turnId: Long,
         val text: StringBuilder = StringBuilder(),
         val serverItemIds: MutableSet<String> = linkedSetOf(),
+        var serverItemId: String? = null,
         var candidateTranscript: String? = null,
         var awaitingFinal: Boolean = false,
         var completed: Boolean = false,
@@ -855,7 +881,6 @@ class StepFunRealtimePipeline(
     private companion object {
         const val TOOL_FOLLOW_UP_RETRY_DELAY_MS = 750L
         const val MAX_TOOL_FOLLOW_UP_RETRIES = 3
-        const val FINAL_TRANSCRIPT_FALLBACK_MS = 1_500L
         const val MODEL_HANGUP_DRAIN_TIMEOUT_MS = 10_000L
     }
 }

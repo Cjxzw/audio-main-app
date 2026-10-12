@@ -20,6 +20,23 @@ object RealtimeContextProjection {
         }
         .joinToString("\n")
 
+    /** Details stay behind the handover card and are never part of the main LLM context. */
+    fun details(messages: List<StoredMessage>): String = buildList {
+        messages.forEach { message ->
+            message.reasoningItems
+                .map { it.text.trim() }
+                .filter(String::isNotBlank)
+                .forEach { add("思考：$it") }
+            if (message.toolCalls.isNotEmpty()) {
+                add("工具调用：${message.toolCalls.joinToString { it.name }}")
+            }
+            if (message.role == "tool" && message.content.isNotBlank()) {
+                val status = message.toolStatus ?: "unknown"
+                add("工具结果[$status]：${message.content}")
+            }
+        }
+    }.joinToString("\n\n")
+
     fun snapshot(messages: List<StoredMessage>, maxTurns: Int = 10, maxChars: Int = 1200): String {
         val turns = mutableListOf<MutableList<StoredMessage>>()
         messages.forEach { message ->

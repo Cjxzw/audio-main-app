@@ -8,7 +8,7 @@ enum class ChatRole { USER, BOT, SYSTEM }
 
 enum class ToolDisplayStatus { RUNNING, SUCCEEDED, FAILED }
 
-enum class ChatPresentation { STANDARD, PERSONALIZED_VOICE }
+enum class ChatPresentation { STANDARD, PERSONALIZED_VOICE, REALTIME_TRANSCRIPT }
 
 enum class ChatStreamState { STREAMING, COMPLETED, INTERRUPTED }
 

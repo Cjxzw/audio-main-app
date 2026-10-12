@@ -1321,7 +1321,6 @@ class VoiceAgentService : Service() {
     }
 
     private fun createStepFunRealtimePipeline(routes: AudioRouteManager): StepFunRealtimePipeline {
-        val mainId = mainConversationId
         val realtimeId = realtimeConversationId
         return StepFunRealtimePipeline(
             scope = serviceScope,
@@ -1330,10 +1329,15 @@ class VoiceAgentService : Service() {
             settings = realtimePipelineRepository,
             tools = toolRegistry,
             conversationId = realtimeId,
-            mainSnapshot = { store.realtimeStartupSnapshot(mainId) },
-            queryMainConversation = { keyword, turns -> store.conversationProjection(mainId, keyword, turns) },
+            mainSnapshot = { store.realtimeStartupSnapshot(store.currentConversationId) },
+            queryMainConversation = { keyword, turns -> store.conversationProjection(store.currentConversationId, keyword, turns) },
             delegateToMain = ::delegateRealtimeToMain,
-            onSessionFinished = { store.transferRealtimeTranscript(realtimeId, mainId) },
+            onSessionFinished = {
+                store.transferRealtimeTranscript(realtimeId, store.currentConversationId)?.let { message ->
+                    EventBus.emitChatMessage(message)
+                    EventBus.emitConversationUpdate()
+                }
+            },
             onUndeliveredMainReply = { turnId, text, failed -> pendingRealtimeResults[turnId] = text to failed },
             instructions = {
                 buildRealtimeSystemPrompt()

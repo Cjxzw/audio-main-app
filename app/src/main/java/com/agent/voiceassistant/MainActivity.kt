@@ -14,7 +14,10 @@ import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ScrollView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
@@ -45,6 +48,7 @@ import com.agent.voiceassistant.service.VoiceAgentService
 import com.agent.voiceassistant.agent.runtime.MainAgentHarness
 import com.agent.voiceassistant.settings.SettingsActivity
 import com.agent.voiceassistant.ui.ChatAdapter
+import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ConversationAdapter
 import com.agent.voiceassistant.ui.MainPage
 import com.agent.voiceassistant.ui.MainPageAdapter
@@ -148,7 +152,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         store = ConversationStore(this)
         workspace = WorkspaceRepository(this)
-        chatAdapter = ChatAdapter(::openWorkspaceDump)
+        chatAdapter = ChatAdapter(::openWorkspaceDump, ::showRealtimeTranscript)
         taskRepository = TaskRepository(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
         homeBinding = PageHomeBinding.inflate(layoutInflater)
@@ -563,7 +567,7 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             EventBus.chatMessages.collectLatest { msg ->
-                if (msg.conversationId != null) return@collectLatest
+                if (msg.conversationId != null && msg.conversationId != store.currentConversationId) return@collectLatest
                 val inserted = chatAdapter.addMessage(msg)
                 if (chatTailFollowEnabled) scheduleChatTailFollow()
                 if (inserted) refreshConversations()
@@ -634,6 +638,51 @@ class MainActivity : AppCompatActivity() {
             .onFailure { showMessage(it.message ?: "转储文件不存在") }
     }
 
+    private fun showRealtimeTranscript(message: ChatMessage) {
+        val padding = (20 * resources.displayMetrics.density).toInt()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(padding, padding / 2, padding, padding / 2)
+        }
+        root.addView(TextView(this).apply {
+            text = message.text
+            textSize = 15f
+            setTextColor(getColor(android.R.color.black))
+            setTextIsSelectable(true)
+        })
+        val details = message.reasoningText?.trim().orEmpty()
+        if (details.isNotBlank()) {
+            val detailsView = TextView(this).apply {
+                text = details
+                textSize = 13f
+                setTextColor(getColor(android.R.color.darker_gray))
+                setTextIsSelectable(true)
+                visibility = View.GONE
+                setPadding(0, padding / 2, 0, 0)
+            }
+            root.addView(TextView(this).apply {
+                text = "查看思考和工具明细"
+                textSize = 13f
+                setTextColor(getColor(android.R.color.holo_blue_dark))
+                setPadding(0, padding / 2, 0, 0)
+                setOnClickListener {
+                    detailsView.visibility = if (detailsView.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    text = if (detailsView.visibility == View.VISIBLE) "收起思考和工具明细" else "查看思考和工具明细"
+                }
+            })
+            root.addView(detailsView)
+        }
+        val scroll = ScrollView(this).apply {
+            addView(root)
+            isFillViewport = true
+        }
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
+            .setTitle("Realtime 通话记录")
+            .setView(scroll)
+            .setPositiveButton(android.R.string.ok, null)
+            .showLightDialog()
+    }
+
     private fun updateStateDisplay(state: ServiceState) {
         if (state == ServiceState.LISTENING) {
             setVoiceControlActive(true)
@@ -675,7 +724,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshConversations() {
         if (!::conversationAdapter.isInitialized) return
-        val conversations = store.conversationSummaries()
+        val conversations = store.conversationSummaries(ConversationDomain.STANDARD)
         conversationAdapter.submitList(conversations)
     }
 
