@@ -14,10 +14,13 @@ import androidx.recyclerview.widget.RecyclerView
 import com.agent.voiceassistant.R
 import com.agent.voiceassistant.agent.LongDetailsPolicy
 import com.agent.voiceassistant.agent.ReplyDetailPolicy
+import com.agent.voiceassistant.workspace.WorkspaceLinkPolicy
 import com.agent.voiceassistant.ui.ChatRole.BOT
 import com.agent.voiceassistant.ui.ChatRole.SYSTEM
 import com.agent.voiceassistant.ui.ChatRole.USER
 import io.noties.markwon.Markwon
+import io.noties.markwon.AbstractMarkwonPlugin
+import io.noties.markwon.LinkResolverDef
 import io.noties.markwon.linkify.LinkifyPlugin
 import io.noties.markwon.ext.tables.TablePlugin
 import kotlin.math.roundToInt
@@ -82,6 +85,19 @@ class ChatAdapter(
         val markdownRenderer = markwon ?: Markwon.builder(parent.context.applicationContext)
             .usePlugin(LinkifyPlugin.create())
             .usePlugin(TablePlugin.create(parent.context.applicationContext))
+            .usePlugin(object : AbstractMarkwonPlugin() {
+                override fun configureConfiguration(builder: io.noties.markwon.MarkwonConfiguration.Builder) {
+                    val fallback = LinkResolverDef()
+                    builder.linkResolver { view, link ->
+                        val relative = WorkspaceLinkPolicy.relativePath(link)
+                        if (relative != null) {
+                            onWorkspaceFileOpen(relative)
+                        } else {
+                            fallback.resolve(view, link)
+                        }
+                    }
+                }
+            })
             .build()
             .also { markwon = it }
         return VH(

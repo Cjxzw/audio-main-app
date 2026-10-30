@@ -8,6 +8,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.text.method.LinkMovementMethod
 import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -15,6 +16,8 @@ import com.agent.voiceassistant.databinding.ActivityWorkspacePreviewBinding
 import com.agent.voiceassistant.editor.TextEditorActivity
 import com.agent.voiceassistant.R
 import io.noties.markwon.Markwon
+import io.noties.markwon.AbstractMarkwonPlugin
+import io.noties.markwon.LinkResolverDef
 import io.noties.markwon.ext.tables.TablePlugin
 import java.io.FileInputStream
 import java.util.Locale
@@ -70,8 +73,27 @@ class WorkspacePreviewActivity : AppCompatActivity() {
 
         val text = repository.readPreview(path)
         if (extension == "md" || extension == "markdown") {
-            Markwon.builder(this).usePlugin(TablePlugin.create(this)).build()
-                .setMarkdown(binding.tvWorkspacePreview, text)
+            val fallback = LinkResolverDef()
+            Markwon.builder(this)
+                .usePlugin(TablePlugin.create(this))
+                .usePlugin(object : AbstractMarkwonPlugin() {
+                    override fun configureConfiguration(builder: io.noties.markwon.MarkwonConfiguration.Builder) {
+                        builder.linkResolver { view, link ->
+                            val relative = WorkspaceLinkPolicy.relativePath(link, path)
+                            if (relative != null) {
+                                startActivity(Intent(this@WorkspacePreviewActivity, WorkspacePreviewActivity::class.java)
+                                    .putExtra(EXTRA_PATH, relative))
+                            } else {
+                                fallback.resolve(view, link)
+                            }
+                        }
+                    }
+                })
+                .build()
+                .also { markwon ->
+                    markwon.setMarkdown(binding.tvWorkspacePreview, text)
+                    binding.tvWorkspacePreview.movementMethod = LinkMovementMethod.getInstance()
+                }
         } else {
             binding.tvWorkspacePreview.typeface = android.graphics.Typeface.MONOSPACE
             binding.tvWorkspacePreview.text = text

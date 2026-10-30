@@ -417,6 +417,7 @@ class VoiceAgentService : Service() {
     @Volatile private var realtimeUiHidden = false
     private var mainConversationId: String = ""
     private var realtimeConversationId: String = ""
+    private val skillPromptSnapshots = ConcurrentHashMap<String, String>()
     private var lastThinkingFeedbackAudio: Int? = null
     @Volatile private var activeSourceTurnId: String = ""
     @Volatile private var activeLoopTurnId: String = ""
@@ -3298,9 +3299,21 @@ class VoiceAgentService : Service() {
     private fun buildSystemMessagePrefix(
         source: String,
         hubFacts: com.agent.voiceassistant.hub.HubFacts?,
+        conversationId: String = mainConversationId,
     ): List<CloudSpeechClient.LlmMessage> = listOf(
         CloudSpeechClient.LlmMessage("system", buildMainSystemPrompt()),
+        CloudSpeechClient.LlmMessage("system", skillPromptForConversation(conversationId)),
     )
+
+    /**
+     * Skill metadata is part of the conversation prefix. Freeze it for the lifetime of
+     * a conversation so a settings change does not rewrite an active prompt/KV-cache.
+     */
+    private fun skillPromptForConversation(conversationId: String): String =
+        skillPromptSnapshots[conversationId]
+            ?: skillRegistry.promptSummary().also { summary ->
+                skillPromptSnapshots.putIfAbsent(conversationId, summary)
+            }
 
     private fun buildRuntimeSystemContext(
         source: String,
@@ -3653,7 +3666,7 @@ class VoiceAgentService : Service() {
         val cachedHubFacts = HubRuntime.facts().value.takeIf {
             HubRuntime.state().value == HubConnectionState.CONNECTED && it.eventId.isNotBlank()
         }
-        return (buildSystemMessagePrefix("background", cachedHubFacts) + store.llmHistoryForConversation(conversationId)).map { message ->
+        return (buildSystemMessagePrefix("background", cachedHubFacts, conversationId) + store.llmHistoryForConversation(conversationId)).map { message ->
             message.copy(reasoningContent = null, responseMetadata = null)
         }
     }
