@@ -596,7 +596,23 @@ class LocalToolExecutor(
                     shouldAskLlm = true,
                 )
             },
-            onFailure = { error -> failed("skill.register", "Skill 注册失败", error) },
+            onFailure = { error -> registerSkillFailure(error) },
+        )
+    }
+
+    private fun registerSkillFailure(error: Throwable): ToolResult {
+        val detail = error.message ?: error.javaClass.simpleName
+        val guidance = if (detail.startsWith("Skill 名称已存在")) {
+            "请不要改名绕过冲突，也不要尝试覆盖。先引导用户到“设置 → 技能与记忆 → 技能”手动删除旧 Skill，用户确认删除后再重新调用 skill_register。"
+        } else {
+            "请根据错误修正 /workspace 中的候选文件后再重试；不得直接修改已注册 Skill。"
+        }
+        return ToolResult(
+            actionType = "skill.register",
+            displayText = "Skill 注册失败：$detail",
+            contextText = "Skill 注册失败：$detail\n$guidance",
+            shouldAskLlm = true,
+            success = false,
         )
     }
 

@@ -23,6 +23,9 @@ class LLMConfigTest {
         assertTrue(prompt.contains("hub_dispatch_task"))
         assertTrue(prompt.contains("subagent"))
         assertTrue(prompt.contains("Main、Hub 与执行 Agent"))
+        assertTrue(prompt.contains("不得自行编辑、覆盖、删除或改名已注册 Skill"))
+        assertTrue(prompt.contains("设置 → 技能与记忆 → 技能"))
+        assertTrue(prompt.contains("skill_register"))
     }
 
     @Test
