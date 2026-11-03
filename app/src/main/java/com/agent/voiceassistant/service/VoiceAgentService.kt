@@ -412,7 +412,6 @@ class VoiceAgentService : Service() {
     private val lastNewConversationRequestAt = AtomicLong(0L)
     private val checkpointRecoveryStarted = AtomicBoolean(false)
     private var checkpointWriteJob: Job? = null
-    private val pendingRealtimeResults = ConcurrentHashMap<String, Pair<String, Boolean>>()
     private val pendingRealtimeDelegations = ConcurrentLinkedQueue<String>()
     private val realtimeDelegationWorkerActive = AtomicBoolean(false)
     private var stepFunRealtimePipeline: StepFunRealtimePipeline? = null
@@ -470,9 +469,6 @@ class VoiceAgentService : Service() {
             store.activateConversationDomain(ConversationDomain.STANDARD).id
         } else {
             store.currentConversationId
-        }
-        store.pendingRealtimeReports().forEach { report ->
-            pendingRealtimeResults[report.turnId] = report.text to report.failed
         }
         ruleStore = RuleStore(this)
         llmProviderRepository = LlmProviderRepository(this)
@@ -729,7 +725,7 @@ class VoiceAgentService : Service() {
 
         when (route) {
             TaskReportPolicy.Route.REALTIME -> {
-                queueRealtimeResult("task-report-${action.reportActionId}", summary, false)
+                injectRealtimeMainResult("task-report-${action.reportActionId}", summary, false)
                 DiagLog.i("realtime.task.completed", "tasks=${hydrated.size} summaryChars=${summary.length}", showInUi = true)
             }
             TaskReportPolicy.Route.DEFER -> Unit
@@ -1285,7 +1281,6 @@ class VoiceAgentService : Service() {
         stepFunRealtimePipeline = created
         return try {
             created.start(captureAudio)
-            flushRealtimeResults()
             created
         } catch (error: Throwable) {
             created.stop()
@@ -1320,27 +1315,29 @@ class VoiceAgentService : Service() {
         }
     }
 
-    private fun queueRealtimeResult(turnId: String, body: String, failed: Boolean) {
+    private fun injectRealtimeMainResult(turnId: String, body: String, failed: Boolean) {
         val normalizedBody = body.trim()
         if (normalizedBody.isBlank()) return
+        if (!realtimeActive) return
         val reportId = turnId.ifBlank { "main-report-${UUID.randomUUID()}" }
-        store.savePendingRealtimeReport(
-            reportId,
-            normalizedBody,
-            failed,
-            realtimeMainConversationId.ifBlank { mainConversationId },
-        )
-        pendingRealtimeResults[reportId] = normalizedBody to failed
-        flushRealtimeResults()
-    }
-
-    private fun flushRealtimeResults() {
-        val pipeline = stepFunRealtimePipeline?.takeIf { it.isReady } ?: return
-        pendingRealtimeResults.entries.toList().forEach { (turnId, result) ->
-            if (pipeline.injectMainAssistantReply(turnId, result.first, result.second)) {
-                pendingRealtimeResults.remove(turnId, result)
-                store.removePendingRealtimeReport(turnId)
+        val current = stepFunRealtimePipeline
+        if (current?.isStarted == true && current.injectMainAssistantReply(reportId, normalizedBody, failed)) return
+        serviceScope.launch {
+            repeat(4) {
+                delay(150L)
+                if (!realtimeActive) return@launch
+                val pipeline = runCatching { ensureRealtimePipeline(captureAudio = !dormant) }
+                    .onFailure { error ->
+                        DiagLog.w(
+                            "realtime.delegate.report_retry_failed",
+                            "reason=${error.message ?: error.javaClass.simpleName}",
+                        )
+                    }
+                    .getOrNull()
+                    ?: return@repeat
+                if (pipeline.injectMainAssistantReply(reportId, normalizedBody, failed)) return@launch
             }
+            DiagLog.w("realtime.delegate.report_dropped", "turn=$reportId reason=pipeline_unavailable")
         }
     }
 
@@ -1363,7 +1360,9 @@ class VoiceAgentService : Service() {
                     EventBus.emitConversationUpdate()
                 }
             },
-            onUndeliveredMainReply = { turnId, text, failed -> queueRealtimeResult(turnId, text, failed) },
+            onUndeliveredMainReply = { turnId, text, failed ->
+                injectRealtimeMainResult(turnId, text, failed)
+            },
             instructions = {
                 buildRealtimeSystemPrompt()
             },
@@ -1463,22 +1462,6 @@ class VoiceAgentService : Service() {
         stepFunRealtimePipeline = null
         realtimeConversationId = ""
         realtimeMainConversationId = ""
-        pendingRealtimeResults.entries.toList().forEach { (turnId, result) ->
-            val conversationId = store.pendingRealtimeReports()
-                .firstOrNull { it.turnId == turnId }
-                ?.conversationId
-                ?: mainConversationId
-            val delivered = notifyBackgroundTurn(
-                turnId = turnId,
-                status = if (result.second) "任务中断" else "任务已完成",
-                body = result.first,
-                conversationId = conversationId,
-            )
-            if (delivered) {
-                pendingRealtimeResults.remove(turnId, result)
-                store.removePendingRealtimeReport(turnId)
-            }
-        }
         val routes = routeManager
         routeManager = null
         EventBus.emitVolume(0f)
@@ -2003,7 +1986,7 @@ class VoiceAgentService : Service() {
                         val body = if (outcome.successful) com.agent.voiceassistant.data.RealtimeContextProjection.assistantBody(outcome.finalText) else
                             "主会话本次任务未能完成。已保留当前过程，请打开主会话查看详情并重新发送请求。"
                         if (realtimeActive) {
-                            queueRealtimeResult(notificationTurnId, body, !outcome.successful)
+                            injectRealtimeMainResult(notificationTurnId, body, !outcome.successful)
                             DiagLog.i("realtime.delegate.completed", "turn=$notificationTurnId success=${outcome.successful} resultChars=${body.length}")
                         } else {
                             notifyBackgroundTurn(notificationTurnId, if (outcome.successful) "任务已完成" else "任务中断", body, checkpointContext?.conversationId ?: mainConversationId)
@@ -2013,8 +1996,24 @@ class VoiceAgentService : Service() {
                 }
             }
         } catch (cancelled: CancellationException) {
+            if (notifyUserTurn && realtimeActive) {
+                injectRealtimeMainResult(
+                    notificationTurnId,
+                    "主会话任务已中断。已保留当前过程，请打开主会话查看并决定是否继续。",
+                    failed = true,
+                )
+            }
             clearBackgroundTurnNotification(notificationTurnId)
             throw cancelled
+        } catch (error: Exception) {
+            if (notifyUserTurn && realtimeActive) {
+                injectRealtimeMainResult(
+                    notificationTurnId,
+                    "主会话任务异常终止：${error.message ?: error.javaClass.simpleName}。已保留当前过程。",
+                    failed = true,
+                )
+            }
+            throw error
         } finally {
             awaitReasoningFeedback()
             llmClient.close()

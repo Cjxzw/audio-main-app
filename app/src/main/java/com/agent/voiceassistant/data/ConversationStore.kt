@@ -316,33 +316,6 @@ class ConversationStore(context: Context) {
         }
     }
 
-    fun pendingRealtimeReports(): List<PendingRealtimeReport> = synchronized(lock) {
-        state.pendingRealtimeReports.toList()
-    }
-
-    fun savePendingRealtimeReport(
-        turnId: String,
-        text: String,
-        failed: Boolean,
-        conversationId: String,
-    ) = synchronized(lock) {
-        val normalizedTurnId = turnId.trim()
-        val normalizedText = text.trim()
-        if (normalizedTurnId.isBlank() || normalizedText.isBlank()) return@synchronized
-        state.pendingRealtimeReports.removeAll { it.turnId == normalizedTurnId }
-        state.pendingRealtimeReports += PendingRealtimeReport(
-            turnId = normalizedTurnId,
-            text = normalizedText,
-            failed = failed,
-            conversationId = conversationId,
-        )
-        persistLocked()
-    }
-
-    fun removePendingRealtimeReport(turnId: String) = synchronized(lock) {
-        if (state.pendingRealtimeReports.removeAll { it.turnId == turnId }) persistLocked()
-    }
-
     fun conversationProjection(
         conversationId: String,
         keyword: String = "",
@@ -1287,16 +1260,6 @@ data class StoreState(
     val sessions: MutableList<ConversationSession> = mutableListOf(),
     val memories: MutableList<StoredMemory> = mutableListOf(),
     var lastLocation: StoredLocation? = null,
-    val pendingRealtimeReports: MutableList<PendingRealtimeReport> = mutableListOf(),
-)
-
-@Serializable
-data class PendingRealtimeReport(
-    val turnId: String,
-    val text: String,
-    val failed: Boolean,
-    val conversationId: String,
-    val createdAt: Long = System.currentTimeMillis(),
 )
 
 @Serializable
