@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.data
 
 import android.content.Context
+import android.util.AtomicFile
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
 import com.agent.voiceassistant.agent.runtime.SkillRegistry
@@ -16,6 +17,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import timber.log.Timber
 import java.io.File
+import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -28,10 +30,10 @@ class ConversationStore(context: Context) {
         ignoreUnknownKeys = true
         prettyPrint = true
     }
-    private val file = File(context.filesDir, "main-agent-store.json")
+    private val file = AtomicFile(File(context.filesDir, "main-agent-store.json"))
     private val toolTraceDir = File(context.filesDir, "agent-runtime/tool-traces").apply { mkdirs() }
 
-    private val shared = SHARED_STORES.computeIfAbsent(file.canonicalPath) {
+    private val shared = SHARED_STORES.computeIfAbsent(file.baseFile.canonicalPath) {
         SharedConversationState(loadState())
     }
     private val lock: Any = shared
@@ -312,6 +314,33 @@ class ConversationStore(context: Context) {
             state.sessions.add(it)
             persistLocked()
         }
+    }
+
+    fun pendingRealtimeReports(): List<PendingRealtimeReport> = synchronized(lock) {
+        state.pendingRealtimeReports.toList()
+    }
+
+    fun savePendingRealtimeReport(
+        turnId: String,
+        text: String,
+        failed: Boolean,
+        conversationId: String,
+    ) = synchronized(lock) {
+        val normalizedTurnId = turnId.trim()
+        val normalizedText = text.trim()
+        if (normalizedTurnId.isBlank() || normalizedText.isBlank()) return@synchronized
+        state.pendingRealtimeReports.removeAll { it.turnId == normalizedTurnId }
+        state.pendingRealtimeReports += PendingRealtimeReport(
+            turnId = normalizedTurnId,
+            text = normalizedText,
+            failed = failed,
+            conversationId = conversationId,
+        )
+        persistLocked()
+    }
+
+    fun removePendingRealtimeReport(turnId: String) = synchronized(lock) {
+        if (state.pendingRealtimeReports.removeAll { it.turnId == turnId }) persistLocked()
     }
 
     fun conversationProjection(
@@ -979,13 +1008,13 @@ class ConversationStore(context: Context) {
         }
 
     private fun loadState(): StoreState {
-        if (!file.exists()) {
+        if (!file.baseFile.exists()) {
             val initial = StoreState()
             initial.sessions.add(newConversation(initial.currentConversationId))
             return initial
         }
         return runCatching {
-            json.decodeFromString<StoreState>(file.readText())
+            file.openRead().bufferedReader().use { json.decodeFromString<StoreState>(it.readText()) }
         }.onFailure {
             Timber.w(it, "ConversationStore: failed to load, reset store")
         }.getOrElse {
@@ -1017,7 +1046,14 @@ class ConversationStore(context: Context) {
 
     private fun persistLocked() {
         runCatching {
-            file.writeText(json.encodeToString(state))
+            val output = file.startWrite()
+            try {
+                OutputStreamWriter(output, Charsets.UTF_8).use { it.write(json.encodeToString(state)) }
+                file.finishWrite(output)
+            } catch (error: Throwable) {
+                file.failWrite(output)
+                throw error
+            }
         }.onFailure {
             Timber.e(it, "ConversationStore: persist failed")
         }
@@ -1251,6 +1287,16 @@ data class StoreState(
     val sessions: MutableList<ConversationSession> = mutableListOf(),
     val memories: MutableList<StoredMemory> = mutableListOf(),
     var lastLocation: StoredLocation? = null,
+    val pendingRealtimeReports: MutableList<PendingRealtimeReport> = mutableListOf(),
+)
+
+@Serializable
+data class PendingRealtimeReport(
+    val turnId: String,
+    val text: String,
+    val failed: Boolean,
+    val conversationId: String,
+    val createdAt: Long = System.currentTimeMillis(),
 )
 
 @Serializable
