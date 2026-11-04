@@ -11,7 +11,8 @@ data class LLMConfig(
     val maxTokens: Int = 1024,
     /** 请求超时秒 */
     val timeoutSeconds: Long = 60,
-    val providerMode: LlmProviderMode = LlmProviderMode.MIMO,
+    val providerMode: LlmProviderMode = LlmProviderMode.OPENAI_COMPATIBLE,
+    val contextWindowTokens: Long? = null,
 ) {
     companion object {
         fun mimo(apiKey: String, baseUrl: String, modelName: String = "mimo-v2.6-pro"): LLMConfig = LLMConfig(
@@ -21,13 +22,19 @@ data class LLMConfig(
             providerMode = LlmProviderMode.MIMO,
         )
 
-        fun unconfigured(): LLMConfig = mimo(apiKey = "", baseUrl = "https://api.xiaomimimo.com/v1")
+        fun unconfigured(): LLMConfig = LLMConfig(
+            apiKey = "",
+            baseUrl = "https://api.openai.com/v1",
+            modelName = "",
+            providerMode = LlmProviderMode.OPENAI_COMPATIBLE,
+        )
     }
 }
 
 enum class LlmProviderMode {
     MIMO,
     OPENAI_COMPATIBLE,
+    ANTHROPIC,
 }
 
 /** Stable identity, concepts, and tool boundaries. User-editable rules own response behavior. */

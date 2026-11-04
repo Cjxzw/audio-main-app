@@ -71,11 +71,11 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
         preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
             addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_mimo)
+                title = getString(R.string.settings_custom_llm)
                 summary = AppCapabilityResolver(requireContext()).capabilities().summary
                 setIcon(R.drawable.ic_model_24)
                 setOnPreferenceClickListener {
-                    (activity as SettingsActivity).open(MimoSettingsFragment(), getString(R.string.settings_mimo))
+                    (activity as SettingsActivity).open(LlmProvidersFragment(), getString(R.string.settings_custom_llm))
                     true
                 }
             })
@@ -95,11 +95,11 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
             addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_custom_llm)
-                summary = getString(R.string.settings_models_summary)
+                title = getString(R.string.settings_conversation_lifecycle)
+                summary = getString(R.string.settings_conversation_lifecycle_summary)
                 setIcon(R.drawable.ic_model_24)
                 setOnPreferenceClickListener {
-                    (activity as SettingsActivity).open(LlmProvidersFragment(), getString(R.string.settings_models))
+                    (activity as SettingsActivity).open(ConversationLifecycleSettingsFragment(), getString(R.string.settings_conversation_lifecycle))
                     true
                 }
             })
@@ -299,8 +299,8 @@ class StepFunRealtimeSettingsFragment : PreferenceFragmentCompat() {
             addPreference(ListPreference(requireContext()).apply {
                 key = "voice_pipeline"
                 title = getString(R.string.settings_realtime_pipeline)
-                entries = arrayOf(getString(R.string.settings_realtime_pipeline_mimo), getString(R.string.settings_realtime_pipeline_stepfun))
-                entryValues = arrayOf(VoicePipeline.MIMO_STANDARD.name, VoicePipeline.STEPFUN_REALTIME.name)
+                entries = arrayOf(getString(R.string.settings_realtime_pipeline_stepfun))
+                entryValues = arrayOf(VoicePipeline.STEPFUN_REALTIME.name)
                 value = repository.activePipeline().name
                 summary = entry
                 setOnPreferenceChangeListener { preference, selected ->
@@ -328,7 +328,7 @@ class StepFunRealtimeSettingsFragment : PreferenceFragmentCompat() {
                     runCatching { repository.saveStepFunConfig(config, value.toString()) }
                         .onSuccess { rebuild() }
                         .onFailure { Toast.makeText(requireContext(), it.message, Toast.LENGTH_LONG).show() }
-                    false
+                    true
                 }
             })
             addPreference(EditTextPreference(requireContext()).apply {
@@ -358,9 +358,6 @@ class StepFunRealtimeSettingsFragment : PreferenceFragmentCompat() {
                 isEnabled = repository.hasStepFunKey()
                 setOnPreferenceClickListener {
                     repository.clearStepFunKey()
-                    if (repository.activePipeline() == VoicePipeline.STEPFUN_REALTIME) {
-                        repository.setActivePipeline(VoicePipeline.MIMO_STANDARD)
-                    }
                     rebuild()
                     true
                 }
@@ -611,7 +608,7 @@ class MimoSettingsFragment : PreferenceFragmentCompat() {
                         .onFailure { Toast.makeText(requireContext(), it.message, Toast.LENGTH_SHORT).show() }
                         .isSuccess
                     if (saved) refreshStatus()
-                    false
+                    true
                 }
             }
             addPreference(keyPreference)
@@ -741,6 +738,7 @@ class LlmProvidersFragment : PreferenceFragmentCompat() {
                 title = profile.displayName
                 summary = buildString {
                     append("${profile.modelId} · ${profile.baseUrl}")
+                    profile.contextWindowTokens?.let { append(" · 上下文 ${it} tokens") }
                     if (!profile.supportsImages) append(" · 纯文本")
                 }
                 isEnabled = !profile.builtIn
@@ -764,6 +762,65 @@ class LlmProvidersFragment : PreferenceFragmentCompat() {
                 true
             }
         })
+    }
+}
+
+class ConversationLifecycleSettingsFragment : PreferenceFragmentCompat() {
+    private lateinit var settings: ConversationLifecycleSettings
+
+    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        settings = ConversationLifecycleSettings(requireContext())
+        rebuild()
+    }
+
+    private fun rebuild() {
+        val current = settings.read()
+        preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            addPreference(EditTextPreference(requireContext()).apply {
+                key = "conversation_context_threshold"
+                title = getString(R.string.settings_conversation_context_threshold)
+                summary = getString(R.string.settings_conversation_context_threshold_summary, current.contextThresholdK)
+                text = current.contextThresholdK.toString()
+                isPersistent = false
+                bindLightDialogInput { field ->
+                    field.inputType = InputType.TYPE_CLASS_NUMBER
+                    field.setSingleLine(true)
+                }
+                setOnPreferenceChangeListener { preference, value ->
+                    val parsed = value.toString().toIntOrNull()
+                    if (parsed == null || parsed <= 0) {
+                        Toast.makeText(requireContext(), R.string.settings_conversation_positive_integer, Toast.LENGTH_SHORT).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    val updated = settings.read().copy(contextThresholdK = parsed)
+                    settings.save(updated)
+                    preference.summary = getString(R.string.settings_conversation_context_threshold_summary, parsed)
+                    true
+                }
+            })
+            addPreference(EditTextPreference(requireContext()).apply {
+                key = "conversation_inactive_minutes"
+                title = getString(R.string.settings_conversation_inactive_minutes)
+                summary = getString(R.string.settings_conversation_inactive_minutes_summary, current.inactiveMinutes)
+                text = current.inactiveMinutes.toString()
+                isPersistent = false
+                bindLightDialogInput { field ->
+                    field.inputType = InputType.TYPE_CLASS_NUMBER
+                    field.setSingleLine(true)
+                }
+                setOnPreferenceChangeListener { preference, value ->
+                    val parsed = value.toString().toIntOrNull()
+                    if (parsed == null || parsed <= 0) {
+                        Toast.makeText(requireContext(), R.string.settings_conversation_positive_integer, Toast.LENGTH_SHORT).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    val updated = settings.read().copy(inactiveMinutes = parsed)
+                    settings.save(updated)
+                    preference.summary = getString(R.string.settings_conversation_inactive_minutes_summary, parsed)
+                    true
+                }
+            })
+        }
     }
 }
 

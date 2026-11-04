@@ -4,6 +4,8 @@ import android.content.Context
 import com.agent.voiceassistant.agent.LLMConfig
 import com.agent.voiceassistant.agent.LlmProviderMode
 import com.agent.voiceassistant.cloud.OpenAiCompatibleLlmClient
+import com.agent.voiceassistant.cloud.AnthropicLlmClient
+import com.agent.voiceassistant.cloud.LlmConnectionTest
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -17,6 +19,7 @@ data class LlmProviderProfile(
     val baseUrl: String,
     val modelId: String,
     val mode: LlmProviderMode,
+    val contextWindowTokens: Long? = null,
     val builtIn: Boolean = false,
     val supportsImages: Boolean = false,
 )
@@ -25,22 +28,23 @@ class LlmProviderRepository(context: Context) {
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val secrets = EncryptedSecretStore(appContext)
-    private val mimo = MimoApiRepository(appContext)
     private val json = Json { ignoreUnknownKeys = true }
 
-    fun profiles(): List<LlmProviderProfile> = listOf(builtInProfile()) + customProfiles()
+    fun profiles(): List<LlmProviderProfile> = customProfiles()
 
     fun activeProfile(): LlmProviderProfile {
-        val activeId = preferences.getString(KEY_ACTIVE, BUILT_IN_ID)
-        return profiles().firstOrNull { it.id == activeId } ?: builtInProfile()
+        val activeId = preferences.getString(KEY_ACTIVE, null)
+        return profiles().firstOrNull { it.id == activeId }
+            ?: profiles().firstOrNull()
+            ?: unconfiguredProfile()
     }
 
     fun setActive(id: String) {
-        require(profiles().any { it.id == id }) { "供应商不存在" }
+        require(customProfiles().any { it.id == id }) { "供应商不存在" }
         preferences.edit().putString(KEY_ACTIVE, id).apply()
     }
 
-    fun activateBuiltIn() = setActive(BUILT_IN_ID)
+    fun activateBuiltIn() = preferences.edit().remove(KEY_ACTIVE).apply()
 
     fun profile(id: String?): LlmProviderProfile? = profiles().firstOrNull { it.id == id }
 
@@ -52,6 +56,7 @@ class LlmProviderRepository(context: Context) {
         mode: LlmProviderMode,
         apiKey: String?,
         supportsImages: Boolean = false,
+        contextWindowTokens: Long? = null,
     ): LlmProviderProfile {
         val profileId = id?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
         require(profileId != BUILT_IN_ID) { "内置供应商不能修改" }
@@ -62,6 +67,7 @@ class LlmProviderRepository(context: Context) {
             baseUrl = normalized,
             modelId = modelId.trim().also { require(it.isNotBlank()) { "请输入模型 ID" } },
             mode = mode,
+            contextWindowTokens = contextWindowTokens,
             supportsImages = supportsImages,
         )
         val normalizedApiKey = apiKey?.trim()?.takeIf { it.isNotBlank() }
@@ -78,16 +84,14 @@ class LlmProviderRepository(context: Context) {
             .putString(KEY_PROFILES, json.encodeToString(customProfiles().filterNot { it.id == id }))
             .apply()
         secrets.remove(secretName(id))
-        if (preferences.getString(KEY_ACTIVE, BUILT_IN_ID) == id) setActive(BUILT_IN_ID)
+        if (preferences.getString(KEY_ACTIVE, null) == id) {
+            preferences.edit().remove(KEY_ACTIVE).apply()
+        }
     }
 
-    fun hasApiKey(id: String): Boolean = when (id) {
-        BUILT_IN_ID -> mimo.hasValidKey()
-        else -> !secrets.get(secretName(id)).isNullOrBlank()
-    }
+    fun hasApiKey(id: String): Boolean = id != UNCONFIGURED_ID && !secrets.get(secretName(id)).isNullOrBlank()
 
     fun runtimeConfig(profile: LlmProviderProfile = activeProfile(), overrideApiKey: String? = null): LLMConfig {
-        if (profile.builtIn) return mimo.runtimeConfig(profile.modelId)
         val apiKey = overrideApiKey?.trim()?.takeIf { it.isNotBlank() }
             ?: secrets.get(secretName(profile.id)).orEmpty()
         require(apiKey.isNotBlank()) { "供应商未配置 API Key" }
@@ -96,13 +100,18 @@ class LlmProviderRepository(context: Context) {
             baseUrl = profile.baseUrl,
             modelName = profile.modelId,
             providerMode = profile.mode,
+            contextWindowTokens = profile.contextWindowTokens,
         )
     }
 
-    suspend fun test(profile: LlmProviderProfile, overrideApiKey: String? = null): String {
-        val client = OpenAiCompatibleLlmClient(runtimeConfig(profile, overrideApiKey))
+    suspend fun test(profile: LlmProviderProfile, overrideApiKey: String? = null): LlmConnectionTest {
+        val config = runtimeConfig(profile, overrideApiKey)
+        val client: com.agent.voiceassistant.cloud.LlmClient = when (profile.mode) {
+            LlmProviderMode.ANTHROPIC -> AnthropicLlmClient(config)
+            else -> OpenAiCompatibleLlmClient(config)
+        }
         return try {
-            client.testConnection()
+            client.testConnectionDetails()
         } finally {
             client.close()
         }
@@ -113,15 +122,13 @@ class LlmProviderRepository(context: Context) {
         return runCatching { json.decodeFromString<List<LlmProviderProfile>>(raw) }.getOrDefault(emptyList())
     }
 
-    private fun builtInProfile(): LlmProviderProfile {
+    private fun unconfiguredProfile(): LlmProviderProfile {
         return LlmProviderProfile(
-            id = BUILT_IN_ID,
-            displayName = "小米 MiMo",
-            baseUrl = mimo.keyType()?.baseUrl ?: MimoKeyType.PAY_AS_YOU_GO.baseUrl,
-            modelId = MimoApiRepository.DEFAULT_MODEL,
-            mode = LlmProviderMode.MIMO,
-            builtIn = true,
-            supportsImages = true,
+            id = UNCONFIGURED_ID,
+            displayName = "未配置 LLM",
+            baseUrl = "https://api.openai.com/v1",
+            modelId = "",
+            mode = LlmProviderMode.OPENAI_COMPATIBLE,
         )
     }
 
@@ -138,6 +145,7 @@ class LlmProviderRepository(context: Context) {
 
     companion object {
         const val BUILT_IN_ID = "builtin-mimo"
+        const val UNCONFIGURED_ID = "unconfigured"
         private const val PREFERENCES = "llm_provider_settings"
         private const val KEY_PROFILES = "profiles"
         private const val KEY_ACTIVE = "active_profile"

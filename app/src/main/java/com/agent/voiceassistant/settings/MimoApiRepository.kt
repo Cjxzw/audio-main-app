@@ -15,10 +15,8 @@ data class AppCapabilities(
 ) {
     val summary: String
         get() = when {
-            llmAvailable && speechAvailable && usingCustomLlm -> "专属 LLM + MiMo 语音输入输出"
-            llmAvailable && speechAvailable -> "MiMo LLM、语音识别与语音合成"
-            llmAvailable -> "纯文本交流；未配置 MiMo 语音服务"
-            else -> "尚未配置可用的 API Key"
+            llmAvailable -> "已配置大模型供应商；语音使用 Realtime 管线"
+            else -> "尚未配置大模型供应商"
         }
 }
 
@@ -66,20 +64,20 @@ class AppCapabilityResolver(context: Context) {
         val customReady = !active.builtIn && llmProviders.hasApiKey(active.id)
         val mimoReady = mimo.hasValidKey()
         return AppCapabilities(
-            llmAvailable = customReady || mimoReady,
-            speechAvailable = mimoReady,
+            llmAvailable = customReady,
+            speechAvailable = false,
             usingCustomLlm = customReady,
         )
     }
 
     fun llmConfig(): LLMConfig {
         val active = llmProviders.activeProfile()
-        return if (!active.builtIn) llmProviders.runtimeConfig(active) else mimo.runtimeConfig(active.modelId)
+        return llmProviders.runtimeConfig(active)
     }
 
-    fun defaultLlmAvailable(): Boolean = mimo.hasValidKey()
+    fun defaultLlmAvailable(): Boolean = false
 
-    fun defaultLlmConfig(): LLMConfig = mimo.runtimeConfig()
+    fun defaultLlmConfig(): LLMConfig = throw IllegalStateException("未配置默认 LLM")
 
     fun speechConfig(): LLMConfig = mimo.runtimeConfig()
 }

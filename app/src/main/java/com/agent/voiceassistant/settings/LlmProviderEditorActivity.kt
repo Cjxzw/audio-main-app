@@ -17,6 +17,7 @@ class LlmProviderEditorActivity : AppCompatActivity() {
     private lateinit var binding: ActivityLlmProviderEditorBinding
     private lateinit var repository: LlmProviderRepository
     private var profileId: String? = null
+    private var detectedContextWindow: Long? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -29,13 +30,15 @@ class LlmProviderEditorActivity : AppCompatActivity() {
         binding.spinnerProviderMode.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
-            listOf("小米 MiMo 兼容", "通用 OpenAI Chat Completions"),
+            listOf("OpenAI Chat Completions", "Anthropic Messages"),
         )
         repository.profile(profileId)?.takeIf { !it.builtIn }?.let { profile ->
             binding.etProviderName.setText(profile.displayName)
             binding.etBaseUrl.setText(profile.baseUrl)
             binding.etModelId.setText(profile.modelId)
-            binding.spinnerProviderMode.setSelection(if (profile.mode == LlmProviderMode.MIMO) 0 else 1)
+            binding.spinnerProviderMode.setSelection(if (profile.mode == LlmProviderMode.ANTHROPIC) 1 else 0)
+            detectedContextWindow = profile.contextWindowTokens
+            refreshContextWindow()
             binding.checkProviderImages.isChecked = profile.supportsImages
             binding.btnDeleteProvider.visibility = View.VISIBLE
         }
@@ -49,6 +52,7 @@ class LlmProviderEditorActivity : AppCompatActivity() {
         binding.btnTestProvider.setOnClickListener { testConnection() }
         binding.btnSaveProvider.setOnClickListener { saveProvider() }
         binding.btnDeleteProvider.setOnClickListener { deleteProvider() }
+        refreshContextWindow()
     }
 
     private fun testConnection() {
@@ -56,7 +60,11 @@ class LlmProviderEditorActivity : AppCompatActivity() {
         setBusy(true)
         lifecycleScope.launch {
             runCatching { repository.test(profile, binding.etApiKey.text?.toString()) }
-                .onSuccess { Toast.makeText(this@LlmProviderEditorActivity, getString(R.string.provider_test_ok, it.take(80)), Toast.LENGTH_LONG).show() }
+                .onSuccess {
+                    detectedContextWindow = it.contextWindowTokens ?: detectedContextWindow
+                    refreshContextWindow()
+                    Toast.makeText(this@LlmProviderEditorActivity, getString(R.string.provider_test_ok, it.message.take(80)), Toast.LENGTH_LONG).show()
+                }
                 .onFailure { showError(it.message ?: "连接失败") }
             setBusy(false)
         }
@@ -73,6 +81,7 @@ class LlmProviderEditorActivity : AppCompatActivity() {
                 mode = profile.mode,
                 apiKey = binding.etApiKey.text?.toString(),
                 supportsImages = binding.checkProviderImages.isChecked,
+                contextWindowTokens = detectedContextWindow,
             )
         }.onSuccess {
             repository.setActive(it.id)
@@ -97,7 +106,8 @@ class LlmProviderEditorActivity : AppCompatActivity() {
             displayName = binding.etProviderName.text?.toString()?.trim().orEmpty().also { require(it.isNotBlank()) { "请输入显示名称" } },
             baseUrl = binding.etBaseUrl.text?.toString()?.trim().orEmpty().also { require(it.isNotBlank()) { "请输入 Base URL" } },
             modelId = binding.etModelId.text?.toString()?.trim().orEmpty().also { require(it.isNotBlank()) { "请输入模型 ID" } },
-            mode = if (binding.spinnerProviderMode.selectedItemPosition == 0) LlmProviderMode.MIMO else LlmProviderMode.OPENAI_COMPATIBLE,
+            mode = if (binding.spinnerProviderMode.selectedItemPosition == 1) LlmProviderMode.ANTHROPIC else LlmProviderMode.OPENAI_COMPATIBLE,
+            contextWindowTokens = detectedContextWindow,
             supportsImages = binding.checkProviderImages.isChecked,
         )
     }.onFailure { showError(it.message ?: "配置不完整") }.getOrNull()
@@ -109,6 +119,13 @@ class LlmProviderEditorActivity : AppCompatActivity() {
 
     private fun showError(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun refreshContextWindow() {
+        binding.tvContextWindow.text = getString(
+            R.string.provider_context_window,
+            detectedContextWindow?.toString() ?: "?",
+        )
     }
 
     companion object {

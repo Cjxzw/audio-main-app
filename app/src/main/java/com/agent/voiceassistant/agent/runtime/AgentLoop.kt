@@ -26,6 +26,7 @@ class AgentLoop(
         val fastMaxCompletionTokens: Int?,
         val deepMaxCompletionTokens: Int?,
         val allowReasoningEscalation: Boolean,
+        val contextWindowTokens: Long? = null,
         val automaticReasoningToolThreshold: Int = DEFAULT_AUTOMATIC_REASONING_TOOL_THRESHOLD,
         val activeToolBudgetMs: Long = DEFAULT_ACTIVE_TOOL_BUDGET_MS,
         val enableBodyToolAdapter: Boolean = false,
@@ -361,7 +362,7 @@ class AgentLoop(
                         promptTokens = usage?.promptTokens ?: estimatedPromptTokens,
                         completionTokens = usage?.completionTokens,
                         reasoningTokens = usage?.reasoningTokens,
-                        contextWindowTokens = contextWindowFor(completion.modelId),
+                        contextWindowTokens = config.contextWindowTokens ?: contextWindowFor(completion.modelId),
                         promptTokensEstimated = usage?.promptTokens == null,
                         finishReason = completion.finishReason,
                         streamComplete = completion.streamDiagnostics.hasNormalEnd &&

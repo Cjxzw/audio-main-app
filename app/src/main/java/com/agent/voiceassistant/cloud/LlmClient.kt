@@ -17,6 +17,10 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -39,8 +43,16 @@ interface LlmClient {
 
     suspend fun testConnection(): String
 
+    suspend fun testConnectionDetails(): LlmConnectionTest =
+        LlmConnectionTest(testConnection(), null)
+
     fun close() = Unit
 }
+
+data class LlmConnectionTest(
+    val message: String,
+    val contextWindowTokens: Long?,
+)
 
 internal class LlmHttpException(
     val statusCode: Int,
@@ -80,10 +92,32 @@ class OpenAiCompatibleLlmClient(
     }
 
     override suspend fun testConnection(): String {
+        return testConnectionDetails().message
+    }
+
+    override suspend fun testConnectionDetails(): LlmConnectionTest {
         return withContext(Dispatchers.IO) {
-            val call = newModelsCall().also {
-                it.timeout().timeout(config.timeoutSeconds, TimeUnit.SECONDS)
-            }
+            val call = client.newCall(
+                Request.Builder()
+                    .url("${config.baseUrl.trimEnd('/')}/chat/completions")
+                    .addHeader("Content-Type", JSON_MEDIA_TYPE.toString())
+                    .addHeader("api-key", config.apiKey)
+                    .addHeader("Authorization", "Bearer ${config.apiKey}")
+                    .post(buildJsonObject {
+                        put("model", config.modelName)
+                        put("stream", false)
+                        put("max_tokens", 16)
+                        putJsonArray("messages") {
+                            add(buildJsonObject {
+                                put("role", "user")
+                                put("content", "这是一个连通性测试，收到请回复“已连接”")
+                            })
+                        }
+                    }.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build(),
+            // Reserve up to two seconds for the best-effort /models context probe so
+            // the complete connection test remains within the ten-second budget.
+            ).also { it.timeout().timeout(8, TimeUnit.SECONDS) }
             val cancellation = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
             try {
                 call.execute().use { response ->
@@ -91,7 +125,16 @@ class OpenAiCompatibleLlmClient(
                     if (!response.isSuccessful) {
                         throw LlmHttpException(response.code, body)
                     }
-                    summarizeModelsResponse(body)
+                    val root = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject }
+                        .getOrElse { throw IOException("连通性测试返回了无效 JSON", it) }
+                    val content = root["choices"]?.jsonArray?.firstOrNull()
+                        ?.jsonObject?.get("message")?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull
+                        ?.trim().orEmpty()
+                    require(content.isNotBlank()) { "连通性测试返回空正文" }
+                    LlmConnectionTest(
+                        message = content,
+                        contextWindowTokens = discoverContextWindowBestEffort(),
+                    )
                 }
             } finally {
                 cancellation?.dispose()
@@ -118,6 +161,34 @@ class OpenAiCompatibleLlmClient(
         }
     }
 
+    private fun discoverContextWindowBestEffort(): Long? {
+        val call = newModelsCall().also { it.timeout().timeout(2, TimeUnit.SECONDS) }
+        return runCatching {
+            call.execute().use { response ->
+                if (!response.isSuccessful) return@use null
+                val root = kotlinx.serialization.json.Json.parseToJsonElement(response.body?.string().orEmpty())
+                val models = when (root) {
+                    is JsonArray -> root
+                    is JsonObject -> root["data"] as? JsonArray
+                    else -> null
+                } ?: return@use null
+                val model = models.firstOrNull {
+                    (it as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull == config.modelName
+                } as? JsonObject ?: return@use null
+                listOf("context_window", "context_length", "max_context_length", "input_token_limit")
+                    .firstNotNullOfOrNull { key -> model[key]?.jsonPrimitive?.longOrNull }
+            }
+        }.getOrNull() ?: knownContextWindow(config.modelName)
+    }
+
+    private fun knownContextWindow(model: String): Long? = when {
+        model.contains("gpt-4o", ignoreCase = true) -> 128_000L
+        model.contains("gpt-4.1", ignoreCase = true) -> 1_000_000L
+        model.contains("claude", ignoreCase = true) -> 200_000L
+        model.contains("deepseek", ignoreCase = true) -> 128_000L
+        else -> null
+    }
+
     override fun close() {
         client.dispatcher.cancelAll()
         client.dispatcher.executorService.shutdown()
@@ -128,9 +199,10 @@ class OpenAiCompatibleLlmClient(
         put("model", config.modelName)
         put("stream", true)
         val supportsNativeThinking = config.providerMode == LlmProviderMode.MIMO ||
+            config.modelName.startsWith("mimo", ignoreCase = true) ||
             config.modelName.startsWith("deepseek", ignoreCase = true)
         request.maxCompletionTokens?.let { limit ->
-            if (config.providerMode == LlmProviderMode.MIMO) {
+            if (config.providerMode == LlmProviderMode.MIMO || config.modelName.startsWith("mimo", ignoreCase = true)) {
                 put("max_completion_tokens", limit)
             } else {
                 put("max_tokens", limit)

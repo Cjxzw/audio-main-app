@@ -52,7 +52,7 @@ import com.agent.voiceassistant.audio.EarconPlayer
 import com.agent.voiceassistant.audio.AudioRouteManager
 import com.agent.voiceassistant.audio.AudioFeedbackPolicy
 import com.agent.voiceassistant.cloud.CloudSpeechClient
-import com.agent.voiceassistant.cloud.FallbackLlmClient
+import com.agent.voiceassistant.cloud.AnthropicLlmClient
 import com.agent.voiceassistant.cloud.LlmClient
 import com.agent.voiceassistant.cloud.LlmHttpException
 import com.agent.voiceassistant.cloud.MultimodalImageEncoder
@@ -81,6 +81,8 @@ import com.agent.voiceassistant.reflection.TurnMetricsTracker
 import com.agent.voiceassistant.settings.LlmProviderRepository
 import com.agent.voiceassistant.settings.LlmProviderProfile
 import com.agent.voiceassistant.settings.RealtimePipelineRepository
+import com.agent.voiceassistant.settings.VoicePipeline
+import com.agent.voiceassistant.settings.ConversationLifecycleSettings
 import com.agent.voiceassistant.settings.SpeechPreferences
 import com.agent.voiceassistant.settings.AppCapabilityResolver
 import com.agent.voiceassistant.tools.LocalToolExecutor
@@ -397,6 +399,7 @@ class VoiceAgentService : Service() {
     private lateinit var activeTurnCheckpointStore: ActiveTurnCheckpointStore
     private val agentHarness = MainAgentHarness()
     private val memoryCompactor = ConversationMemoryCompactor()
+    private lateinit var conversationLifecycleSettings: ConversationLifecycleSettings
     private lateinit var earcons: EarconPlayer
     private var dormant = true
     private val turnMutex = Mutex()
@@ -465,6 +468,7 @@ class VoiceAgentService : Service() {
         super.onCreate()
         DiagLog.i("service.create", "pid=${android.os.Process.myPid()}", showInUi = true)
         store = ConversationStore(this)
+        conversationLifecycleSettings = ConversationLifecycleSettings(this)
         mainConversationId = if (store.currentConversationDomain == ConversationDomain.REALTIME) {
             store.activateConversationDomain(ConversationDomain.STANDARD).id
         } else {
@@ -498,9 +502,7 @@ class VoiceAgentService : Service() {
             executionEnv.disabledSystemSkillsManifest,
         )
         imageEncoder = MultimodalImageEncoder(executionEnv.workspaceRoot)
-        multimodalTranscriber = MultimodalTranscriber(this) {
-            OpenAiCompatibleLlmClient(capabilityResolver.defaultLlmConfig())
-        }
+        multimodalTranscriber = MultimodalTranscriber(this) { createLlmClient(silent = true) }
         deviceContextProvider = DeviceContextProvider(
             this,
             capabilityResolver,
@@ -530,6 +532,7 @@ class VoiceAgentService : Service() {
         serviceScope.launch { taskCoordinator.recover() }
         serviceScope.launch { taskReportReviewLoop() }
         serviceScope.launch { backgroundLlmWorker() }
+        serviceScope.launch { coldConversationMonitor() }
         serviceScope.launch {
             agentHarness.state.collect(EventBus::emitAgentState)
         }
@@ -875,6 +878,10 @@ class VoiceAgentService : Service() {
 
     private fun wakeAgent() {
         DiagLog.i("agent.wake.begin", "dormant=$dormant loop=${loopJob?.isActive == true}", showInUi = true)
+        if (realtimePipelineRepository.activePipeline() == VoicePipeline.STEPFUN_REALTIME) {
+            startRealtimeSession()
+            return
+        }
         if ((loopJob?.isActive == true || stepFunRealtimePipeline?.isStarted == true) && !dormant) return
         locationProvider.refreshInBackground("agent_wake")
         val foregroundReady = runCatching {
@@ -926,6 +933,34 @@ class VoiceAgentService : Service() {
         if (loopJob?.isActive != true) {
             loopJob = serviceScope.launch {
                 runConversationLoop()
+            }
+        }
+    }
+
+    private suspend fun coldConversationMonitor() {
+        while (coroutineContext.isActive) {
+            runCatching { maybeStartColdConversation() }
+                .onFailure { DiagLog.w("conversation.cold_check.failed", "reason=${it.message}") }
+            delay(60_000L)
+        }
+    }
+
+    private fun maybeStartColdConversation() {
+        if (store.currentConversationDomain != ConversationDomain.STANDARD) return
+        val config = conversationLifecycleSettings.read()
+        val summary = store.currentConversationSummary()
+        val usage = summary.contextUsageTokens ?: 0L
+        val inactiveMs = System.currentTimeMillis() - summary.updatedAt
+        if (usage < config.contextThresholdK * 1_000L || inactiveMs < config.inactiveMinutes * 60_000L) return
+        if (newConversationInProgress.compareAndSet(false, true)) {
+            try {
+                store.startNewConversation("上下文达到 ${config.contextThresholdK}k 且已 ${config.inactiveMinutes} 分钟无活动")
+                    .also { mainConversationId = it.id }
+                EventBus.emitChatReset(emptyList())
+                EventBus.emitConversationUpdate()
+                DiagLog.i("conversation.cold_rotated", "usage=$usage inactiveMs=$inactiveMs", showInUi = true)
+            } finally {
+                newConversationInProgress.set(false)
             }
         }
     }
@@ -1932,6 +1967,7 @@ class VoiceAgentService : Service() {
                     initialThinkingMode = initialThinkingMode,
                     maxToolRounds = maxToolRounds,
                     allowReasoningEscalation = allowReasoningEscalation,
+                    contextWindowTokens = runCatching { capabilityResolver.llmConfig().contextWindowTokens }.getOrNull(),
                     fastMaxCompletionTokens = null,
                     deepMaxCompletionTokens = null,
                     initialBusinessToolCallCount = checkpointContext?.resumed?.businessToolCallCount ?: 0,
@@ -2672,6 +2708,9 @@ class VoiceAgentService : Service() {
         finalText: String,
         responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
     ) {
+        responseMetadata?.promptTokens?.let { tokens ->
+            store.recordContextUsage(mainConversationId, tokens)
+        }
         val draft = assistantDrafts.remove(turnId)
         val messageId = draft?.messageId
         if (messageId == null) {
@@ -3237,7 +3276,7 @@ class VoiceAgentService : Service() {
                 ),
             )
         }
-        val client = runCatching { OpenAiCompatibleLlmClient(capabilityResolver.llmConfig()) }
+        val client = runCatching { createLlmClient(silent = true) }
             .getOrElse { error ->
                 DiagLog.w("intent.route.failed", "stage=create_client reason=${error.message}")
                 return@async null
@@ -3806,7 +3845,7 @@ class VoiceAgentService : Service() {
                 return@repeat
             }
             val requestId = "${task.taskId}:$attempt"
-            val client = OpenAiCompatibleLlmClient(config)
+            val client = newLlmClient(config)
             try {
                 DiagLog.i(
                     "background.llm.attempt_started",
@@ -3896,30 +3935,12 @@ class VoiceAgentService : Service() {
     }
 
     private fun createLlmClient(silent: Boolean = false): LlmClient {
-        val active = llmProviderRepository.activeProfile()
-        val primary = OpenAiCompatibleLlmClient(capabilityResolver.llmConfig())
-        if (active.builtIn || !capabilityResolver.defaultLlmAvailable()) return primary
-        return FallbackLlmClient(
-            primary = primary,
-            fallbackProvider = {
-                OpenAiCompatibleLlmClient(capabilityResolver.defaultLlmConfig())
-            },
-            onFallback = { error ->
-                llmProviderRepository.activateBuiltIn()
-                val reason = when (error) {
-                    is LlmHttpException -> "HTTP ${error.statusCode}"
-                    else -> error.message ?: error.javaClass.simpleName
-                }
-                val message = "自定义 LLM 当前不可用，已切回默认模型。原因：$reason"
-                if (silent) {
-                    DiagLog.w("intent.route.fallback", message)
-                } else {
-                    store.addMessage("system", message)
-                    EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, message))
-                    emitLog(message)
-                }
-            },
-        )
+        return newLlmClient(capabilityResolver.llmConfig())
+    }
+
+    private fun newLlmClient(config: LLMConfig): LlmClient = when (config.providerMode) {
+        com.agent.voiceassistant.agent.LlmProviderMode.ANTHROPIC -> AnthropicLlmClient(config)
+        else -> OpenAiCompatibleLlmClient(config)
     }
 
     private suspend fun playFullTtsSentence(client: CloudSpeechClient, sentence: String) {

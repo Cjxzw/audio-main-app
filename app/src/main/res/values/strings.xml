@@ -48,9 +48,9 @@
     <string name="conversation_empty_preview">暂无消息</string>
     <string name="conversation_message_count">%1$d 条消息 · %2$s</string>
     <string name="settings_title">设置</string>
-    <string name="settings_models">模型与供应商</string>
-    <string name="settings_custom_llm">专属 LLM</string>
-    <string name="settings_models_summary">可选；配置后聊天请求改走专属供应商</string>
+    <string name="settings_models">大模型配置</string>
+    <string name="settings_custom_llm">大模型配置</string>
+    <string name="settings_models_summary">管理 LLM 供应商</string>
     <string name="settings_mimo">小米 MiMo 服务</string>
     <string name="settings_mimo_key">MiMo API Key</string>
     <string name="settings_mimo_key_missing">未配置；语音输入输出不可用</string>
@@ -62,8 +62,15 @@
     <string name="settings_realtime">Realtime 语音管线</string>
     <string name="settings_realtime_summary">使用 StepFun 实时语音、文本、思考与工具调用</string>
     <string name="settings_realtime_active_summary">当前正在使用 StepFun Realtime 管线</string>
+    <string name="settings_conversation_lifecycle">会话生命周期</string>
+    <string name="settings_conversation_lifecycle_summary">设置上下文阈值和非活跃时间，自动开启新会话</string>
+    <string name="settings_conversation_context_threshold">上下文阈值（千 tokens）</string>
+    <string name="settings_conversation_context_threshold_summary">达到 %1$dk 且超时后自动开启新会话</string>
+    <string name="settings_conversation_inactive_minutes">非活跃时间（分钟）</string>
+    <string name="settings_conversation_inactive_minutes_summary">连续 %1$d 分钟无事件后检查会话</string>
+    <string name="settings_conversation_positive_integer">请输入非零正整数</string>
     <string name="settings_realtime_pipeline">当前语音管线</string>
-    <string name="settings_realtime_pipeline_mimo">MiMo 标准语音</string>
+    <string name="settings_realtime_pipeline_mimo">MiMo 标准语音（已停用）</string>
     <string name="settings_realtime_pipeline_stepfun">StepFun Realtime</string>
     <string name="settings_realtime_key">StepFun API Key</string>
     <string name="settings_realtime_key_missing">未配置；无法启用 StepFun Realtime</string>
@@ -207,6 +214,7 @@
     <string name="provider_save">保存并启用</string>
     <string name="provider_delete">删除此供应商</string>
     <string name="provider_test_ok">连接成功：%1$s</string>
+    <string name="provider_context_window">已记录最大上下文窗口：%1$s tokens（测试连接后更新）</string>
     <string name="provider_saved">供应商已保存并启用</string>
     <string name="provider_saved_text_only_warning">供应商已启用。该模型不支持多模态，图片会尝试由默认模型转写且可能损失细节；默认模型不可用时将无法识别图片。</string>
     <string name="provider_text_only_selection_warning">当前模型不支持多模态，请尽量避免发送图片。图片会尝试由默认模型转写，转写不保证完整准确。</string>

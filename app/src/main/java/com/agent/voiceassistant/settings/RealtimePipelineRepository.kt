@@ -29,9 +29,12 @@ class RealtimePipelineRepository(context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
 
     fun activePipeline(): VoicePipeline = preferences
-        .getString(KEY_ACTIVE_PIPELINE, VoicePipeline.MIMO_STANDARD.name)
-        ?.let { value -> runCatching { VoicePipeline.valueOf(value) }.getOrNull() }
-        ?: VoicePipeline.MIMO_STANDARD
+        .getString(KEY_ACTIVE_PIPELINE, VoicePipeline.STEPFUN_REALTIME.name)
+        ?.let { value ->
+            runCatching { VoicePipeline.valueOf(value) }.getOrNull()
+                ?.takeIf { it == VoicePipeline.STEPFUN_REALTIME }
+        }
+        ?: VoicePipeline.STEPFUN_REALTIME
 
     fun setActivePipeline(pipeline: VoicePipeline) {
         preferences.edit().putString(KEY_ACTIVE_PIPELINE, pipeline.name).apply()

@@ -74,6 +74,7 @@ class ConversationStore(context: Context) {
                 current = session.id == state.currentConversationId,
                 memoryCompressedAt = session.memoryCompressedAt,
                 domain = session.domain,
+                contextUsageTokens = session.contextUsageTokens,
             )
             }
             .toList()
@@ -91,6 +92,7 @@ class ConversationStore(context: Context) {
             current = true,
             memoryCompressedAt = session.memoryCompressedAt,
             domain = session.domain,
+            contextUsageTokens = session.contextUsageTokens,
         )
     }
 
@@ -103,6 +105,10 @@ class ConversationStore(context: Context) {
 
     fun latestConversationId(domain: ConversationDomain): String? = synchronized(lock) {
         state.sessions.filter { it.domain == domain }.maxByOrNull { it.updatedAt }?.id
+    }
+
+    fun currentConversationContextUsage(): Long = synchronized(lock) {
+        currentSessionLocked().contextUsageTokens ?: 0L
     }
 
     fun recentChatMessagesForConversation(conversationId: String, limit: Int = 500): List<ChatMessage> = synchronized(lock) {
@@ -192,6 +198,15 @@ class ConversationStore(context: Context) {
             persistLocked()
         }
         return message
+    }
+
+    fun recordContextUsage(conversationId: String, tokens: Long) = synchronized(lock) {
+        if (tokens <= 0) return@synchronized
+        state.sessions.firstOrNull { it.id == conversationId }?.let { session ->
+            session.contextUsageTokens = tokens
+            session.updatedAt = System.currentTimeMillis()
+            persistLocked()
+        }
     }
 
     fun addMessageToConversation(
@@ -639,8 +654,9 @@ class ConversationStore(context: Context) {
     }
 
     fun switchConversation(id: String): Boolean = synchronized(lock) {
-        if (state.sessions.none { it.id == id }) return@synchronized false
+        val session = state.sessions.firstOrNull { it.id == id } ?: return@synchronized false
         state.currentConversationId = id
+        session.updatedAt = System.currentTimeMillis()
         persistLocked()
         true
     }
@@ -785,48 +801,50 @@ class ConversationStore(context: Context) {
         }
     }
 
-    /** Returns at most three user/assistant turns from old sessions for a single keyword. */
+    /** Returns at most three complete historical turns from all standard sessions. */
     fun searchHistoricalConversationTurns(keyword: String, maxTurns: Int = 3): String = synchronized(lock) {
         val query = keyword.trim()
         if (query.isBlank()) return@synchronized "历史会话搜索需要一个明确关键词。"
+        if (query.length > 10) return@synchronized "历史会话搜索失败：关键词最多 10 个字符。"
         data class Candidate(
+            val sessionCreatedAt: Long,
             val user: String,
             val assistant: String,
             val updatedAt: Long,
-            val uncompressed: Boolean,
         )
         val candidates = mutableListOf<Candidate>()
         state.sessions.filter { it.domain == ConversationDomain.STANDARD }.forEach { session ->
-            val cursorIndex = session.compactedUpToMessageId
-                ?.let { id -> session.messages.indexOfFirst { it.id == id } }
-                ?: -1
             session.messages.forEachIndexed { index, message ->
                 if (message.role != "user" || message.content.isBlank()) return@forEachIndexed
-                val assistant = session.messages
-                    .drop(index + 1)
-                    .takeWhile { it.role != "user" }
-                    .lastOrNull { it.role == "assistant" && it.content.isNotBlank() && it.llmVisible != false }
-                    ?: return@forEachIndexed
+                val following = session.messages.drop(index + 1).takeWhile { it.role != "user" }
+                val completed = following.lastOrNull {
+                    it.role == "assistant" && it.content.isNotBlank() &&
+                        it.llmVisible != false && it.streamState != ChatStreamState.INTERRUPTED.name
+                }
+                val assistant = completed ?: following.lastOrNull {
+                    it.role == "assistant" && it.content.isNotBlank() && it.llmVisible != false
+                } ?: return@forEachIndexed
                 if (!message.content.contains(query, ignoreCase = true) &&
-                    !assistant.content.contains(query, ignoreCase = true)
+                    !following.any { it.content.contains(query, ignoreCase = true) }
                 ) return@forEachIndexed
                 candidates += Candidate(
+                    sessionCreatedAt = session.createdAt,
                     user = message.content,
                     assistant = assistant.content,
                     updatedAt = maxOf(message.timestamp, assistant.timestamp),
-                    uncompressed = index > cursorIndex,
                 )
             }
         }
         val selected = candidates
-            .sortedWith(compareByDescending<Candidate> { it.uncompressed }.thenByDescending { it.updatedAt })
+            .sortedByDescending { it.updatedAt }
             .take(maxTurns.coerceIn(1, 3))
         if (selected.isEmpty()) return@synchronized "没有找到包含“$query”的历史会话。"
         buildString {
             appendLine("历史会话搜索结果（关键词：$query）：")
             selected.forEachIndexed { index, candidate ->
                 val body = "用户：${candidate.user}\n助手：${candidate.assistant}"
-                appendLine("${index + 1}. ${body.take(1000)}${if (body.length > 1000) "…（已截断）" else ""}")
+                val time = SimpleDateFormat("yyMMddHHmm", Locale.CHINA).format(Date(candidate.sessionCreatedAt))
+                appendLine("${index + 1}. 会话产生时间 $time\n$body")
             }
         }.trim()
     }
@@ -1277,6 +1295,7 @@ data class ConversationSession(
     var domain: ConversationDomain = ConversationDomain.STANDARD,
     val messages: MutableList<StoredMessage> = mutableListOf(),
     var contextSnapshot: String? = null,
+    var contextUsageTokens: Long? = null,
     var memoryCompressedAt: Long? = null,
     var compactedUpToMessageId: String? = null,
     val pendingContextNotes: MutableList<String> = mutableListOf(),
@@ -1312,6 +1331,7 @@ data class ConversationSummary(
     val current: Boolean,
     val memoryCompressedAt: Long?,
     val domain: ConversationDomain = ConversationDomain.STANDARD,
+    val contextUsageTokens: Long? = null,
 )
 
 data class ConversationCompressionSource(

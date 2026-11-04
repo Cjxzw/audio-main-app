@@ -118,16 +118,23 @@ class MainToolRegistry(
 
     suspend fun execute(call: CloudSpeechClient.ToolCall): Execution {
         val payload = parseArguments(call.arguments)
-        if (call.name == TOOL_MEMORY_SEARCH && payload.text("scope") == "history") {
+        if (call.name == TOOL_MEMORY_SEARCH &&
+            (payload.text("scope") == "history" || payload.text("conversation_search_mode") == "all_history")
+        ) {
             val query = payload.text("query").orEmpty().trim()
             if (query.isBlank()) {
                 return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索失败", "必须提供一个关键词。", shouldAskLlm = false, success = false))
             }
-            if (historicalSearchCount.incrementAndGet() > 3) {
+            if (query.length > 10) {
+                return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索失败", "关键词最多 10 个字符。", shouldAskLlm = false, success = false))
+            }
+            if (historicalSearchCount.get() >= 3) {
                 return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索已限流", "每个回合最多搜索 3 次，请合并关键词后再试。", shouldAskLlm = false))
             }
             val result = historicalConversationSearch?.invoke(query, 3) ?: "历史会话搜索暂不可用。"
-            return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索", result, shouldAskLlm = false))
+            val missed = result.startsWith("未命中") || result.startsWith("没有找到")
+            if (!missed) historicalSearchCount.incrementAndGet()
+            return Execution(call, LocalToolExecutor.ToolResult(call.name, "历史会话搜索", result, shouldAskLlm = false, success = !missed))
         }
         if (call.name == TOOL_HUB_DISPATCH_TASK) {
             return Execution(call, executeHubDispatch(payload))
@@ -494,7 +501,7 @@ class MainToolRegistry(
 
     private fun memorySearch() = tool(
         name = TOOL_MEMORY_SEARCH,
-        description = "查询本地长期记忆；需要补充旧会话细节时，将 scope 设为 history，并提供一个明确关键词。历史会话搜索每回合最多 3 次，每次最多返回 3 轮。",
+        description = "查询本地长期记忆；需要补充旧会话细节时，将 scope 设为 history 或 conversation_search_mode 设为 all_history，并提供不超过 10 个字符的关键词。历史会话搜索每回合最多 3 次，每次最多返回 3 轮。",
     ) {
         putJsonObject("query") {
             put("type", "string")
@@ -504,6 +511,11 @@ class MainToolRegistry(
             put("type", "string")
             put("enum", buildJsonArray { add(JsonPrimitive("memory")); add(JsonPrimitive("history")) })
             put("description", "memory 查询长期记忆；history 查询历史会话细节")
+        }
+        putJsonObject("conversation_search_mode") {
+            put("type", "string")
+            put("enum", buildJsonArray { add(JsonPrimitive("none")); add(JsonPrimitive("all_history")) })
+            put("description", "设为 all_history 时在全部历史标准会话中搜索")
         }
         putJsonObject("limit") {
             put("type", "integer")
