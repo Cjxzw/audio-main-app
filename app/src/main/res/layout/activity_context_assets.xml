@@ -11,7 +11,7 @@
         android:layout_height="56dp"
         android:background="@color/white"
         app:navigationIcon="@drawable/ic_arrow_back_24"
-        app:title="@string/settings_context_assets"
+        app:title="@string/settings_context_management"
         app:titleTextColor="@color/black"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"

@@ -22,7 +22,15 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 
 class ContextAssetsActivity : AppCompatActivity() {
-    private enum class Tab { SKILLS, MEMORIES, RULES }
+    enum class Tab { SKILLS, MEMORIES, RULES }
+
+    companion object {
+        private const val EXTRA_TAB = "context_assets_tab"
+
+        fun intent(context: android.content.Context, tab: Tab): android.content.Intent =
+            android.content.Intent(context, ContextAssetsActivity::class.java)
+                .putExtra(EXTRA_TAB, tab.name)
+    }
 
     private lateinit var binding: ActivityContextAssetsBinding
     private lateinit var store: ConversationStore
@@ -44,6 +52,16 @@ class ContextAssetsActivity : AppCompatActivity() {
         binding.contextAssetsList.adapter = adapter
         binding.contextAssetsToolbar.inflateMenu(R.menu.menu_context_assets)
         binding.contextAssetsToolbar.setNavigationOnClickListener { finish() }
+        tab = runCatching { Tab.valueOf(intent.getStringExtra(EXTRA_TAB).orEmpty()) }
+            .getOrDefault(Tab.SKILLS)
+        binding.contextAssetsToolbar.title = tabTitle(tab)
+        binding.contextAssetTabs.check(
+            when (tab) {
+                Tab.SKILLS -> R.id.btnSkillsTab
+                Tab.MEMORIES -> R.id.btnMemoriesTab
+                Tab.RULES -> R.id.btnRulesTab
+            },
+        )
         binding.contextAssetsToolbar.setOnMenuItemClickListener { item ->
             if (item.itemId == R.id.action_add_context_asset) {
                 addCurrentAsset()
@@ -59,6 +77,7 @@ class ContextAssetsActivity : AppCompatActivity() {
                 R.id.btnRulesTab -> Tab.RULES
                 else -> Tab.SKILLS
             }
+            binding.contextAssetsToolbar.title = tabTitle(tab)
             reload()
         }
         reload()
@@ -136,6 +155,12 @@ class ContextAssetsActivity : AppCompatActivity() {
     }
 
     private fun showError(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+
+    private fun tabTitle(tab: Tab): String = when (tab) {
+        Tab.SKILLS -> getString(R.string.context_assets_skills)
+        Tab.MEMORIES -> getString(R.string.context_assets_memories)
+        Tab.RULES -> getString(R.string.context_assets_rules)
+    }
 
 }
 

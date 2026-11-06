@@ -95,15 +95,6 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
             addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_conversation_lifecycle)
-                summary = getString(R.string.settings_conversation_lifecycle_summary)
-                setIcon(R.drawable.ic_model_24)
-                setOnPreferenceClickListener {
-                    (activity as SettingsActivity).open(ConversationLifecycleSettingsFragment(), getString(R.string.settings_conversation_lifecycle))
-                    true
-                }
-            })
-            addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_http_credentials)
                 summary = getString(R.string.settings_http_credentials_summary)
                 setIcon(R.drawable.ic_model_24)
@@ -113,20 +104,14 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 }
             })
             addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_voice)
-                summary = getString(R.string.settings_voice_summary)
-                setIcon(R.drawable.ic_volume_24)
+                title = getString(R.string.settings_context_management)
+                summary = getString(R.string.settings_context_management_summary)
+                setIcon(R.drawable.ic_context_management_24)
                 setOnPreferenceClickListener {
-                    (activity as SettingsActivity).open(VoiceSettingsFragment(), getString(R.string.settings_voice))
-                    true
-                }
-            })
-            addPreference(Preference(requireContext()).apply {
-                title = getString(R.string.settings_context_assets)
-                summary = getString(R.string.settings_context_assets_summary)
-                setIcon(R.drawable.ic_brain_24)
-                setOnPreferenceClickListener {
-                    startActivity(Intent(requireContext(), ContextAssetsActivity::class.java))
+                    (activity as SettingsActivity).open(
+                        ContextManagementFragment(),
+                        getString(R.string.settings_context_management),
+                    )
                     true
                 }
             })
@@ -154,6 +139,52 @@ class RootSettingsFragment : PreferenceFragmentCompat() {
                 setIcon(R.drawable.ic_info_24)
                 setOnPreferenceClickListener {
                     (activity as SettingsActivity).open(AboutSettingsFragment(), getString(R.string.settings_about))
+                    true
+                }
+            })
+        }
+    }
+}
+
+class ContextManagementFragment : PreferenceFragmentCompat() {
+    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.context_assets_skills)
+                summary = getString(R.string.context_management_skills_summary)
+                setIcon(R.drawable.ic_book_24)
+                setOnPreferenceClickListener {
+                    startActivity(ContextAssetsActivity.intent(requireContext(), ContextAssetsActivity.Tab.SKILLS))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.context_assets_memories)
+                summary = getString(R.string.context_management_memories_summary)
+                setIcon(R.drawable.ic_brain_24)
+                setOnPreferenceClickListener {
+                    startActivity(ContextAssetsActivity.intent(requireContext(), ContextAssetsActivity.Tab.MEMORIES))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.context_assets_rules)
+                summary = getString(R.string.context_management_rules_summary)
+                setIcon(R.drawable.ic_balance_24)
+                setOnPreferenceClickListener {
+                    startActivity(ContextAssetsActivity.intent(requireContext(), ContextAssetsActivity.Tab.RULES))
+                    true
+                }
+            })
+            addPreference(Preference(requireContext()).apply {
+                title = getString(R.string.settings_conversation_lifecycle)
+                summary = getString(R.string.settings_conversation_lifecycle_summary)
+                setIcon(R.drawable.ic_recycle_24)
+                setOnPreferenceClickListener {
+                    (activity as SettingsActivity).open(
+                        ConversationLifecycleSettingsFragment(),
+                        getString(R.string.settings_conversation_lifecycle),
+                    )
                     true
                 }
             })

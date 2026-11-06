@@ -109,6 +109,11 @@
     <string name="settings_voice_summary">音量与个性化语音设置</string>
     <string name="settings_context_assets">技能与记忆</string>
     <string name="settings_context_assets_summary">配置技能、记忆、规则</string>
+    <string name="settings_context_management">上下文管理</string>
+    <string name="settings_context_management_summary">管理技能、记忆、规则和会话生命周期</string>
+    <string name="context_management_skills_summary">按需加载的能力、流程和专门知识</string>
+    <string name="context_management_memories_summary">按评分自动管理并注入长期记忆</string>
+    <string name="context_management_rules_summary">始终生效的 Agent 行为约束</string>
     <string name="settings_reflections">回合反思</string>
     <string name="settings_reflections_summary">查看耗时、工具调用和影子反思结果</string>
     <string name="reflections_empty">还没有回合指标</string>
