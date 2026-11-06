@@ -34,6 +34,7 @@ class LocalToolExecutor(
         Timber.i("LocalToolExecutor: execute ${action.actionType}")
         return when (action.actionType) {
             "memory.create", "note.create" -> createMemory(action.payload)
+            "memory.edit" -> editMemory(action.payload)
             "memory.search", "note.search" -> searchMemory(action.payload)
             "location.refresh", "location.get_current" -> refreshLocation()
             "location.reverse_geocode", "location.reverseGeocode" -> reverseGeocodeLocation()
@@ -87,13 +88,56 @@ class LocalToolExecutor(
         val summary = if (found.isEmpty()) {
             "没有找到相关记忆。"
         } else {
-            found.joinToString("\n") { "- ${it.content}" }
+            found.joinToString("\n") { memory ->
+                "- UID=${memory.id} score=${store.memoryScore(memory)} updated=${memory.updatedAt}: ${memory.content}"
+            }
         }
         return ToolResult(
             actionType = "memory.search",
             displayText = "查询记忆：${query.ifBlank { "最近记忆" }}",
             contextText = "记忆查询结果：\n$summary",
             shouldAskLlm = true,
+        )
+    }
+
+    private fun editMemory(payload: JsonObject): ToolResult {
+        val mode = payload.string("mode")?.lowercase().orEmpty()
+        val id = payload.string("memory_id")?.trim().orEmpty()
+        if (mode !in setOf("edit", "delete")) {
+            return ToolResult("memory.edit", "记忆操作失败", "mode 必须是 edit 或 delete。", true, false)
+        }
+        if (mode == "delete") {
+            if (id.isBlank() || id == "new") {
+                return ToolResult("memory.edit", "记忆删除失败", "delete 模式必须提供已有记忆 UID。", true, false)
+            }
+            val deleted = store.deleteMemory(id)
+            return ToolResult(
+                "memory.edit",
+                if (deleted) "已删除记忆" else "记忆删除失败",
+                if (deleted) "已删除记忆 UID=$id。" else "未找到记忆 UID=$id。",
+                shouldAskLlm = true,
+                success = deleted,
+            )
+        }
+        val content = payload.string("content")?.trim().orEmpty()
+        if (content.isBlank()) {
+            return ToolResult("memory.edit", "记忆编辑失败", "edit 模式必须提供非空 content。", true, false)
+        }
+        val tags = payload.stringList("tags")
+        val updated = if (id == "new") {
+            store.addMemory(content, tags)
+        } else if (id.isNotBlank()) {
+            store.updateMemory(id, content, tags)
+        } else {
+            null
+        }
+        return ToolResult(
+            "memory.edit",
+            if (updated != null) "已更新记忆" else "记忆编辑失败",
+            updated?.let { "记忆已更新：UID=${it.id} score=${store.memoryScore(it)} ${it.content}" }
+                ?: "未找到记忆 UID=$id。",
+            shouldAskLlm = true,
+            success = updated != null,
         )
     }
 

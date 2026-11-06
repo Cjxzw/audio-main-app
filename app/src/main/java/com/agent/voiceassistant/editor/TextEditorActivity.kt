@@ -126,9 +126,9 @@ class TextEditorActivity : AppCompatActivity() {
                         .map(String::trim)
                         .filter(String::isNotBlank)
                     savedMemory = if (creatingMemory()) {
-                        conversationStore.addMemory(text, tags)
+                        conversationStore.addMemory(text, tags, manuallyAdded = true)
                     } else {
-                        conversationStore.updateMemory(path, text, tags) ?: error("记忆不存在")
+                        conversationStore.updateMemory(path, text, tags, manuallyEdited = true) ?: error("记忆不存在")
                     }
                     path = requireNotNull(savedMemory).id
                 }

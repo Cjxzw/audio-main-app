@@ -23,6 +23,7 @@ class ConversationMemoryCompactor {
         appendLine("4. 一条 memory 只表达一个可独立复用的事实。不要保存对话摘要，不要把多个无关事实拼成一条。")
         appendLine("5. 若内容与已有记忆相同、修正或可合并，必须填写 existing_memory_id；否则省略该字段。")
         appendLine("6. 没有值得长期保存的信息时，必须返回 {\"memories\":[]}，这属于合法成功结果。")
+        appendLine("7. 已有记忆比普通聊天历史更可信；同为已有记忆时优先参考分数更高、更新时间更近的条目。用户在当前消息中的明确纠正优先于旧记忆。不要因为相似内容就无条件新增重复项。")
         appendLine()
         appendLine("正确示例 A：用户消息 m-12 为‘以后回答直接一点，先说结论’，返回：")
         appendLine("{\"memories\":[{\"content\":\"用户偏好回答先给结论并保持直接简洁\",\"category\":\"preference\",\"tags\":[\"沟通方式\"],\"evidence_message_ids\":[\"m-12\"]}]}")
@@ -33,7 +34,7 @@ class ConversationMemoryCompactor {
         appendLine("会话标题：${source.title}")
         appendLine("<existing_memories>")
         existingMemories.filter { it.enabled }.take(MAX_EXISTING_MEMORIES).forEach { memory ->
-            appendLine("${memory.id}\t${memory.category.orEmpty()}\t${memory.content}")
+            appendLine("${memory.id}\t${memory.category.orEmpty()}\tscore=${memoryScore(memory)}\tupdated=${memory.updatedAt}\t${memory.content}")
         }
         appendLine("</existing_memories>")
         appendLine("<evidence_index>")
@@ -41,6 +42,13 @@ class ConversationMemoryCompactor {
             appendLine("[${message.id}] ${if (message.role == "user") "用户" else "助手"}: ${message.content}")
         }
         appendLine("</evidence_index>")
+    }
+
+    private fun memoryScore(memory: StoredMemory): Int {
+        val ageDays = ((System.currentTimeMillis() - memory.updatedAt).coerceAtLeast(0L) / DAY_MS).toInt()
+        val freshness = (FRESHNESS_MAX - ageDays / FRESHNESS_DECAY_DAYS).coerceAtLeast(0)
+        return freshness + (if (memory.manualBonusGranted) MANUAL_MEMORY_BONUS else 0) +
+            memory.recallScore.coerceIn(0, MAX_RECALL_SCORE)
     }
 
     fun parseStrict(raw: String): Result<List<ConversationMemoryDraft>> = runCatching {
@@ -94,6 +102,11 @@ class ConversationMemoryCompactor {
     private companion object {
         const val MAX_EXISTING_MEMORIES = 80
         const val MAX_RESULT_MEMORIES = 12
+        const val FRESHNESS_MAX = 10
+        const val FRESHNESS_DECAY_DAYS = 30
+        const val MANUAL_MEMORY_BONUS = 10
+        const val MAX_RECALL_SCORE = 10
+        const val DAY_MS = 24L * 60L * 60L * 1_000L
         val ALLOWED_CATEGORIES = setOf("preference", "profile", "ongoing", "decision", "recurring_topic", "explicit")
         val REQUIRED_ITEM_KEYS = setOf("content", "category", "tags", "evidence_message_ids")
         val ALLOWED_ITEM_KEYS = REQUIRED_ITEM_KEYS + "existing_memory_id"

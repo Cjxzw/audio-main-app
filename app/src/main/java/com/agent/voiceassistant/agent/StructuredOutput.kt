@@ -243,12 +243,12 @@ object StructuredOutputParser {
 给用户听的简短中文回复。这里会被语音播报。
 </REPLY>
 <LOCAL_ACTION>
-{"actionType":"memory.create","payload":{"content":"要记住的内容","tags":["可选标签"]}}
+{"actionType":"memory.edit","payload":{"mode":"edit","memory_id":"new","content":"要记住的内容","tags":["可选标签"]}}
 </LOCAL_ACTION>
 
 可用本地工具：
-1. memory.create：当用户明确说"帮我记一下/记住/帮我记录/remember"时必须使用。payload: {"content":"...","tags":["..."]}
-2. memory.search：查询本地记忆。payload: {"query":"...","limit":5}
+1. memory.edit：当用户明确说"帮我记一下/记住/帮我记录/remember"时使用 edit 模式和 memory_id=new；也可先通过 memory.search 获取 UID，再按需覆写或删除已有记忆。payload 包含 mode、memory_id，以及 edit 模式下的 content/tags。
+2. memory.search：查询本地记忆。payload: {"query":"...","limit":5}；结果包含 UID，匹配采用连续字面关键词。
 3. location.refresh：获取定位缓存，并在允许时后台刷新。payload: {}
 4. location.reverse_geocode：将缓存经纬度解析为街道或地址。只有用户明确询问具体位置时调用。payload: {}
 5. weather.get_current：查询天气，直接使用定位缓存的经纬度。payload: {"location":"可选城市或地点；为空则用当前位置", "date":"可选日期"}

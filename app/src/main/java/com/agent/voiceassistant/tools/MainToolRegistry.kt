@@ -63,27 +63,27 @@ class MainToolRegistry(
             return listOf(mainConversationQuery(), memorySearch(), delegateToMain(), realtimeHangup())
         }
         return listOf(
-        memoryCreate(),
-        memorySearch(),
-        locationRefresh(),
-        locationReverseGeocode(),
-        weatherCurrent(),
-        webSearch(),
-        readFile(),
-        writeFile(),
-        workspaceDelete(),
-        execCommand(),
-        httpRequest(),
-        codeGraphSearch(),
-        codeGraphExplain(),
-        skillRegister(),
-        skillUse(),
-        voiceReply(),
-        singSong(),
-        taskStatus(),
-        cancelTask(),
-        agentSleep(),
-        hubDispatchTask(),
+            memoryEdit(),
+            memorySearch(),
+            locationRefresh(),
+            locationReverseGeocode(),
+            weatherCurrent(),
+            webSearch(),
+            readFile(),
+            writeFile(),
+            workspaceDelete(),
+            execCommand(),
+            httpRequest(),
+            codeGraphSearch(),
+            codeGraphExplain(),
+            skillRegister(),
+            skillUse(),
+            voiceReply(),
+            singSong(),
+            taskStatus(),
+            cancelTask(),
+            agentSleep(),
+            hubDispatchTask(),
         )
     }
 
@@ -143,7 +143,7 @@ class MainToolRegistry(
             return Execution(call, executeAsyncTaskTool(call, payload))
         }
         val legacyAction = when (call.name) {
-            TOOL_MEMORY_CREATE -> "memory.create"
+            TOOL_MEMORY_EDIT -> "memory.edit"
             TOOL_MEMORY_SEARCH -> "memory.search"
             TOOL_LOCATION_REFRESH -> "location.refresh"
             TOOL_LOCATION_REVERSE_GEOCODE -> "location.reverse_geocode"
@@ -354,7 +354,7 @@ class MainToolRegistry(
     }
 
     fun displayName(toolName: String): String = when (toolName) {
-        TOOL_MEMORY_CREATE -> "写入记忆"
+        TOOL_MEMORY_EDIT -> "编辑记忆"
         TOOL_MEMORY_SEARCH -> "查询记忆"
         TOOL_LOCATION_REFRESH -> "刷新定位"
         TOOL_LOCATION_REVERSE_GEOCODE -> "解析当前位置"
@@ -386,7 +386,7 @@ class MainToolRegistry(
     fun displaySummary(call: CloudSpeechClient.ToolCall): String? {
         val payload = parseArguments(call.arguments)
         val value = when (call.name) {
-            TOOL_MEMORY_CREATE -> payload.text("content")?.let { "保存 ${it.take(24)}" }
+            TOOL_MEMORY_EDIT -> payload.text("memory_id")?.let { "${payload.text("mode") ?: "编辑"} ${it.take(12)}" }
             TOOL_MEMORY_SEARCH -> payload.text("query")
             TOOL_LOCATION_REFRESH -> "获取缓存"
             TOOL_LOCATION_REVERSE_GEOCODE -> "解析地址"
@@ -441,18 +441,27 @@ class MainToolRegistry(
     private fun JsonObject.text(key: String): String? =
         (this[key] as? JsonPrimitive)?.content?.trim()?.takeIf { it.isNotBlank() }
 
-    private fun memoryCreate() = tool(
-        name = TOOL_MEMORY_CREATE,
-        description = "当用户明确要求记住、记录或保存某项信息时，将内容写入本地长期记忆。",
-        required = listOf("content"),
+    private fun memoryEdit() = tool(
+        name = TOOL_MEMORY_EDIT,
+        description = "编辑或删除本地长期记忆。必须使用 memory_search 返回的 UID 精确定位；edit 模式覆写已有记忆并刷新更新时间，memory_id=new 才表示新增。delete 模式删除已有记忆，不允许使用 new。LLM 自动编辑不会获得手动加分，只有用户在 UI 中手动编辑才获得一次永久手动加分。",
+        required = listOf("mode", "memory_id"),
     ) {
+        putJsonObject("mode") {
+            put("type", "string")
+            put("enum", buildJsonArray { add(JsonPrimitive("edit")); add(JsonPrimitive("delete")) })
+            put("description", "edit 覆写或新增；delete 删除已有记忆")
+        }
+        putJsonObject("memory_id") {
+            put("type", "string")
+            put("description", "已有记忆 UID；仅 edit 模式允许填写 new")
+        }
         putJsonObject("content") {
             put("type", "string")
-            put("description", "需要记住的完整内容")
+            put("description", "edit 模式下要保存的完整记忆内容")
         }
         putJsonObject("tags") {
             put("type", "array")
-            put("description", "可选的简短分类标签")
+            put("description", "edit 模式下替换为新的标签列表")
             put("items", buildJsonObject { put("type", "string") })
         }
     }
@@ -501,11 +510,11 @@ class MainToolRegistry(
 
     private fun memorySearch() = tool(
         name = TOOL_MEMORY_SEARCH,
-        description = "查询本地长期记忆；需要补充旧会话细节时，将 scope 设为 history 或 conversation_search_mode 设为 all_history，并提供不超过 10 个字符的关键词。历史会话搜索每回合最多 3 次，每次最多返回 3 轮。",
+        description = "查询本地长期记忆或历史会话。长期记忆搜索使用不区分大小写的连续字面子串匹配，不支持语义相似、同义词或跳跃字符；结果包含稳定 UID、分数和更新时间，命中会增加有限召回分。需要补充旧会话细节时，将 scope 设为 history 或 conversation_search_mode 设为 all_history，并提供不超过 10 个字符的关键词。历史会话搜索每回合最多 3 次，每次最多返回 3 轮。",
     ) {
         putJsonObject("query") {
             put("type", "string")
-            put("description", "查询关键词；为空时返回最近记忆")
+            put("description", "长期记忆使用实际出现在正文或标签中的连续关键词；为空时按评分返回常用记忆")
         }
         putJsonObject("scope") {
             put("type", "string")
@@ -880,7 +889,7 @@ class MainToolRegistry(
     }
 
     companion object {
-        const val TOOL_MEMORY_CREATE = "memory_create"
+        const val TOOL_MEMORY_EDIT = "memory_edit"
         const val TOOL_MEMORY_SEARCH = "memory_search"
         const val TOOL_LOCATION_REFRESH = "location_refresh"
         const val TOOL_LOCATION_REVERSE_GEOCODE = "location_reverse_geocode"
@@ -909,7 +918,7 @@ class MainToolRegistry(
         const val TOOL_REALTIME_HANGUP = "realtime_hangup"
 
         val NATIVE_TOOL_NAMES = setOf(
-            TOOL_MEMORY_CREATE, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
+            TOOL_MEMORY_EDIT, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
             TOOL_LOCATION_REVERSE_GEOCODE, TOOL_WEATHER_CURRENT, TOOL_WEB_SEARCH,
             TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_EXEC, TOOL_HTTP_REQUEST,
             TOOL_CODE_GRAPH_SEARCH, TOOL_CODE_GRAPH_EXPLAIN, TOOL_SKILL_REGISTER,
