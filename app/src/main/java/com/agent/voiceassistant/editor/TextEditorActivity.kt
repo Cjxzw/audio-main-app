@@ -62,13 +62,14 @@ class TextEditorActivity : AppCompatActivity() {
         binding.textEditorToolbar.inflateMenu(R.menu.menu_text_editor)
         binding.textEditorToolbar.setNavigationOnClickListener { leaveEditor() }
         binding.textEditorToolbar.setOnMenuItemClickListener { item ->
-            if (item.itemId == R.id.action_save_text) {
-                save()
-                true
-            } else {
-                false
+            when (item.itemId) {
+                R.id.action_save_text -> { save(); true }
+                R.id.action_delete_memory -> { confirmDeleteMemory(); true }
+                else -> false
             }
         }
+        binding.textEditorToolbar.menu.findItem(R.id.action_delete_memory)?.isVisible =
+            source == Source.MEMORY && !creatingMemory()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = leaveEditor()
         })
@@ -166,6 +167,18 @@ class TextEditorActivity : AppCompatActivity() {
         }
     }
 
+    private fun confirmDeleteMemory() {
+        MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
+            .setTitle(R.string.text_editor_delete_memory_confirm_title)
+            .setMessage(R.string.text_editor_delete_memory_confirm_message)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.context_asset_delete) { _, _ ->
+                if (conversationStore.deleteMemory(path)) finish()
+                else Toast.makeText(this, "记忆不存在", Toast.LENGTH_LONG).show()
+            }
+            .showLightDialog()
+    }
+
     private fun showPreview(preview: Boolean) {
         binding.textEditorInput.visibility = if (preview) View.GONE else View.VISIBLE
         binding.textEditorPreviewScroll.visibility = if (preview) View.VISIBLE else View.GONE
@@ -179,9 +192,19 @@ class TextEditorActivity : AppCompatActivity() {
     }
 
     private fun isDirty(): Boolean =
-        binding.textEditorInput.text?.toString().orEmpty() != savedText ||
-            (source == Source.MEMORY && binding.memoryTagsInput.text?.toString().orEmpty() != savedTags) ||
+        if (source == Source.MEMORY) {
+            binding.textEditorInput.text?.toString().orEmpty().trim() != savedText.trim() ||
+                normalizeMemoryTags(binding.memoryTagsInput.text?.toString().orEmpty()) != normalizeMemoryTags(savedTags)
+        } else {
+            binding.textEditorInput.text?.toString().orEmpty() != savedText ||
             (source == Source.RULE && binding.ruleTitleInput.text?.toString().orEmpty() != savedRuleTitle)
+        }
+
+    private fun normalizeMemoryTags(value: String): List<String> = value
+        .split(',', '，')
+        .map(String::trim)
+        .filter(String::isNotBlank)
+        .distinct()
 
     private fun requireMemory() = conversationStore.memories().firstOrNull { it.id == path }
         ?: error("记忆不存在")

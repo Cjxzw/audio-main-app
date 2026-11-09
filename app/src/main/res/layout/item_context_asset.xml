@@ -16,40 +16,25 @@
         android:layout_height="wrap_content"
         android:layout_marginEnd="12dp" />
 
-    <LinearLayout
+    <TextView
+        android:id="@+id/tvContextAssetScore"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="10dp"
+        android:textColor="@color/gray_500"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/tvContextAssetTitle"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_weight="1"
-        android:orientation="vertical"
-        android:paddingEnd="8dp">
-
-        <TextView
-            android:id="@+id/tvContextAssetTitle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:ellipsize="end"
-            android:maxLines="3"
-            android:textColor="?attr/colorOnSurface"
-            android:textSize="16sp" />
-
-        <TextView
-            android:id="@+id/tvContextAssetSummary"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:ellipsize="end"
-            android:maxLines="2"
-            android:textColor="@color/text_secondary"
-            android:textSize="14sp" />
-
-        <TextView
-            android:id="@+id/tvContextAssetMetadata"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textColor="@color/gray_500"
-            android:textSize="12sp" />
-    </LinearLayout>
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:paddingEnd="8dp"
+        android:textColor="?attr/colorOnSurface"
+        android:textSize="16sp" />
 
     <ImageButton
         android:id="@+id/btnEditContextAsset"

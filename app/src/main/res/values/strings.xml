@@ -145,6 +145,9 @@
     <string name="skill_editor_read_only">该文件不是可编辑的文本文件</string>
     <string name="skill_editor_file_meta">%1$s · %2$s</string>
     <string name="text_editor_save">保存</string>
+    <string name="text_editor_delete_memory">删除记忆</string>
+    <string name="text_editor_delete_memory_confirm_title">删除这条记忆？</string>
+    <string name="text_editor_delete_memory_confirm_message">这条记忆将被永久删除，且无法恢复。</string>
     <string name="text_editor_saved">已保存</string>
     <string name="text_editor_edit_mode">编辑</string>
     <string name="text_editor_preview_mode">预览</string>
@@ -228,6 +231,7 @@
     <string name="context_assets_no_matches">没有匹配内容</string>
     <string name="context_assets_result_count">显示 %1$d / %2$d 条</string>
     <string name="context_assets_memory_score">评分 %1$d · 更新于 %2$s</string>
+    <string name="context_assets_memory_score_short">评分 %1$d</string>
     <string name="context_assets_rule_version">版本 %1$d · 更新于 %2$s</string>
     <string name="context_assets_system_skill">系统技能</string>
     <string name="context_assets_user_skill">用户技能</string>

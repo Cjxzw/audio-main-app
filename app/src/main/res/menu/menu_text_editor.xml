@@ -6,4 +6,10 @@
         android:icon="@drawable/ic_save_24"
         android:title="@string/text_editor_save"
         app:showAsAction="always" />
+    <item
+        android:id="@+id/action_delete_memory"
+        android:icon="@drawable/ic_delete_red_24"
+        android:title="@string/context_asset_delete"
+        android:visible="false"
+        app:showAsAction="always" />
 </menu>

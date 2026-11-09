@@ -21,9 +21,6 @@ import com.agent.voiceassistant.tools.AndroidExecutionEnv
 import com.agent.voiceassistant.ui.showLightDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class ContextAssetsActivity : AppCompatActivity() {
     enum class Tab { SKILLS, MEMORIES, RULES }
@@ -83,11 +80,6 @@ class ContextAssetsActivity : AppCompatActivity() {
             Tab.SKILLS -> skills.listAll().sortedByDescending { it.enabled }.map { skill ->
                 ContextAssetItem(
                     skill.id, skill.name, skill.enabled, ContextAssetItem.Kind.SKILL, skill.system,
-                    summary = skill.description,
-                    metadata = listOfNotNull(
-                        getString(if (skill.system) R.string.context_assets_system_skill else R.string.context_assets_user_skill),
-                        skill.version.takeIf { it.isNotBlank() },
-                    ).joinToString(" · "),
                     searchFields = listOf(skill.id, skill.name, skill.description, skill.virtualPath, skill.version),
                 )
             }
@@ -98,8 +90,7 @@ class ContextAssetsActivity : AppCompatActivity() {
                     memory.content,
                     memory.enabled,
                     ContextAssetItem.Kind.MEMORY,
-                    metadata = getString(R.string.context_assets_memory_score, store.memoryScore(memory), formatDate(memory.updatedAt)) +
-                        memory.tags.takeIf { it.isNotEmpty() }?.joinToString("、", prefix = " · ").orEmpty(),
+                    scoreText = getString(R.string.context_assets_memory_score_short, store.memoryScore(memory)),
                     searchFields = listOf(memory.id, memory.content) + memory.tags,
                 )
             }
@@ -109,8 +100,6 @@ class ContextAssetsActivity : AppCompatActivity() {
             ).map { rule ->
                 ContextAssetItem(
                     rule.id, rule.title, rule.enabled, ContextAssetItem.Kind.RULE,
-                    summary = rule.body,
-                    metadata = getString(R.string.context_assets_rule_version, rule.version, formatDate(rule.updatedAt)),
                     searchFields = listOf(rule.title, rule.body),
                 )
             }
@@ -126,8 +115,6 @@ class ContextAssetsActivity : AppCompatActivity() {
         binding.contextAssetsEmpty.setText(if (query.isBlank()) R.string.context_assets_empty else R.string.context_assets_no_matches)
         binding.contextAssetsCount.text = getString(R.string.context_assets_result_count, items.size, allItems.size)
     }
-
-    private fun formatDate(timestamp: Long): String = SimpleDateFormat("yy-MM-dd HH:mm", Locale.CHINA).format(Date(timestamp))
 
     private fun addCurrentAsset() {
         when (tab) {
@@ -190,8 +177,7 @@ private data class ContextAssetItem(
     val enabled: Boolean,
     val kind: Kind,
     val system: Boolean = false,
-    val summary: String = "",
-    val metadata: String = "",
+    val scoreText: String = "",
     val searchFields: List<String> = emptyList(),
 ) {
     enum class Kind { SKILL, MEMORY, RULE }
@@ -218,26 +204,28 @@ private class ContextAssetAdapter(
     override fun getItemCount(): Int = items.size
 
     inner class Holder(view: View) : RecyclerView.ViewHolder(view) {
-        private val toggle = view.findViewById<MaterialSwitch>(R.id.switchContextAsset)
         private val title = view.findViewById<TextView>(R.id.tvContextAssetTitle)
-        private val summary = view.findViewById<TextView>(R.id.tvContextAssetSummary)
-        private val metadata = view.findViewById<TextView>(R.id.tvContextAssetMetadata)
+        private val score = view.findViewById<TextView>(R.id.tvContextAssetScore)
+        private val toggle = view.findViewById<MaterialSwitch>(R.id.switchContextAsset)
         private val edit = view.findViewById<ImageButton>(R.id.btnEditContextAsset)
         private val delete = view.findViewById<ImageButton>(R.id.btnDeleteContextAsset)
 
         fun bind(item: ContextAssetItem) {
-            toggle.setOnCheckedChangeListener(null)
-            toggle.visibility = View.VISIBLE
-            toggle.isChecked = item.enabled
             title.text = item.title
-            summary.text = item.summary
-            summary.visibility = if (item.summary.isBlank()) View.GONE else View.VISIBLE
-            metadata.text = item.metadata
-            edit.visibility = if (item.system) View.GONE else View.VISIBLE
-            delete.visibility = if (item.system) View.GONE else View.VISIBLE
+            title.maxLines = 1
+            title.ellipsize = android.text.TextUtils.TruncateAt.END
+            val memory = item.kind == ContextAssetItem.Kind.MEMORY
+            score.text = item.scoreText
+            score.visibility = if (memory) View.VISIBLE else View.GONE
+            toggle.visibility = if (memory) View.GONE else View.VISIBLE
+            toggle.setOnCheckedChangeListener(null)
+            toggle.isChecked = item.enabled
             toggle.setOnCheckedChangeListener { _, checked -> onToggle(item, checked) }
+            edit.visibility = if (memory || item.system) View.GONE else View.VISIBLE
+            delete.visibility = if (memory || item.system) View.GONE else View.VISIBLE
             edit.setOnClickListener { onEdit(item) }
             delete.setOnClickListener { onDelete(item) }
+            itemView.setOnClickListener { if (memory) onEdit(item) }
         }
     }
 }
