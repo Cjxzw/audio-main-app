@@ -224,4 +224,11 @@
     <string name="provider_saved_text_only_warning">供应商已启用。该模型不支持多模态，图片会尝试由默认模型转写且可能损失细节；默认模型不可用时将无法识别图片。</string>
     <string name="provider_text_only_selection_warning">当前模型不支持多模态，请尽量避免发送图片。图片会尝试由默认模型转写，转写不保证完整准确。</string>
     <string name="provider_deleted">供应商已删除</string>
+    <string name="context_assets_search_hint">搜索%1$s</string>
+    <string name="context_assets_no_matches">没有匹配内容</string>
+    <string name="context_assets_result_count">显示 %1$d / %2$d 条</string>
+    <string name="context_assets_memory_score">评分 %1$d · 更新于 %2$s</string>
+    <string name="context_assets_rule_version">版本 %1$d · 更新于 %2$s</string>
+    <string name="context_assets_system_skill">系统技能</string>
+    <string name="context_assets_user_skill">用户技能</string>
 </resources>

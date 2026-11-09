@@ -476,7 +476,7 @@ class MainToolRegistry(
 
     private fun skillRegister() = tool(
         name = TOOL_SKILL_REGISTER,
-        description = "仅将已在 /workspace 中完成审查和兼容性转换的全新 Skill 注册到 App；本工具只负责新建，绝不修改、覆盖或删除已有 Skill。调用前必须先完整读取候选目录和核心文件，确认其主要是知识或流程说明；纯脚本型、依赖 Python/Node/二进制运行时且无法改写为 read/write/exec/http_request 流程的 Skill 不得注册。若用户要更新已有 Skill，先把完整新版写入 /workspace 候选目录，再引导用户到“设置 → 技能与记忆 → 技能”手动删除旧 Skill，删除完成后才能重新调用本工具注册；遇到同名冲突时不得自动改名、覆盖或删除。注册成功后候选文件会移出工作区。",
+        description = "仅将已在 /workspace 中完成审查和兼容性转换的全新 Skill 注册到 App；本工具只负责新建，绝不修改、覆盖或删除已有 Skill。调用前必须先完整读取候选目录和核心文件，确认其主要是知识或流程说明；纯脚本型、依赖 Python/Node/二进制运行时且无法改写为 read/write/exec/http_request 流程的 Skill 不得注册。若用户要更新已有 Skill，先把完整新版写入 /workspace 候选目录，再引导用户到“设置 → 上下文管理 → 技能”手动删除旧 Skill，删除完成后才能重新调用本工具注册；遇到同名冲突时不得自动改名、覆盖或删除。注册成功后候选文件会移出工作区。",
         required = listOf("source_path", "name", "description", "core_file", "compatibility_notes", "reviewed_files"),
     ) {
         putJsonObject("source_path") {
