@@ -62,8 +62,10 @@ data class VaultCredential(
 
 object CredentialPolicy {
     const val TTL_MS = 30L * 24 * 60 * 60 * 1000
-    val reference = Regex("\\{\\{cred:([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)}}")
-    val anyReference = Regex("\\{\\{(?:cred:|credential\\.)[^}]*}}")
+    // Escape both closing braces explicitly. Android's ICU regex implementation
+    // rejects an unmatched `}` even though the desktop JVM accepts it as literal.
+    val reference = Regex("\\{\\{cred:([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)\\}\\}")
+    val anyReference = Regex("\\{\\{(?:cred:|credential\\.)[^}]*\\}\\}")
     fun token(record: VaultCredential, field: VaultField) = "{{cred:${record.id}.${field.id}}}"
     fun references(text: String) = reference.findAll(text).map { it.value }.distinct().toList()
 
