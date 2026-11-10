@@ -56,3 +56,5 @@ http request URL [--method METHOD] [--body BODY] [--credential-profile PROFILE]
 ```
 
 所有命令输出结构化 JSON。`inspect` 和 `logs` 在本机组合 ADB、Bridge、应用日志与 Android 退出记录；`http request` 复用 App 正式的 `AndroidExecutionEnv`，因此会执行同样的 URL 前缀、凭据和响应截断策略。`turn run` 会返回最终助手正文、本轮可见消息和模型消息中的原生工具调用，供 Agent 继续判断。
+
+`credentials list` 返回新版凭证和旧版 profile 的元数据与引用（默认最多各 10 条），不返回真实值。新版引用形如 `{{cred:凭证UID.字段UID}}`，可直接放在 `http request` 的 Header 或 body 中；旧版 `{{credential.profile.key}}` 继续搭配 `--credential-profile` 使用。URL 本身不能包含凭证引用，引用过期或删除后会失败。完整请求解析和回显过滤行为见开发日志。

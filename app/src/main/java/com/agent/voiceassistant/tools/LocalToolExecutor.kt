@@ -32,7 +32,13 @@ class LocalToolExecutor(
 
     suspend fun execute(action: AgentAction): ToolResult {
         Timber.i("LocalToolExecutor: execute ${action.actionType}")
+        if (action.actionType in setOf("write", "exec", "memory.edit", "memory.create", "note.create", "skill.create", "skill.edit", "skill.register") &&
+            CredentialPolicy.anyReference.containsMatchIn(action.payload.toString())) {
+            return ToolResult(action.actionType, "此工具不接受凭证引用", "凭证引用只能交给 http_request；不能写入文件、记忆、Skill 或命令。", false, false)
+        }
         return when (action.actionType) {
+            "describe_credentials" -> ToolResult("describe_credentials", "查询凭证", executionEnv?.describeCredentials(action.payload.string("query").orEmpty(), action.payload.int("limit") ?: 10) ?: "凭证存储不可用", false)
+
             "memory.create", "note.create" -> createMemory(action.payload)
             "memory.edit" -> editMemory(action.payload)
             "memory.search", "note.search" -> searchMemory(action.payload)

@@ -44,6 +44,12 @@ class ChatAdapter(
         notifyDataSetChanged()
     }
 
+    fun refreshCredentials() {
+        messages.forEachIndexed { index, message ->
+            if (message.role == USER && message.credentialReferences.isNotEmpty()) notifyItemChanged(index, PAYLOAD_TEXT)
+        }
+    }
+
     fun addMessage(msg: ChatMessage): Boolean {
         if (!msg.messageId.isNullOrBlank()) {
             val existing = messages.indexOfFirst { it.messageId == msg.messageId }
@@ -399,7 +405,8 @@ class ChatAdapter(
                 llDetails.visibility = View.GONE
             } else {
                 tvText.visibility = View.VISIBLE
-                tvText.text = msg.text
+                tvText.text = CredentialTextRenderer.render(itemView.context, msg)
+                tvText.movementMethod = LinkMovementMethod.getInstance()
                 llDetails.visibility = View.GONE
             }
         }

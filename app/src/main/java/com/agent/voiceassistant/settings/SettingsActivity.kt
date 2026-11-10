@@ -200,14 +200,29 @@ class CredentialProfilesFragment : PreferenceFragmentCompat() {
         rebuild()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::store.isInitialized) rebuild()
+    }
+
     private fun rebuild() {
         preferenceScreen = preferenceManager.createPreferenceScreen(requireContext()).apply {
             addPreference(Preference(requireContext()).apply {
                 title = getString(R.string.settings_http_credentials_add)
                 summary = getString(R.string.settings_http_credentials_add_summary)
                 setIcon(R.drawable.ic_add_24)
-                setOnPreferenceClickListener { showEditor(); true }
+                setOnPreferenceClickListener { startActivity(CredentialEditorActivity.intent(requireContext())); true }
             })
+            com.agent.voiceassistant.tools.CredentialVault(requireContext()).records().sortedByDescending { it.createdAt }.forEach { credential ->
+                addPreference(Preference(requireContext()).apply {
+                    title = credential.name
+                    summary = "${credential.fields.count { !it.archived }} 个键 · " +
+                        (credential.expiresAt?.let { java.text.DateFormat.getDateInstance().format(java.util.Date(it)) + " 到期" } ?: "永久")
+                    setOnPreferenceClickListener {
+                        startActivity(CredentialEditorActivity.intent(requireContext(), credential.id)); true
+                    }
+                })
+            }
             store.availableProfiles().forEach { profile ->
                 addPreference(Preference(requireContext()).apply {
                     title = profile.name

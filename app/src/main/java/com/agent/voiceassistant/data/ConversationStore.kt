@@ -26,6 +26,10 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class ConversationStore(context: Context) {
+    private val credentialVault = com.agent.voiceassistant.tools.CredentialVault(context)
+    fun captureCredentialInput(text: String, conversationId: String = currentConversationId) =
+        credentialVault.capture(text, conversationId, restoredCredentialValues(conversationId).values.toSet())
+
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -101,7 +105,7 @@ class ConversationStore(context: Context) {
         currentSessionLocked().messages
             .filter { it.chatVisible != false }
             .takeLast(limit)
-            .map { it.toChatMessage() }
+            .map { it.toChatMessage(state.currentConversationId) }
     }
 
     fun latestConversationId(domain: ConversationDomain): String? = synchronized(lock) {
@@ -164,6 +168,7 @@ class ConversationStore(context: Context) {
         reasoningItems: List<ReasoningDisplayItem> = emptyList(),
         responseMetadata: CloudSpeechClient.ResponseMetadata? = null,
         llmVisible: Boolean? = null,
+        credentialReferences: List<String> = emptyList(),
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -191,6 +196,7 @@ class ConversationStore(context: Context) {
             finishReason = responseMetadata?.finishReason,
             streamComplete = responseMetadata?.streamComplete,
             llmVisible = llmVisible,
+            credentialReferences = credentialReferences,
         )
         synchronized(lock) {
             val session = currentSessionLocked()
@@ -199,6 +205,58 @@ class ConversationStore(context: Context) {
             persistLocked()
         }
         return message
+    }
+
+    /** User-approved plaintext lives only in this session; it is not a global detector bypass. */
+    fun restoredCredentialValues(conversationId: String): Map<String, String> = synchronized(lock) {
+        state.sessions.firstOrNull { it.id == conversationId }?.restoredCredentials?.toMap().orEmpty()
+    }
+
+    fun restoreCredential(conversationId: String, token: String, value: String): Boolean = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized false
+        if (session.restoredCredentials[token] == value) return@synchronized true
+        val previousUpdatedAt = session.updatedAt
+        session.updatedAt = System.currentTimeMillis()
+        val previousValue = session.restoredCredentials.put(token, value)
+        val notice = StoredMessage(
+            id = UUID.randomUUID().toString(), role = "user", timestamp = System.currentTimeMillis(),
+            content = "用户已选择恢复明文显示：凭证引用 $token 的真实值为：" +
+                kotlinx.serialization.json.JsonPrimitive(value).toString() +
+                "。这是用户明确恢复的明文；本会话不再自动提取这个值。",
+        )
+        session.pendingCredentialNotices += notice
+        try { persistLocked(strict = true) } catch (error: Exception) {
+            if (previousValue == null) session.restoredCredentials.remove(token) else session.restoredCredentials[token] = previousValue
+            session.pendingCredentialNotices.remove(notice)
+            session.updatedAt = previousUpdatedAt
+            throw error
+        }
+        true
+    }
+
+    fun pendingCredentialNotices(conversationId: String): List<StoredMessage> = synchronized(lock) {
+        state.sessions.firstOrNull { it.id == conversationId }?.pendingCredentialNotices?.toList().orEmpty()
+    }
+
+    /** Acknowledge only after a model-context checkpoint contains the notice. */
+    fun acknowledgeCredentialNotices(conversationId: String, contents: Set<String>): List<ChatMessage> = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized emptyList()
+        val delivered = session.pendingCredentialNotices.filter { it.content in contents }
+        if (delivered.isNotEmpty()) {
+            session.messages.addAll(delivered)
+            session.pendingCredentialNotices.removeAll(delivered.toSet())
+            try { persistLocked(strict = true) } catch (error: Exception) {
+                session.messages.removeAll(delivered.toSet())
+                session.pendingCredentialNotices.addAll(0, delivered)
+                throw error
+            }
+        }
+        delivered.map { it.toChatMessage(conversationId) }
+    }
+
+    fun hasCredentialReferencesOutsideConversation(token: String, conversationId: String): Boolean = synchronized(lock) {
+        state.sessions.any { session -> session.id != conversationId &&
+            session.messages.any { token in it.content || token in it.llmContent.orEmpty() } }
     }
 
     fun recordContextUsage(conversationId: String, tokens: Long) = synchronized(lock) {
@@ -221,6 +279,7 @@ class ConversationStore(context: Context) {
         streamState: ChatStreamState? = null,
         reasoningItems: List<ReasoningDisplayItem> = emptyList(),
         llmVisible: Boolean? = null,
+        credentialReferences: List<String> = emptyList(),
     ): StoredMessage {
         val normalizedRole = when (role) {
             "assistant", "bot" -> "assistant"
@@ -238,6 +297,7 @@ class ConversationStore(context: Context) {
             streamState = streamState?.name,
             reasoningItems = reasoningItems.map(ReasoningDisplayItem::toStored),
             llmVisible = llmVisible,
+            credentialReferences = credentialReferences,
         )
         synchronized(lock) {
             val session = state.sessions.firstOrNull { it.id == conversationId }
@@ -1109,11 +1169,11 @@ class ConversationStore(context: Context) {
         }
     }
 
-    private fun persistLocked() {
-        runCatching {
+    private fun persistLocked(strict: Boolean = false) {
+        val result = runCatching {
             val output = file.startWrite()
             try {
-                OutputStreamWriter(output, Charsets.UTF_8).use { it.write(json.encodeToString(state)) }
+                OutputStreamWriter(output, Charsets.UTF_8).apply { write(json.encodeToString(state)); flush() }
                 file.finishWrite(output)
             } catch (error: Throwable) {
                 file.failWrite(output)
@@ -1122,6 +1182,7 @@ class ConversationStore(context: Context) {
         }.onFailure {
             Timber.e(it, "ConversationStore: persist failed")
         }
+        if (strict) result.getOrThrow()
     }
 
     private fun persistToolTrace(trace: StoredToolTrace) {
@@ -1167,6 +1228,7 @@ class ConversationStore(context: Context) {
         return ChatMessage(
             role = role,
             text = displayContent,
+            credentialReferences = credentialReferences,
             timestamp = timestamp,
             messageId = id,
             toolCallId = toolCallId,
@@ -1383,6 +1445,8 @@ data class ConversationSession(
     val realtimeContextNotes: MutableList<String> = mutableListOf(),
     var ruleLedger: ConversationRuleLedger? = null,
     val skillSnapshots: MutableList<StoredSkillSnapshot> = mutableListOf(),
+    val restoredCredentials: MutableMap<String, String> = mutableMapOf(),
+    val pendingCredentialNotices: MutableList<StoredMessage> = mutableListOf(),
 )
 
 @Serializable
@@ -1461,6 +1525,7 @@ data class StoredMessage(
     val promptTokensEstimated: Boolean? = null,
     val finishReason: String? = null,
     val streamComplete: Boolean? = null,
+    val credentialReferences: List<String> = emptyList(),
 )
 
 @Serializable

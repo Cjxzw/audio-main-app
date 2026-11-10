@@ -260,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_text = realtime_actions.add_parser("text", help="向当前 Realtime 会话提交文本")
     realtime_text.add_argument("text")
 
-    credentials = commands.add_parser("credentials", help="凭据 profile（仅显示脱敏摘要）")
+    credentials = commands.add_parser("credentials", help="凭证与旧版 profile（仅返回元数据和引用）")
     credentials.add_subparsers(dest="action", required=True).add_parser("list", help="列出 profile")
 
     logs = commands.add_parser("logs", help="读取应用诊断日志")

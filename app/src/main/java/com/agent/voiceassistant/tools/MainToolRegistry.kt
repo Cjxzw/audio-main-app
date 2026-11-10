@@ -74,6 +74,7 @@ class MainToolRegistry(
             workspaceDelete(),
             execCommand(),
             httpRequest(),
+            describeCredentials(),
             codeGraphSearch(),
             codeGraphExplain(),
             skillRegister(),
@@ -368,6 +369,7 @@ class MainToolRegistry(
         TOOL_WORKSPACE_DELETE -> "移入回收站"
         TOOL_EXEC -> "执行命令"
         TOOL_HTTP_REQUEST -> "发送网络请求"
+        TOOL_DESCRIBE_CREDENTIALS -> "查询凭证"
         TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
         TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
         TOOL_SKILL_REGISTER -> "注册 Skill"
@@ -808,9 +810,17 @@ class MainToolRegistry(
         }
     }
 
+    private fun describeCredentials() = tool(
+        name = TOOL_DESCRIBE_CREDENTIALS,
+        description = "查找可用凭证，只返回名称、键名、稳定引用、允许 URL 和到期时间，不返回真实值。用户消息已有引用可直接用于 http_request，无需重复查询。",
+    ) {
+        putJsonObject("query") { put("type", "string"); put("description", "按凭证名称、UID 或键名过滤，空白列出前若干条") }
+        putJsonObject("limit") { put("type", "integer"); put("minimum", 1); put("maximum", 20) }
+    }
+
     private fun httpRequest() = tool(
         name = TOOL_HTTP_REQUEST,
-        description = "发送完整 HTTP/HTTPS 请求，用于 API 调试和纯文本 Skill 调用。Skill 必须提供完整 URL、headers 和 body；凭证只能通过 profile 与 {{credential.profile.key}} 引用，不得要求用户把密钥放进参数。",
+        description = "发送完整 HTTP/HTTPS 请求，用于 API 调试和纯文本 Skill 调用。Skill 必须提供完整 URL、headers 和 body；凭证在 Header 或 body 中原样使用 {{cred:UID.字段UID}}，由执行器检查 URL 白名单后还原；不需要 credential_profile。兼容旧版 profile 与 {{credential.profile.key}}。禁止将凭证放入 URL。",
         required = listOf("url"),
     ) {
         putJsonObject("method") {
@@ -829,7 +839,7 @@ class MainToolRegistry(
         putJsonObject("headers") {
             put("type", "object")
             put("additionalProperties", buildJsonObject { put("type", "string") })
-            put("description", "完整请求 Header；敏感值使用 {{credential.profile.key}} 引用")
+            put("description", "完整请求 Header；敏感值使用 describe_credentials 或用户消息提供的凭证引用")
         }
         putJsonObject("timeout_ms") {
             put("type", "integer")
@@ -899,6 +909,7 @@ class MainToolRegistry(
         const val TOOL_WRITE = "write"
         const val TOOL_WORKSPACE_DELETE = "workspace_delete"
         const val TOOL_EXEC = "exec"
+        const val TOOL_DESCRIBE_CREDENTIALS = "describe_credentials"
         const val TOOL_HTTP_REQUEST = "http_request"
         const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
         const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
@@ -920,7 +931,7 @@ class MainToolRegistry(
         val NATIVE_TOOL_NAMES = setOf(
             TOOL_MEMORY_EDIT, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
             TOOL_LOCATION_REVERSE_GEOCODE, TOOL_WEATHER_CURRENT, TOOL_WEB_SEARCH,
-            TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_EXEC, TOOL_HTTP_REQUEST,
+            TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_EXEC, TOOL_HTTP_REQUEST, TOOL_DESCRIBE_CREDENTIALS,
             TOOL_CODE_GRAPH_SEARCH, TOOL_CODE_GRAPH_EXPLAIN, TOOL_SKILL_REGISTER,
             TOOL_SKILL_USE, TOOL_AGENT_SLEEP,
             TOOL_VOICE_REPLY, TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,

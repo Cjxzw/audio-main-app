@@ -1119,17 +1119,25 @@ class VoiceAgentService : Service() {
         attachments: List<String> = emptyList(),
         preclaimedMainTurn: Boolean = false,
     ) {
-        val isNewTopic = LocalConversationCommandPolicy.classify(userText) == LocalConversationCommandPolicy.Command.NEW_TOPIC
+        val capture = runCatching { store.captureCredentialInput(userText) }.getOrElse { error ->
+            if (preclaimedMainTurn) mainTurnActive.set(false)
+            EventBus.emitUserNotice("凭证处理失败，本次输入尚未发送。请重试或检查凭证管理。")
+            emitLog("凭证输入处理失败：${error.javaClass.simpleName}")
+            return
+        }
+        val safeUserText = capture.text
+
+        val isNewTopic = LocalConversationCommandPolicy.classify(safeUserText) == LocalConversationCommandPolicy.Command.NEW_TOPIC
         if (isNewTopic) {
             requestNewConversation(
-                userText,
+                safeUserText,
                 greet = true,
                 speakReplies = false,
             )
             if (preclaimedMainTurn) mainTurnActive.set(false)
             return
         }
-        val recoveryCommand = userText.trim()
+        val recoveryCommand = safeUserText.trim()
         if (agentHarness.isWaiting() && recoveryCommand == "取消") {
             agentHarness.abort("用户取消等待中的回合")
             withContext(Dispatchers.IO) { activeTurnCheckpointStore.clear() }
@@ -1140,11 +1148,11 @@ class VoiceAgentService : Service() {
             if (preclaimedMainTurn) mainTurnActive.set(false)
             return
         }
-        val recoveryInput = if (recoveryCommand in setOf("继续", "重试")) "" else userText
+        val recoveryInput = if (recoveryCommand in setOf("继续", "重试")) "" else safeUserText
         if (agentHarness.resume(recoveryInput)) {
             if (recoveryInput.isNotBlank()) {
-                val resumed = store.addMessage("user", recoveryInput)
-                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, recoveryInput, messageId = resumed.id))
+                val resumed = store.addMessage("user", recoveryInput, credentialReferences = capture.references)
+                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, recoveryInput, messageId = resumed.id, conversationId = store.currentConversationId, credentialReferences = capture.references))
             }
             EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, "正在继续未完成回合…", messageId = "recovery-$activeSourceTurnId"))
             emitLog("继续未完成回合($source): ${recoveryCommand.ifBlank { "继续" }}")
@@ -1164,28 +1172,28 @@ class VoiceAgentService : Service() {
         turnMutex.withLock {
             activeTextTurnSilent = source == "text" && !speakReplies
             try {
-                if (handleLocalConversationCommand(userText)) return
+                if (handleLocalConversationCommand(safeUserText)) return
                 val client: CloudSpeechClient? = null
                 val displayText = buildString {
-                    append(userText)
+                    append(safeUserText)
                     if (attachments.isNotEmpty()) {
                         append("\n")
                         attachments.forEach { append("\n附件：$it") }
                     }
                 }
                 val storedAttachments = attachments.map { StoredAttachment(it, attachmentMimeType(it)) }
-                val currentUserMessage = store.addMessage("user", displayText, attachments = storedAttachments)
+                val currentUserMessage = store.addMessage("user", displayText, attachments = storedAttachments, credentialReferences = capture.references)
                 activeSourceTurnId = currentUserMessage.id
-                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, displayText))
+                EventBus.emitChatMessage(ChatMessage(ChatRole.USER, displayText, messageId = currentUserMessage.id, conversationId = store.currentConversationId, credentialReferences = capture.references))
                 turnNote?.let {
                     store.addMessage("system", it)
                     EventBus.emitChatMessage(ChatMessage(ChatRole.SYSTEM, it))
                 }
-                emitLog("你($source): $userText attachments=${attachments.size}")
+                emitLog("你($source): $safeUserText attachments=${attachments.size}")
                 updateNotification("正在回应...")
 
                 val visualTranscript = prepareVisualTranscript(
-                    userText = userText,
+                    userText = safeUserText,
                     currentUserMessageId = currentUserMessage.id,
                     attachments = attachments,
                 )
@@ -1213,7 +1221,7 @@ class VoiceAgentService : Service() {
                 val metricsTracker = TurnMetricsTracker()
                 val intentRouting = if (ExperimentConfig.ENABLE_INTENT_ROUTING) {
                     startIntentRouting(
-                        userText = userText,
+                        userText = safeUserText,
                         currentUserMessageId = currentUserMessage.id,
                         attachments = attachments,
                     )
@@ -1225,7 +1233,7 @@ class VoiceAgentService : Service() {
                     speechClient = client,
                     speakReplies = speakReplies,
                     messages = buildMessages(
-                        userText = userText,
+                        userText = safeUserText,
                         currentUserMessageId = currentUserMessage.id,
                         source = source,
                         turnNote = turnNote,
@@ -1242,7 +1250,7 @@ class VoiceAgentService : Service() {
                         conversationId = store.currentConversationId,
                         source = source,
                         speakReplies = speakReplies,
-                        userRequest = userText,
+                        userRequest = safeUserText,
                     ),
                 )
                 val metrics = metricsTracker.snapshot()
@@ -1534,6 +1542,7 @@ class VoiceAgentService : Service() {
         } else {
             null
         }
+        var latestTurnCheckpoint: ActiveTurnCheckpointStore.Snapshot? = null
         var finalizedAssistantForContext: CloudSpeechClient.LlmMessage? = null
         var intentRouteConsumed = false
         fun startReasoningFeedback(source: String) {
@@ -1558,6 +1567,28 @@ class VoiceAgentService : Service() {
 
         val loop = AgentLoop(
             runtime = object : AgentLoop.Runtime {
+                private val credentialConversationId = checkpointContext?.conversationId ?: store.currentConversationId
+                override fun pendingUserMessages(existing: List<CloudSpeechClient.LlmMessage>): List<CloudSpeechClient.LlmMessage> {
+                    if (checkpointContext == null) return emptyList()
+                    val contents = existing.filter { it.role == "user" }.mapNotNull { it.content }.toSet()
+                    return store.pendingCredentialNotices(credentialConversationId)
+                        .filterNot { it.content in contents }
+                        .map { CloudSpeechClient.LlmMessage(role = "user", content = it.content) }
+                }
+                override suspend fun onUserMessagesCheckpointed(messages: List<CloudSpeechClient.LlmMessage>) {
+                    if (checkpointContext == null) return
+                    val contents = messages.filter { it.role == "user" }.mapNotNull { it.content }.toSet()
+                    if (store.pendingCredentialNotices(credentialConversationId).none { it.content in contents }) return
+                    checkpointWriteJob?.join()
+                    withContext(Dispatchers.IO) {
+                        activeTurnCheckpointStore.save(requireNotNull(latestTurnCheckpoint))
+                    }
+                    store.acknowledgeCredentialNotices(credentialConversationId, contents).forEach { message ->
+                        if (store.currentConversationId == credentialConversationId) EventBus.emitChatMessage(message)
+                    }
+                    EventBus.emitConversationUpdate()
+                }
+
                 override fun toolDefinitions(allowReasoningEscalation: Boolean) =
                     if (toolsEnabled) {
                         toolRegistry.definitions(
@@ -2007,7 +2038,7 @@ class VoiceAgentService : Service() {
                                     businessToolCallCount = toolCount,
                                     activeElapsedMs = activeMs,
                                     activeBudgetStarted = budgetStarted,
-                                ),
+                                ).also { latestTurnCheckpoint = it },
                             )
                         }
                     },
@@ -3440,7 +3471,7 @@ class VoiceAgentService : Service() {
             appendLine()
             append("Agent 虚拟文件系统：\n")
             append(executionEnv.virtualRootSummary())
-            append("\n\n可用凭据 profile（仅可引用名称，认证值不会进入上下文）：\n")
+            append("\n\n本地凭证（按需发现，认证值不会进入上下文）：\n")
             append(executionEnv.credentialProfileSummary())
             append("\n\n全局用户规则：\n")
             append(

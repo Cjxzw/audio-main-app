@@ -79,6 +79,9 @@ class AgentLoop(
     }
 
     interface Runtime {
+        fun pendingUserMessages(existing: List<CloudSpeechClient.LlmMessage>): List<CloudSpeechClient.LlmMessage> = emptyList()
+        suspend fun onUserMessagesCheckpointed(messages: List<CloudSpeechClient.LlmMessage>) = Unit
+
         fun toolDefinitions(allowReasoningEscalation: Boolean): List<CloudSpeechClient.ToolDefinition>
         fun isToolAllowed(call: CloudSpeechClient.ToolCall, nativeToolNames: Set<String>): Boolean =
             call.name in nativeToolNames
@@ -229,6 +232,12 @@ class AgentLoop(
                 }
                 while (streamedResult == null) {
                     pauseActiveBudget()
+                    val pending = runtime.pendingUserMessages(workingMessages)
+                    if (pending.isNotEmpty()) {
+                        workingMessages += pending
+                        checkpoint(CheckpointPhase.RUNNING)
+                    }
+                    runtime.onUserMessagesCheckpointed(workingMessages)
                     modelCall += 1
                     eventSink(AgentEvent.MessageStarted(turnId, modelCall))
                     val request = CloudSpeechClient.ChatRequest(

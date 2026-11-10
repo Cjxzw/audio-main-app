@@ -175,19 +175,29 @@ class StepFunRealtimePipeline(
     }
 
     fun submitText(text: String) {
-        val normalized = text.trim()
+        val capture = store.captureCredentialInput(text.trim(), conversationId)
+        val normalized = capture.text
         if (normalized.isBlank()) return
         tools.resetTurnToolBudget()
-        val stored = store.addMessageToConversation(conversationId, "user", normalized)
-        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, normalized, stored.timestamp, stored.id, conversationId = conversationId))
+        val stored = store.addMessageToConversation(conversationId, "user", normalized, credentialReferences = capture.references)
+        EventBus.emitChatMessage(ChatMessage(ChatRole.USER, normalized, stored.timestamp, stored.id, conversationId = conversationId, credentialReferences = capture.references))
         try {
             responseInFlight = true
+            flushCredentialNotices()
             client.sendText(normalized)
         } catch (error: Throwable) {
             store.deleteMessage(stored.id)
             EventBus.emitChatRemoval(stored.id)
             throw error
         }
+    }
+
+    /** Append the user's correction without creating an independent response/loop. */
+    private fun flushCredentialNotices() = synchronized(sessionBoundaryLock) {
+        val notices = store.pendingCredentialNotices(conversationId)
+        if (notices.isEmpty()) return@synchronized
+        notices.forEach { client.appendUserText(it.content) }
+        store.acknowledgeCredentialNotices(conversationId, notices.map { it.content }.toSet()).forEach(EventBus::emitChatMessage)
     }
 
     fun stop() {
@@ -769,6 +779,7 @@ class StepFunRealtimePipeline(
                 if (!isSessionCurrent(generation)) { return@runCatching }
                 outputs.forEach { (callId, content) -> client.sendFunctionOutput(callId, content) }
                 if (!isSessionCurrent(generation)) { return@runCatching }
+                flushCredentialNotices()
                 client.createResponse()
             }.onFailure { error ->
                 notifyDisconnected("工具结果发送失败：${error.message ?: error.javaClass.simpleName}")
@@ -789,7 +800,7 @@ class StepFunRealtimePipeline(
         toolFollowUpRetryCount += 1
         toolFollowUpRetryJob = scope.launch {
             delay(TOOL_FOLLOW_UP_RETRY_DELAY_MS * toolFollowUpRetryCount)
-            runCatching { client.createResponse() }
+            runCatching { flushCredentialNotices(); client.createResponse() }
                 .onFailure { error -> notifyDisconnected("工具后续回复重试失败：${error.message ?: error.javaClass.simpleName}") }
         }
     }
@@ -828,6 +839,7 @@ class StepFunRealtimePipeline(
                             client.sendContext(if (failed) "主会话任务最终失败，请用自然中文向用户报告：$text" else
                                 "主会话任务已完成，请向用户汇报以下最终正文：$text")
                             responseInFlight = true
+                            flushCredentialNotices()
                             client.createResponse()
                             pendingMainReplies.remove(entry.key)
                             reportedMainTurns += entry.key

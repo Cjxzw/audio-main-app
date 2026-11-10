@@ -78,7 +78,7 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         "status" -> success(request, "status", "Hanwo 调试状态已读取", startedAt, status(context))
         "config.show" -> success(request, "config", "配置状态已读取", startedAt, config(context))
         "credentials.list" -> success(request, "credentials", "凭据 profile 已读取", startedAt, buildJsonObject {
-            put("profiles", AndroidExecutionEnv(context).credentialProfileSummary())
+            put("profiles", AndroidExecutionEnv(context).describeCredentials())
         })
         "key.set" -> setMimoKey(context, request, startedAt)
         "key.clear" -> clearMimoKey(context, request, startedAt)

@@ -188,9 +188,9 @@
     <string name="attachment_camera">拍照</string>
     <string name="attachment_pending">待发送：%1$s</string>
     <string name="settings_current_provider">当前供应商</string>
-    <string name="settings_http_credentials">HTTPS 工具凭据</string>
-    <string name="settings_http_credentials_summary">为 http_request 配置本机加密保存的认证 Header</string>
-    <string name="settings_http_credentials_add">添加凭据 profile</string>
+    <string name="settings_http_credentials">凭证管理</string>
+    <string name="settings_http_credentials_summary">管理自动收纳的凭证、键值、URL 范围和有效期</string>
+    <string name="settings_http_credentials_add">添加凭证</string>
     <string name="settings_http_credentials_add_summary">密钥使用 Android Keystore 加密，不进入模型上下文</string>
     <string name="settings_http_credentials_profile">基础地址：%1$s</string>
     <string name="settings_http_credentials_profile_no_base">必须使用完整 URL</string>

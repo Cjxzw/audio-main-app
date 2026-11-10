@@ -79,6 +79,7 @@ class AndroidExecutionEnv(
 
     private val appContext = context.applicationContext
     private val runtimeRoot = File(appContext.filesDir, "agent-runtime")
+    private val credentialVault = CredentialVault(appContext)
     val sourceRoot = File(runtimeRoot, "source")
     val logsRoot = File(runtimeRoot, "logs")
     val workspaceRoot = File(runtimeRoot, "workspace")
@@ -175,6 +176,7 @@ class AndroidExecutionEnv(
         endLine: Int? = null,
         expectedSha256: String? = null,
     ): WriteResult {
+        require(!CredentialPolicy.anyReference.containsMatchIn(path + content)) { "凭证引用不能写入文件，请通过 http_request 使用" }
         val file = pathResolver.resolve(path, write = true)
         file.parentFile?.mkdirs()
         val normalizedMode = mode.lowercase()
@@ -221,6 +223,7 @@ class AndroidExecutionEnv(
         timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
         cwd: String = "/workspace",
     ): ExecResult {
+        require(!CredentialPolicy.anyReference.containsMatchIn(argv.joinToString(" ") + cwd)) { "exec 不展开凭证引用，请使用 http_request" }
         require(argv.isNotEmpty()) { "argv 不能为空" }
         require(argv.size <= MAX_EXEC_ARGV_ITEMS) { "argv 项目过多" }
         require(argv.none { it.length > MAX_EXEC_ARG_CHARS }) { "argv 参数过长" }
@@ -311,53 +314,85 @@ class AndroidExecutionEnv(
             ?.let { credentialStore.resolveUrl(it, url) }
             ?: url
         credentialProfile?.takeIf(String::isNotBlank)?.let { profile -> credentialStore.validateUrl(profile, resolvedUrl) }
-        val expandedHeaders = headers.mapValues { (_, value) -> requireNotNull(credentialStore.expandReferences(credentialProfile, value)) }
-        val expandedBody = credentialStore.expandReferences(credentialProfile, body)
-        require(resolvedUrl.startsWith("https://") || resolvedUrl.startsWith("http://")) {
-            "只允许 http 或 https URL"
-        }
-        val normalizedMethod = method.uppercase()
-        require(normalizedMethod in HTTP_METHODS) { "不支持的 HTTP 方法：$method" }
-        val requestBody = when {
-            normalizedMethod in setOf("POST", "PUT", "PATCH") ->
-                expandedBody.orEmpty().toRequestBody((contentType ?: "application/json; charset=utf-8").toMediaTypeOrNull())
-            expandedBody != null -> expandedBody.toRequestBody(contentType?.toMediaTypeOrNull())
-            else -> null
-        }
-        val builder = Request.Builder().url(resolvedUrl).method(normalizedMethod, requestBody)
-        val savedHeaders = credentialProfile?.takeIf(String::isNotBlank)?.let(credentialStore::headers).orEmpty()
-        HttpRequestPolicy.headers(savedHeaders, expandedHeaders).forEach { (name, value) -> builder.header(name, value) }
-        val request = builder.build()
-        var lastTimeout: IOException? = null
-        val requestClient = httpClient.newBuilder()
-            .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            .writeTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(normalizedMethod in setOf("GET", "HEAD"))
-            .build()
-        repeat(HttpRequestPolicy.attempts(normalizedMethod)) {
-            try {
-                requestClient.newCall(request).execute().use { response ->
-                    val responseBody = response.body
-                    val bounded = responseBody?.source()?.let {
-                        BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
-                    } ?: BoundedSourceReader.Result(ByteArray(0), truncated = false)
-                    return@withContext HttpResult(
-                        status = response.code,
-                        contentType = responseBody?.contentType()?.toString(),
-                        body = bounded.bytes.toString(Charsets.UTF_8),
-                        truncated = bounded.truncated,
-                        headers = response.headers.toMultimap().filterKeys {
-                            !it.equals("set-cookie", true) && !it.equals("authorization", true)
-                        },
-                    )
-                }
-            } catch (error: InterruptedIOException) {
-                lastTimeout = error
+        require(!CredentialPolicy.anyReference.containsMatchIn(resolvedUrl)) { "凭证引用不能放在 URL 中，请放入 Header 或 body" }
+        val used = linkedMapOf<String, String>()
+        fun redact(text: String): String {
+            val variants = linkedMapOf<String, String>()
+            used.forEach { (value, token) ->
+                listOf(value, kotlinx.serialization.json.JsonPrimitive(value).toString().drop(1).dropLast(1),
+                    java.net.URLEncoder.encode(value, "UTF-8")).filter { it.isNotEmpty() }.forEach { variants[it] = token }
             }
+            if (variants.isEmpty()) return text
+            return Regex(variants.keys.sortedByDescending { it.length }.joinToString("|") { Regex.escape(it) })
+                .replace(text) { variants.getValue(it.value) }
         }
-        throw NetworkTimeoutException("HTTP request", lastTimeout)
+        fun expand(text: String): String = CredentialPolicy.anyReference.replace(text) { match ->
+            val value = if (match.value.startsWith("{{cred:")) credentialVault.resolve(match.value, resolvedUrl)
+                else requireNotNull(credentialStore.expandReferences(credentialProfile, match.value))
+            used[value] = match.value
+            value
+        }
+        try {
+            require(headers.keys.none { CredentialPolicy.anyReference.containsMatchIn(it) }) { "凭证引用不能用作 Header 名称" }
+            val expandedHeaders = headers.mapValues { (_, value) -> expand(value) }
+            val effectiveContentType = contentType ?: headers.entries.firstOrNull { it.key.equals("Content-Type", true) }?.value
+            val expandedBody = CredentialPolicy.expandBody(body, effectiveContentType, ::expand)
+            require(resolvedUrl.startsWith("https://") || resolvedUrl.startsWith("http://")) {
+                "只允许 http 或 https URL"
+            }
+            val normalizedMethod = method.uppercase()
+            require(normalizedMethod in HTTP_METHODS) { "不支持的 HTTP 方法：$method" }
+            val requestBody = when {
+                normalizedMethod in setOf("POST", "PUT", "PATCH") ->
+                    expandedBody.orEmpty().toRequestBody((effectiveContentType ?: "application/json; charset=utf-8").toMediaTypeOrNull())
+                expandedBody != null -> expandedBody.toRequestBody(effectiveContentType?.toMediaTypeOrNull())
+                else -> null
+            }
+            val builder = Request.Builder().url(resolvedUrl).method(normalizedMethod, requestBody)
+            val savedHeaders = credentialProfile?.takeIf(String::isNotBlank)?.let(credentialStore::headers).orEmpty()
+            savedHeaders.forEach { (name, value) -> used[value] = "{{credential.$credentialProfile.$name}}" }
+            HttpRequestPolicy.headers(savedHeaders, expandedHeaders).forEach { (name, value) -> builder.header(name, value) }
+            val request = builder.build()
+            var lastTimeout: IOException? = null
+            val requestClient = httpClient.newBuilder()
+                .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+                .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+                .writeTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+                .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .retryOnConnectionFailure(normalizedMethod in setOf("GET", "HEAD"))
+                .build()
+            repeat(HttpRequestPolicy.attempts(normalizedMethod)) {
+                try {
+                    requestClient.newCall(request).execute().use { response ->
+                        val responseBody = response.body
+                        val bounded = responseBody?.source()?.let {
+                            BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
+                        } ?: BoundedSourceReader.Result(ByteArray(0), truncated = false)
+                        return@withContext HttpResult(
+                            status = response.code,
+                            contentType = responseBody?.contentType()?.toString(),
+                            body = redact(bounded.bytes.toString(Charsets.UTF_8)),
+                            truncated = bounded.truncated,
+                            headers = response.headers.toMultimap().filterKeys {
+                                !it.equals("set-cookie", true) && !it.equals("authorization", true)
+                            }.mapValues { (_, values) -> values.map(::redact) },
+                        )
+                    }
+                } catch (error: InterruptedIOException) {
+                    lastTimeout = error
+                }
+            }
+            throw NetworkTimeoutException("HTTP request", lastTimeout)
+        } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            // Never attach an unsanitized cause: logs and tool failures serialize exception details.
+            val safeMessage = redact(error.message ?: error.javaClass.simpleName)
+            if (error is IllegalArgumentException) throw IllegalArgumentException(safeMessage)
+            if (error is NetworkTimeoutException) throw NetworkTimeoutException(safeMessage)
+            throw IOException(safeMessage)
+        }
     }
 
     fun virtualRootSummary(): String = buildString {
@@ -366,14 +401,17 @@ class AndroidExecutionEnv(
         append("/workspace：Agent 可读写工作区。Skill 目录不属于通用虚拟文件系统，只能通过 Skill 专用工具访问。")
     }
 
-    fun credentialProfileSummary(): String {
-        val profiles = credentialStore.availableProfiles()
-        if (profiles.isEmpty()) return "当前没有可用凭据 profile。"
-        return profiles.joinToString("\n") { profile ->
-            val base = profile.baseUrl?.let { "，基础地址 $it" }.orEmpty()
-            "- ${profile.name}$base"
-        }
+    fun describeCredentials(query: String = "", limit: Int = 10): String = buildString {
+        appendLine(credentialVault.describe(query, limit))
+        credentialStore.availableProfiles().filter { query.isBlank() || it.name.contains(query, true) }
+            .take(limit.coerceIn(1, 20)).forEach { profile ->
+                appendLine("legacy profile=${profile.name} urls=${credentialStore.allowedUrlPrefixes(profile.name).joinToString()}")
+                credentialStore.entryNames(profile.name).forEach { key -> appendLine("  {{credential.${profile.name}.$key}}") }
+            }
     }
+
+    fun credentialProfileSummary(): String =
+        "有效自动/新版凭证 ${credentialVault.records().size} 条，旧版 profile ${credentialStore.availableProfiles().size} 条。需要查找时调用 describe_credentials；用户消息内已有的凭证引用可直接使用。"
 
     private fun readDirectory(path: String, directory: File, offset: Int, limit: Int): ReadResult {
         val entries = directory.listFiles().orEmpty()

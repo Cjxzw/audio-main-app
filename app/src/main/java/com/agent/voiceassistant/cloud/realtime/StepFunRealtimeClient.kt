@@ -80,10 +80,15 @@ class StepFunRealtimeClient(
 
     fun createResponse() = send(StepFunRealtimeProtocol.createResponse())
 
-    fun sendText(text: String) {
+    fun appendUserText(text: String) {
         val normalized = text.trim()
         if (normalized.isBlank()) return
         send(StepFunRealtimeProtocol.createTextMessage(normalized))
+    }
+
+    fun sendText(text: String) {
+        if (text.isBlank()) return
+        appendUserText(text)
         createResponse()
     }
 

@@ -5,6 +5,8 @@ import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -17,6 +19,8 @@ import com.agent.voiceassistant.service.ServiceState
 import com.agent.voiceassistant.ui.ChatAdapter
 import com.agent.voiceassistant.ui.VoiceBarView
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /** Dedicated transcript surface for the full-duplex Realtime session. */
@@ -32,6 +36,14 @@ class RealtimeActivity : AppCompatActivity() {
         setContentView(R.layout.activity_realtime)
         store = ConversationStore(this)
         adapter = ChatAdapter()
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (isActive) {
+                    delay(60_000)
+                    adapter.refreshCredentials()
+                }
+            }
+        }
         val list = findViewById<RecyclerView>(R.id.rvRealtimeChat)
         val voiceBar = findViewById<VoiceBarView>(R.id.realtimeVoiceBar)
         val textInput = findViewById<EditText>(R.id.etRealtimeTextInput)

@@ -29,6 +29,8 @@ import androidx.core.graphics.drawable.DrawableCompat
 import androidx.core.view.GravityCompat
 import androidx.appcompat.widget.TooltipCompat
 import androidx.core.view.doOnNextLayout
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -63,6 +65,8 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayoutMediator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
@@ -153,6 +157,14 @@ class MainActivity : AppCompatActivity() {
         store = ConversationStore(this)
         workspace = WorkspaceRepository(this)
         chatAdapter = ChatAdapter(::openWorkspaceDump, ::showRealtimeTranscript)
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (isActive) {
+                    delay(60_000)
+                    chatAdapter.refreshCredentials()
+                }
+            }
+        }
         taskRepository = TaskRepository(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
         homeBinding = PageHomeBinding.inflate(layoutInflater)
@@ -368,6 +380,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        chatAdapter.refreshCredentials()
         refreshConversations()
     }
 

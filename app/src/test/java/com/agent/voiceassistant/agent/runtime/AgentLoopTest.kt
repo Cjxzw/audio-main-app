@@ -8,12 +8,46 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 
 class AgentLoopTest {
+    @Test
+    fun `credential notice queued during tools is checkpointed before next request exactly once`() = runBlocking {
+        val notice = CloudSpeechClient.LlmMessage("user", "用户恢复明文：dummy-value")
+        val runtime = FakeRuntime(ArrayDeque(listOf(
+            message(toolCalls = listOf(CloudSpeechClient.ToolCall("read-1", "read", "{}"))),
+            message(content = "完成"),
+        )))
+        runtime.afterTool = { runtime.pendingNotices += notice }
+        var checkpointed = false
+        val configuration = config().copy(onCheckpoint = { _, messages, _, _, _, _, _ ->
+            if (notice in messages) checkpointed = true
+        })
+        runtime.beforeNoticeAcknowledged = { assertTrue(checkpointed) }
+        AgentLoop(runtime).run(configuration)
+        assertFalse(runtime.requests.first().messages.contains(notice))
+        assertEquals(1, runtime.requests.last().messages.count { it == notice })
+        assertTrue(runtime.pendingNotices.isEmpty())
+        assertEquals(1, runtime.acknowledgedNotices.size)
+    }
+
+    @Test
+    fun `idle notice waits for input and resumed checkpoint does not duplicate it`() = runBlocking {
+        val notice = CloudSpeechClient.LlmMessage("user", "用户恢复明文：dummy-value")
+        val runtime = FakeRuntime(ArrayDeque(listOf(message(content = "完成"))))
+        runtime.pendingNotices += notice
+        assertTrue(runtime.requests.isEmpty())
+        // Simulate a process stopping after the checkpoint, before queue acknowledgment.
+        AgentLoop(runtime).run(config().copy(messages = config().messages + notice))
+        assertEquals(1, runtime.requests.single().messages.count { it == notice })
+        assertEquals(listOf(notice), runtime.acknowledgedNotices)
+        assertTrue(runtime.pendingNotices.isEmpty())
+    }
+
     @Test
     fun `broken stream continues partial content once`() = runBlocking {
         val runtime = FakeRuntime(
@@ -751,6 +785,17 @@ class AgentLoopTest {
             !it.content.isNullOrBlank()
         },
     ) : AgentLoop.Runtime {
+        val pendingNotices = mutableListOf<CloudSpeechClient.LlmMessage>()
+        val acknowledgedNotices = mutableListOf<CloudSpeechClient.LlmMessage>()
+        var afterTool: () -> Unit = {}
+        var beforeNoticeAcknowledged: () -> Unit = {}
+        override fun pendingUserMessages(existing: List<CloudSpeechClient.LlmMessage>) = pendingNotices.filterNot { it in existing }
+        override suspend fun onUserMessagesCheckpointed(messages: List<CloudSpeechClient.LlmMessage>) {
+            val delivered = pendingNotices.filter { it in messages }
+            if (delivered.isNotEmpty()) beforeNoticeAcknowledged()
+            pendingNotices.removeAll(delivered.toSet())
+            acknowledgedNotices.addAll(delivered)
+        }
         val requests = mutableListOf<CloudSpeechClient.ChatRequest>()
         val executedCalls = mutableListOf<String>()
         val blockedCalls = mutableListOf<String>()
@@ -861,6 +906,7 @@ class AgentLoopTest {
             maxActiveTools.updateAndGet { current -> maxOf(current, active) }
             if (toolDelayMs > 0) delay(toolDelayMs)
             activeTools.decrementAndGet()
+            afterTool()
             return AgentLoop.ToolExecution(
                 message = CloudSpeechClient.LlmMessage("tool", "读取结果", toolCallId = call.id),
                 succeeded = call.id !in failedCallIds,
