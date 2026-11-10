@@ -75,6 +75,12 @@ class AndroidExecutionEnv(
         val body: String,
         val truncated: Boolean,
         val headers: Map<String, List<String>> = emptyMap(),
+        val savedPath: String? = null,
+        val savedBytes: Long? = null,
+        val savedSha256: String? = null,
+        val savedTruncated: Boolean = false,
+        val savedExpiresAt: Long? = null,
+        val binary: Boolean = false,
     )
 
     private val appContext = context.applicationContext
@@ -90,6 +96,7 @@ class AndroidExecutionEnv(
     val systemSkillsRoot = File(runtimeRoot, "system-skills")
     val disabledSystemSkillsManifest = File(runtimeRoot, "system-skills-disabled")
     private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot)
+    private val httpResponseStore = HttpResponseStore(workspaceRoot)
     private val workspaceTrash = WorkspaceTrashRepository(appContext)
 
     init {
@@ -126,6 +133,10 @@ class AndroidExecutionEnv(
             return readDirectory(normalizedPath, file, offset ?: 1, limit)
         }
         require(file.length() <= MAX_READ_FILE_BYTES) { "文件过大，不能直接读取：$path" }
+        if (file.length() > STREAMING_READ_THRESHOLD_BYTES) {
+            require(!hasLogFilters) { "大文件暂不支持日志筛选，请先分段读取原始内容" }
+            return readLargeTextFile(normalizedPath, file, offset, limit, tailLines)
+        }
         val text = file.readText(Charsets.UTF_8)
         require(!text.contains('\u0000')) { "暂不支持读取二进制文件：$path" }
         val sourceLines = text.lines()
@@ -165,6 +176,50 @@ class AndroidExecutionEnv(
                 null
             },
             sha256 = sha256(text.toByteArray()),
+        )
+    }
+
+    private fun readLargeTextFile(
+        normalizedPath: String,
+        file: File,
+        offset: Int?,
+        limit: Int,
+        tailLines: Int?,
+    ): ReadResult {
+        val selected = mutableListOf<String>()
+        val tail = ArrayDeque<String>()
+        var totalLines = 0
+        file.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            lines.forEach { line ->
+                require(!line.contains('\u0000')) { "暂不支持读取二进制文件：$normalizedPath" }
+                totalLines += 1
+                if (tailLines != null) {
+                    tail.addLast(line)
+                    if (tail.size > tailLines) tail.removeFirst()
+                } else if (totalLines >= (offset ?: 1) && selected.size < limit) {
+                    selected += line
+                }
+            }
+        }
+        val effectiveTail = tailLines != null
+        val resultLines = if (effectiveTail) tail.toList() else selected
+        val startLine = if (effectiveTail) {
+            (totalLines - resultLines.size).coerceAtLeast(0) + 1
+        } else {
+            offset ?: 1
+        }
+        val fullContent = resultLines.joinToString("\n")
+        val content = fullContent.take(MAX_READ_OUTPUT_CHARS)
+        val endLine = if (resultLines.isEmpty()) startLine - 1 else startLine + resultLines.size - 1
+        return ReadResult(
+            path = normalizedPath,
+            kind = "file",
+            content = content,
+            startLine = startLine,
+            endLine = endLine,
+            totalLines = totalLines,
+            truncated = startLine > 1 || endLine < totalLines || fullContent.length > content.length,
+            sha256 = sha256File(file),
         )
     }
 
@@ -299,6 +354,19 @@ class AndroidExecutionEnv(
         .digest(bytes)
         .joinToString("") { byte -> "%02x".format(byte) }
 
+    private fun sha256File(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+    }
+
     suspend fun httpRequest(
         method: String,
         url: String,
@@ -307,6 +375,7 @@ class AndroidExecutionEnv(
         credentialProfile: String? = null,
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Int = 5_000,
+        downloadTo: String? = null,
     ): HttpResult = withContext(Dispatchers.IO) {
         require(timeoutMs in 1_000..120_000) { "timeout_ms 必须在 1000 到 120000 之间" }
         val resolvedUrl = credentialProfile
@@ -333,6 +402,11 @@ class AndroidExecutionEnv(
             value
         }
         try {
+            val downloadPath = downloadTo?.trim()?.takeIf(String::isNotBlank)?.let { rawPath ->
+                val normalized = pathResolver.normalize(rawPath)
+                require(normalized.startsWith("/workspace/")) { "download_to 只能写入 /workspace" }
+                normalized to pathResolver.resolve(normalized, write = true)
+            }
             require(headers.keys.none { CredentialPolicy.anyReference.containsMatchIn(it) }) { "凭证引用不能用作 Header 名称" }
             val expandedHeaders = headers.mapValues { (_, value) -> expand(value) }
             val effectiveContentType = contentType ?: headers.entries.firstOrNull { it.key.equals("Content-Type", true) }?.value
@@ -367,17 +441,35 @@ class AndroidExecutionEnv(
                 try {
                     requestClient.newCall(request).execute().use { response ->
                         val responseBody = response.body
-                        val bounded = responseBody?.source()?.let {
-                            BoundedSourceReader.read(it, MAX_HTTP_BODY_BYTES.toLong())
-                        } ?: BoundedSourceReader.Result(ByteArray(0), truncated = false)
+                        val capture = responseBody?.source()?.let {
+                            httpResponseStore.capture(
+                                source = it,
+                                contentLength = responseBody.contentLength().takeIf { length -> length >= 0L },
+                                contentType = responseBody.contentType()?.toString(),
+                                downloadTarget = downloadPath?.second,
+                                downloadVirtualPath = downloadPath?.first,
+                            )
+                        } ?: HttpResponseStore.Capture(ByteArray(0), false, true)
+                        val preview = if (capture.isTextual) {
+                            redact(capture.preview.toString(Charsets.UTF_8))
+                        } else {
+                            ""
+                        }
+                        val artifact = capture.artifact
                         return@withContext HttpResult(
                             status = response.code,
                             contentType = responseBody?.contentType()?.toString(),
-                            body = redact(bounded.bytes.toString(Charsets.UTF_8)),
-                            truncated = bounded.truncated,
+                            body = preview,
+                            truncated = capture.displayTruncated,
                             headers = response.headers.toMultimap().filterKeys {
                                 !it.equals("set-cookie", true) && !it.equals("authorization", true)
                             }.mapValues { (_, values) -> values.map(::redact) },
+                            savedPath = downloadPath?.first ?: artifact?.virtualPath,
+                            savedBytes = artifact?.bytes,
+                            savedSha256 = artifact?.sha256,
+                            savedTruncated = artifact?.truncated == true,
+                            savedExpiresAt = artifact?.expiresAt,
+                            binary = !capture.isTextual,
                         )
                     }
                 } catch (error: InterruptedIOException) {
@@ -557,7 +649,8 @@ class AndroidExecutionEnv(
     companion object {
         private const val DEFAULT_READ_LINES = 200
         private const val MAX_READ_LINES = 1_000
-        private const val MAX_READ_FILE_BYTES = 2L * 1024 * 1024
+        private const val MAX_READ_FILE_BYTES = HttpResponseStore.MAX_FILE_BYTES
+        private const val STREAMING_READ_THRESHOLD_BYTES = 2L * 1024 * 1024
         private const val MAX_READ_OUTPUT_CHARS = 40_000
         private const val MAX_WRITE_BYTES = 8 * 1024
         private const val MAX_WRITE_LINES = 50
@@ -566,7 +659,6 @@ class AndroidExecutionEnv(
         private const val MAX_EXEC_ARGV_ITEMS = 64
         private const val MAX_EXEC_ARG_CHARS = 4_000
         private const val MAX_EXEC_OUTPUT_CHARS = 40_000
-        private const val MAX_HTTP_BODY_BYTES = 512 * 1024
         private val HTTP_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
     }
 }

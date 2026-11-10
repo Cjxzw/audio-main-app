@@ -282,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     http_request.add_argument("--credential-profile")
     http_request.add_argument("--header", action="append", default=[], metavar="NAME=VALUE")
     http_request.add_argument("--timeout-ms", type=int, default=5000)
+    http_request.add_argument("--download-to", help="将响应流保存到 /workspace 下的持久文件")
 
     provider = commands.add_parser("provider", help="LLM 供应商")
     provider_actions = provider.add_subparsers(dest="action", required=True)
@@ -365,7 +366,7 @@ def bridge_command(args: argparse.Namespace) -> tuple[str, dict[str, object], fl
         return "http.request", {
             "method": args.method, "url": args.url, "body": args.body,
             "content_type": args.content_type, "credential_profile": args.credential_profile,
-            "headers": headers, "timeout_ms": args.timeout_ms,
+            "headers": headers, "timeout_ms": args.timeout_ms, "download_to": args.download_to,
         }, max(15.0, args.timeout_ms / 1000 + 5)
     if args.group == "provider":
         if args.action == "list":

@@ -406,7 +406,7 @@ class MainToolRegistry(
                 ?.firstOrNull()
                 ?.let { it as? JsonPrimitive }
                 ?.content
-            TOOL_HTTP_REQUEST -> payload.text("url")
+            TOOL_HTTP_REQUEST -> payload.text("download_to") ?: payload.text("url")
             TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
             TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
             TOOL_SKILL_REGISTER -> payload.text("name")
@@ -820,7 +820,7 @@ class MainToolRegistry(
 
     private fun httpRequest() = tool(
         name = TOOL_HTTP_REQUEST,
-        description = "发送完整 HTTP/HTTPS 请求，用于 API 调试和纯文本 Skill 调用。Skill 必须提供完整 URL、headers 和 body；凭证在 Header 或 body 中原样使用 {{cred:UID.字段UID}}，由执行器检查 URL 白名单后还原；不需要 credential_profile。兼容旧版 profile 与 {{credential.profile.key}}。禁止将凭证放入 URL。",
+        description = "发送完整 HTTP/HTTPS 请求，用于 API 调试、纯文本 Skill 调用和文件下载。Skill 必须提供完整 URL、headers 和 body；凭证在 Header 或 body 中原样使用 {{cred:UID.字段UID}}，由执行器检查 URL 白名单后还原；不需要 credential_profile。兼容旧版 profile 与 {{credential.profile.key}}。禁止将凭证放入 URL。大响应会自动缓存，长期保存请使用 download_to。",
         required = listOf("url"),
     ) {
         putJsonObject("method") {
@@ -850,6 +850,10 @@ class MainToolRegistry(
         putJsonObject("credential_profile") {
             put("type", "string")
             put("description", "Android Keystore 中已配置的凭据 profile；请求 URL 必须匹配其允许前缀")
+        }
+        putJsonObject("download_to") {
+            put("type", "string")
+            put("description", "可选的持久下载路径，只能是 /workspace 下的虚拟路径。指定后响应会以文件流保存，不把正文放入模型上下文；单文件上限 128 MiB。未指定时，超过展示限制的响应会自动保存到临时 HTTP cache，三天后清理。")
         }
     }
 

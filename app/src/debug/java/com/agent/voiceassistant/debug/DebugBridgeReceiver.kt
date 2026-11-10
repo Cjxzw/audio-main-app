@@ -404,6 +404,7 @@ class DebugBridgeReceiver : BroadcastReceiver() {
                 credentialProfile = args.string("credential_profile"),
                 headers = headers,
                 timeoutMs = (args.long("timeout_ms")?.toInt() ?: 5_000).coerceIn(1_000, 120_000),
+                downloadTo = args.string("download_to"),
             )
         }
         return success(request, "http_completed", "HTTP 请求已完成", startedAt, buildJsonObject {
@@ -411,6 +412,12 @@ class DebugBridgeReceiver : BroadcastReceiver() {
             result.contentType?.let { put("content_type", it) }
             put("body", result.body)
             put("truncated", result.truncated)
+            result.savedPath?.let { put("saved_path", it) }
+            result.savedBytes?.let { put("saved_bytes", it) }
+            result.savedSha256?.let { put("saved_sha256", it) }
+            put("saved_truncated", result.savedTruncated)
+            result.savedExpiresAt?.let { put("saved_expires_at", it) }
+            put("binary", result.binary)
             putJsonObject("headers") { result.headers.forEach { (name, values) -> put(name, buildJsonArray { values.forEach { add(JsonPrimitive(it)) } }) } }
         })
     }

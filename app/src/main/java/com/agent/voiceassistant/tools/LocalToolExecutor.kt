@@ -500,6 +500,7 @@ class LocalToolExecutor(
                 credentialProfile = payload.string("credential_profile"),
                 headers = payload.objectStringMap("headers"),
                 timeoutMs = payload.int("timeout_ms") ?: 5_000,
+                downloadTo = payload.string("download_to"),
             )
         }.fold(
             onSuccess = { result ->
@@ -509,8 +510,20 @@ class LocalToolExecutor(
                     contextText = buildString {
                         appendLine("HTTP 状态：${result.status}")
                         result.headers.forEach { (name, values) -> appendLine("$name: ${values.joinToString()}") }
-                        append(result.body.ifBlank { "[空响应]" })
+                        if (result.binary) {
+                            appendLine("响应为二进制内容，正文未放入模型上下文。")
+                        } else {
+                            append(result.body.ifBlank { "[空响应]" })
+                        }
                         if (result.truncated) append("\n[响应已截断]")
+                        result.savedPath?.let { path ->
+                            appendLine()
+                            appendLine("完整响应已保存：[$path]($path)")
+                            result.savedBytes?.let { appendLine("保存大小：$it bytes") }
+                            result.savedSha256?.let { appendLine("SHA-256：$it") }
+                            if (result.savedTruncated) appendLine("保存结果已达到 128 MiB 上限，文件不完整。")
+                            result.savedExpiresAt?.let { appendLine("缓存自动删除时间：${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(it))}") }
+                        }
                     },
                     shouldAskLlm = true,
                     success = result.status in 200..399,
