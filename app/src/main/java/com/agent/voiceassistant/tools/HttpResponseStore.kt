@@ -97,8 +97,7 @@ internal class HttpResponseStore(
         if (explicitDownload) startOutput()
 
         try {
-            var finished = false
-            while (!finished) {
+            while (true) {
                 val remaining = MAX_FILE_BYTES - totalBytes
                 if (remaining < 0L) {
                     artifactTruncated = true
@@ -113,7 +112,6 @@ internal class HttpResponseStore(
                 val chunk = Buffer()
                 val count = source.read(chunk, requestSize)
                 if (count < 0L) {
-                    finished = true
                     break
                 }
                 val bytes = chunk.readByteArray()
@@ -135,7 +133,6 @@ internal class HttpResponseStore(
                 if (previewRemaining > 0L) preview.write(bytes, 0, minOf(allowed.toLong(), previewRemaining).toInt())
                 totalBytes += allowed
                 if (artifactTruncated) break
-                if (count < requestSize) finished = true
             }
             output?.flush()
             output?.close()

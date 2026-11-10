@@ -1,6 +1,10 @@
 package com.agent.voiceassistant.tools
 
 import okio.Buffer
+import okio.BufferedSource
+import okio.Source
+import okio.Timeout
+import okio.buffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -82,5 +86,36 @@ class HttpResponseStoreTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `short network reads do not truncate a download`() {
+        val root = File(System.getProperty("java.io.tmpdir"), "http-response-${UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            val raw = ByteArray(20_000) { (it % 251).toByte() }
+            val target = File(root, "downloads/short-read.bin")
+            val source: BufferedSource = ShortReadSource(Buffer().write(raw), maxBytes = 7).buffer()
+            val capture = HttpResponseStore(root).capture(
+                source,
+                contentLength = raw.size.toLong(),
+                contentType = "application/octet-stream",
+                downloadTarget = target,
+                downloadVirtualPath = "/workspace/downloads/short-read.bin",
+            )
+            assertEquals(raw.size.toLong(), capture.artifact?.bytes)
+            assertFalse(capture.artifact?.truncated == true)
+            assertArrayEquals(raw, target.readBytes())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    private class ShortReadSource(
+        private val delegate: Source,
+        private val maxBytes: Long,
+    ) : Source {
+        override fun read(sink: Buffer, byteCount: Long): Long = delegate.read(sink, minOf(byteCount, maxBytes))
+        override fun timeout(): Timeout = delegate.timeout()
+        override fun close() = delegate.close()
     }
 }
