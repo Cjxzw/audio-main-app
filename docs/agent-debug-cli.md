@@ -57,4 +57,6 @@ http request URL [--method METHOD] [--body BODY] [--credential-profile PROFILE] 
 
 所有命令输出结构化 JSON。`inspect` 和 `logs` 在本机组合 ADB、Bridge、应用日志与 Android 退出记录；`http request` 复用 App 正式的 `AndroidExecutionEnv`，因此会执行同样的 URL 前缀、凭据和响应截断策略。`turn run` 会返回最终助手正文、本轮可见消息和模型消息中的原生工具调用，供 Agent 继续判断。
 
+`status` 同时返回当前会话的上下文用量、最近活动时间、非活跃时长，以及会话生命周期的阈值设置；`conversation list` 包含各会话的域和上下文用量，可配合 `logs grep conversation.cold_rotated` 验证冷会话自动新建。后台每分钟检查一次，文字输入和启动 Realtime 前也会补查；执行中、等待恢复的任务和正在进行的 Realtime 通话不会被自动切走。
+
 `credentials list` 返回新版凭证和旧版 profile 的元数据与引用（默认最多各 10 条），不返回真实值。新版引用形如 `{{cred:凭证UID.字段UID}}`，可直接放在 `http request` 的 Header 或 body 中；旧版 `{{credential.profile.key}}` 继续搭配 `--credential-profile` 使用。URL 本身不能包含凭证引用，引用过期或删除后会失败。大响应超过展示限制时，App 会自动保存到 `/workspace/.http-cache/`，文件最多保存 128 MiB，缓存保留 3 天。指定 `--download-to` 时以流式方式写入持久文件，路径必须位于 `/workspace`，并返回文件大小、SHA-256 和是否达到上限。当前自动缓存与下载保存原始响应，不做脱敏。

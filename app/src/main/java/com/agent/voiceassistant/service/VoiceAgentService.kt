@@ -946,22 +946,36 @@ class VoiceAgentService : Service() {
     }
 
     private fun maybeStartColdConversation() {
-        if (store.currentConversationDomain != ConversationDomain.STANDARD) return
-        val config = conversationLifecycleSettings.read()
-        val summary = store.currentConversationSummary()
-        val usage = summary.contextUsageTokens ?: 0L
-        val inactiveMs = System.currentTimeMillis() - summary.updatedAt
-        if (usage < config.contextThresholdK * 1_000L || inactiveMs < config.inactiveMinutes * 60_000L) return
-        if (newConversationInProgress.compareAndSet(false, true)) {
+        // Never move a live/recoverable turn or a Realtime call to another session.
+        if (!turnMutex.tryLock()) return
+        try {
+            if (mainTurnActive.get() || agentHarness.state.value != MainAgentHarness.State.IDLE ||
+                realtimeActive || pendingRealtimeDelegations.isNotEmpty()
+            ) return
+            val config = conversationLifecycleSettings.read()
+            val summary = store.currentConversationSummary()
+            val usage = summary.contextUsageTokens ?: 0L
+            val inactiveMs = System.currentTimeMillis() - summary.updatedAt
+            if (summary.domain != ConversationDomain.STANDARD ||
+                usage < config.contextThresholdK * 1_000L || inactiveMs < config.inactiveMinutes * 60_000L
+            ) return
+            if (activeTurnCheckpointStore.load() != null) return
+            if (!newConversationInProgress.compareAndSet(false, true)) return
             try {
-                store.startNewConversation("上下文达到 ${config.contextThresholdK}k 且已 ${config.inactiveMinutes} 分钟无活动")
-                    .also { mainConversationId = it.id }
+                val created = store.startNewConversationIfCold(config) ?: return
+                mainConversationId = created.id
                 EventBus.emitChatReset(emptyList())
                 EventBus.emitConversationUpdate()
-                DiagLog.i("conversation.cold_rotated", "usage=$usage inactiveMs=$inactiveMs", showInUi = true)
+                DiagLog.i(
+                    "conversation.cold_rotated",
+                    "previous=${summary.id} current=${created.id} usage=$usage inactiveMs=$inactiveMs",
+                    showInUi = true,
+                )
             } finally {
                 newConversationInProgress.set(false)
             }
+        } finally {
+            turnMutex.unlock()
         }
     }
 
@@ -1119,6 +1133,9 @@ class VoiceAgentService : Service() {
         attachments: List<String> = emptyList(),
         preclaimedMainTurn: Boolean = false,
     ) {
+        // Android may suspend the minute timer. Check before the incoming event
+        // refreshes the old session's activity time or captures session credentials.
+        if (!preclaimedMainTurn) maybeStartColdConversation()
         val capture = runCatching { store.captureCredentialInput(userText) }.getOrElse { error ->
             if (preclaimedMainTurn) mainTurnActive.set(false)
             EventBus.emitUserNotice("凭证处理失败，本次输入尚未发送。请重试或检查凭证管理。")
@@ -1468,6 +1485,7 @@ class VoiceAgentService : Service() {
             fail("请先在设置中配置 StepFun API Key，才能启用 Realtime 语音管线")
             return
         }
+        maybeStartColdConversation()
         realtimeActive = true
         EventBus.emitRealtimeUi(RealtimeUiState(active = true, hidden = realtimeUiHidden))
         EventBus.emitRealtimeState(RealtimeState.CONNECTING)

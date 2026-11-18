@@ -5,6 +5,7 @@ import android.util.AtomicFile
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
 import com.agent.voiceassistant.agent.runtime.SkillRegistry
+import com.agent.voiceassistant.settings.ConversationLifecycleConfig
 import com.agent.voiceassistant.ui.ChatMessage
 import com.agent.voiceassistant.ui.ChatPresentation
 import com.agent.voiceassistant.ui.ChatRole
@@ -51,8 +52,18 @@ class ConversationStore(context: Context) {
     init {
         synchronized(lock) {
             val quarantined = state.sessions.sumOf(::quarantineMalformedToolHistory)
-            if (quarantined > 0) {
-                Timber.w("ConversationStore: quarantined $quarantined malformed tool history messages")
+            if (quarantined > 0) Timber.w("ConversationStore: quarantined $quarantined malformed tool history messages")
+            // Older reply presentation paths persisted usage on the bubble only.
+            // Backfill without touching updatedAt: loading history is not activity.
+            val recoveredUsage = state.sessions.count { session ->
+                if (session.contextUsageTokens != null) return@count false
+                val tokens = session.messages.asReversed()
+                    .firstOrNull { it.role == "assistant" && (it.promptTokens ?: 0L) > 0L }
+                    ?.promptTokens ?: return@count false
+                session.contextUsageTokens = tokens
+                true
+            }
+            if (quarantined > 0 || recoveredUsage > 0) {
                 persistLocked()
             }
         }
@@ -201,6 +212,7 @@ class ConversationStore(context: Context) {
         synchronized(lock) {
             val session = currentSessionLocked()
             session.messages.add(message)
+            responseMetadata?.promptTokens?.takeIf { it > 0L }?.let { session.contextUsageTokens = it }
             session.updatedAt = System.currentTimeMillis()
             persistLocked()
         }
@@ -518,6 +530,7 @@ class ConversationStore(context: Context) {
                 llmVisible = llmVisible ?: session.messages[index].llmVisible,
             )
             session.messages[index] = updated
+            responseMetadata?.promptTokens?.takeIf { it > 0L }?.let { session.contextUsageTokens = it }
             session.updatedAt = timestamp
             persistLocked()
             return updated
@@ -691,6 +704,22 @@ class ConversationStore(context: Context) {
         state.currentConversationId = replacement.id
         persistLocked()
         replacement
+    }
+
+    /** Check and rotate atomically so a concurrent activity/switch cannot rotate the wrong session. */
+    fun startNewConversationIfCold(
+        config: ConversationLifecycleConfig,
+        now: Long = System.currentTimeMillis(),
+    ): ConversationSession? = synchronized(lock) {
+        val session = currentSessionLocked()
+        if (session.domain != ConversationDomain.STANDARD ||
+            (session.contextUsageTokens ?: 0L) < config.contextThresholdK * 1_000L ||
+            now - session.updatedAt < config.inactiveMinutes * 60_000L
+        ) return@synchronized null
+        startNewConversation(
+            reason = "上下文达到 ${config.contextThresholdK}k 且已 ${config.inactiveMinutes} 分钟无活动",
+            domain = ConversationDomain.STANDARD,
+        )
     }
 
     fun startNewConversation(

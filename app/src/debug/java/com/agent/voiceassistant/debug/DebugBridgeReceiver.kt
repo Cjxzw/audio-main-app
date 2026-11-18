@@ -10,6 +10,7 @@ import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.service.EventBus
 import com.agent.voiceassistant.service.VoiceAgentService
 import com.agent.voiceassistant.settings.AppCapabilityResolver
+import com.agent.voiceassistant.settings.ConversationLifecycleSettings
 import com.agent.voiceassistant.settings.LlmProviderProfile
 import com.agent.voiceassistant.settings.LlmProviderRepository
 import com.agent.voiceassistant.settings.MimoApiRepository
@@ -118,6 +119,7 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         val capabilities = AppCapabilityResolver(context).capabilities()
         val active = LlmProviderRepository(context).activeProfile()
         val current = store.currentConversationSummary()
+        val lifecycle = ConversationLifecycleSettings(context).read()
         return buildJsonObject {
             put("package", context.packageName)
             put("version_name", BuildConfig.VERSION_NAME)
@@ -131,6 +133,14 @@ class DebugBridgeReceiver : BroadcastReceiver() {
                 put("id", current.id)
                 put("title", current.title)
                 put("message_count", current.messageCount)
+                put("domain", current.domain.name.lowercase())
+                put("context_usage_tokens", current.contextUsageTokens)
+                put("updated_at", current.updatedAt)
+                put("inactive_ms", (System.currentTimeMillis() - current.updatedAt).coerceAtLeast(0L))
+            }
+            putJsonObject("conversation_lifecycle") {
+                put("context_threshold_k", lifecycle.contextThresholdK)
+                put("inactive_minutes", lifecycle.inactiveMinutes)
             }
         }
     }
@@ -532,6 +542,8 @@ class DebugBridgeReceiver : BroadcastReceiver() {
                 put("created_at", summary.createdAt)
                 put("updated_at", summary.updatedAt)
                 put("current", summary.current)
+                put("domain", summary.domain.name.lowercase())
+                put("context_usage_tokens", summary.contextUsageTokens)
             })
         }
     }
