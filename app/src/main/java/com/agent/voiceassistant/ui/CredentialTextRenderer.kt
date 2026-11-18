@@ -7,7 +7,9 @@ import android.text.TextPaint
 import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.text.style.BackgroundColorSpan
+import android.text.style.StyleSpan
 import android.view.View
+import android.graphics.Typeface
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.settings.CredentialEditorActivity
 import com.agent.voiceassistant.tools.CredentialPolicy
@@ -31,7 +33,8 @@ object CredentialTextRenderer {
             result.replace(start, match.range.last + 1, value)
             if (credential != null) {
                 val end = start + value.length
-                result.setSpan(BackgroundColorSpan(Color.argb(45, 55, 130, 190)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                result.setSpan(BackgroundColorSpan(Color.argb(88, 255, 193, 7)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                result.setSpan(StyleSpan(Typeface.BOLD), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 result.setSpan(object : ClickableSpan() {
                     override fun onClick(widget: View) {
                         context.startActivity(CredentialEditorActivity.intent(context, credential.first.id, match.value, message.conversationId))

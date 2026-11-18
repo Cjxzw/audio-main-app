@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
-import android.view.ViewGroup
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import com.agent.voiceassistant.R
@@ -102,7 +101,7 @@ class CredentialEditorActivity : AppCompatActivity() {
             if (secret) { setSelectAllOnFocus(true); isSaveEnabled = false }
         }
         if (secret) layout.endIconMode = TextInputLayout.END_ICON_PASSWORD_TOGGLE
-        layout.addView(field, ViewGroup.LayoutParams(-1, -2))
+        layout.addView(field, LinearLayout.LayoutParams(-1, -2))
         parent.addView(layout, LinearLayout.LayoutParams(-1, -2))
         return field
     }

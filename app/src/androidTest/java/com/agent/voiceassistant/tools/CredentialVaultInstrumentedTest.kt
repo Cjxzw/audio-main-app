@@ -2,6 +2,9 @@ package com.agent.voiceassistant.tools
 
 import android.content.Context
 import android.content.ContextWrapper
+import android.text.Spanned
+import android.text.style.BackgroundColorSpan
+import android.text.style.ClickableSpan
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.agent.voiceassistant.data.ConversationStore
@@ -27,6 +30,25 @@ class CredentialVaultInstrumentedTest {
             override fun getFilesDir() = directory
             override fun getApplicationContext(): Context = this
         }
+    }
+
+    @Test fun capturedSensitiveInputRendersAsHighlightedClickablePlaintext() {
+        val context = isolatedContext()
+        val store = ConversationStore(context)
+        val secret = "highlight-${UUID.randomUUID()}"
+        val capture = store.captureCredentialInput("token: $secret")
+        assertEquals(1, capture.references.size)
+
+        val stored = store.addMessage("user", capture.text, credentialReferences = capture.references)
+        val message = store.recentChatMessages().single { it.messageId == stored.id }
+        val rendered = CredentialTextRenderer.render(context, message)
+
+        assertEquals("token: $secret", rendered.toString())
+        assertFalse(rendered.toString().contains(capture.references.single()))
+        assertTrue(rendered is Spanned)
+        val spanned = rendered as Spanned
+        assertEquals(1, spanned.getSpans(0, spanned.length, ClickableSpan::class.java).size)
+        assertEquals(1, spanned.getSpans(0, spanned.length, BackgroundColorSpan::class.java).size)
     }
 
     @Test fun captureDedupExpiryAndExplicitRestoreAreSessionBound() {
