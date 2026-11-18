@@ -250,6 +250,7 @@ class VoiceAgentService : Service() {
         const val ACTION_COMPACT_CONVERSATION = "com.agent.voiceassistant.COMPACT_CONVERSATION"
         const val ACTION_CANCEL_TASK = "com.agent.voiceassistant.CANCEL_TASK"
         const val ACTION_CANCEL_AGENT = "com.agent.voiceassistant.CANCEL_AGENT"
+        const val ACTION_SKILL_DECISION = "com.agent.voiceassistant.SKILL_DECISION"
         const val EXTRA_OPEN_TASKS = "open_tasks"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_ATTACHMENTS = "attachments"
@@ -356,6 +357,11 @@ class VoiceAgentService : Service() {
             sendServiceAction(ctx, ACTION_CANCEL_TASK) { putExtra(EXTRA_TASK_ID, id) }
 
         fun cancelAgent(ctx: Context) = sendServiceAction(ctx, ACTION_CANCEL_AGENT)
+
+        fun skillDecision(ctx: Context, id: String, decision: String) = sendServiceAction(ctx, ACTION_SKILL_DECISION) {
+            putExtra("skill_request_id", id)
+            putExtra("skill_decision", decision)
+        }
 
         private fun sendServiceAction(ctx: Context, action: String, configure: Intent.() -> Unit = {}) {
             val intent = Intent(ctx, VoiceAgentService::class.java).setAction(action).apply(configure)
@@ -517,6 +523,7 @@ class VoiceAgentService : Service() {
                 executionEnv = executionEnv,
                 codeGraph = CodeGraphIndex(this),
                 skillRegistry = skillRegistry,
+                skillApprovals = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this),
             ),
             taskCoordinator = taskCoordinator,
             taskRepository = taskRepository,
@@ -530,6 +537,7 @@ class VoiceAgentService : Service() {
             historicalConversationSearch = { keyword, limit -> store.searchHistoricalConversationTurns(keyword, limit) },
         )
         serviceScope.launch { taskCoordinator.recover() }
+        serviceScope.launch { deliverSkillDecisions() }
         serviceScope.launch { taskReportReviewLoop() }
         serviceScope.launch { backgroundLlmWorker() }
         serviceScope.launch { coldConversationMonitor() }
@@ -550,6 +558,18 @@ class VoiceAgentService : Service() {
             showInUi = true,
         )
         when (intent?.action) {
+            ACTION_SKILL_DECISION -> {
+                ensureForegroundForCurrentState()
+                serviceScope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this@VoiceAgentService)
+                                .decide(intent.getStringExtra("skill_request_id").orEmpty(), intent.getStringExtra("skill_decision").orEmpty())
+                        }
+                        deliverSkillDecisions()
+                    } catch (error: Exception) { EventBus.emitUserNotice(error.message ?: "Skill 处理失败") }
+                }
+            }
             null -> sleepAgent()
             ACTION_BOOTSTRAP -> {
                 sleepAgent()
@@ -933,6 +953,22 @@ class VoiceAgentService : Service() {
         if (loopJob?.isActive != true) {
             loopJob = serviceScope.launch {
                 runConversationLoop()
+            }
+        }
+    }
+
+    private suspend fun deliverSkillDecisions() {
+        val approvals = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this)
+        val outcomes = approvals.outcomes()
+        if (outcomes.any { it.status == "approved" }) skillPromptSnapshots.clear()
+        outcomes.forEach { outcome ->
+            store.queueSkillDecision(outcome.conversationId, outcome.requestId, outcome.status, outcome.message)
+            approvals.acknowledge(outcome.requestId, outcome.status)
+        }
+        if (outcomes.isNotEmpty()) {
+            EventBus.emitConversationUpdate()
+            if (!mainTurnActive.get() && outcomes.any { it.conversationId == store.currentConversationId } && !realtimeActive) {
+                processUserText("[系统通知] 用户刚刚处理了 Skill 确认请求，请根据确认结果继续。", source = "skill_decision")
             }
         }
     }
@@ -2272,7 +2308,7 @@ class VoiceAgentService : Service() {
                 }
                 if (!toolRegistry.isReasoningEscalation(event.call)) {
                     when {
-                        event.call.name == MainToolRegistry.TOOL_SKILL_USE -> store.recordEphemeralToolResult(
+                        toolRegistry.isSkillRead(event.call) -> store.recordEphemeralToolResult(
                             event.turnId, event.call, event.result, event.success && !event.blocked,
                         )
                         else -> store.addToolResult(

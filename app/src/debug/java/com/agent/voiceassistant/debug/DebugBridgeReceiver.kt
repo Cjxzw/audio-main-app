@@ -36,6 +36,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.add
 
 class DebugBridgeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -78,6 +79,33 @@ class DebugBridgeReceiver : BroadcastReceiver() {
     ): JsonObject = when (request.command) {
         "status" -> success(request, "status", "Hanwo 调试状态已读取", startedAt, status(context))
         "config.show" -> success(request, "config", "配置状态已读取", startedAt, config(context))
+        "skills.status" -> {
+            val env = AndroidExecutionEnv(context)
+            val registry = skillRegistry(env)
+            val pending = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(context).pending.value
+            success(request, "skills", "Skill 状态已读取", startedAt, buildJsonObject {
+                put("pending", pending?.let { kotlinx.serialization.json.Json.encodeToJsonElement(com.agent.voiceassistant.agent.runtime.SkillApprovalStore.Request.serializer(), it) } ?: kotlinx.serialization.json.JsonNull)
+                put("skills", buildJsonArray { registry.listAll().forEach { skill -> add(buildJsonObject {
+                    put("id", skill.id); put("name", skill.name); put("enabled", skill.enabled); put("version", skill.version)
+                    put("resources", buildJsonArray { registry.files(skill.id).forEach { add(it.relativePath) } })
+                }) } })
+                put("path_bridge_available", File(context.applicationInfo.nativeLibraryDir, "libhanwo_paths.so").isFile)
+            })
+        }
+        "skills.tool" -> {
+            val operation = request.arguments["operation"]?.jsonPrimitive?.content.orEmpty()
+            require(operation in setOf("skill.use", "skill.register", "skill.edit")) { "未知 Skill 调试操作" }
+            val payload = request.arguments["payload"] as? JsonObject ?: error("缺少 payload")
+            val env = AndroidExecutionEnv(context)
+            val store = ConversationStore(context)
+            val result = runBlocking { com.agent.voiceassistant.tools.LocalToolExecutor(
+                store, com.agent.voiceassistant.tools.LocationProvider(context, store), executionEnv = env,
+                skillRegistry = skillRegistry(env), skillApprovals = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(context),
+            ).execute(com.agent.voiceassistant.agent.AgentAction(operation, payload, payload.toString())) }
+            success(request, "skill_tool", result.displayText, startedAt, buildJsonObject {
+                put("success", result.success); put("result", result.contextText)
+            })
+        }
         "credentials.list" -> success(request, "credentials", "凭据 profile 已读取", startedAt, buildJsonObject {
             put("profiles", AndroidExecutionEnv(context).describeCredentials())
         })
@@ -113,6 +141,11 @@ class DebugBridgeReceiver : BroadcastReceiver() {
         "turn.run" -> runTurn(context, request, startedAt)
         else -> error("未知调试命令：${request.command}")
     }
+
+    private fun skillRegistry(env: AndroidExecutionEnv) = com.agent.voiceassistant.agent.runtime.SkillRegistry(
+        env.skillsRoot, env.disabledSkillsRoot, env.deletedSkillsManifest, env.modifiedSkillsManifest,
+        env.systemSkillsRoot, env.disabledSystemSkillsManifest,
+    )
 
     private fun status(context: Context): JsonObject {
         val store = ConversationStore(context)

@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 
 PACKAGE = "com.agent.voiceassistant"
@@ -263,6 +264,18 @@ def build_parser() -> argparse.ArgumentParser:
     credentials = commands.add_parser("credentials", help="凭证与旧版 profile（仅返回元数据和引用）")
     credentials.add_subparsers(dest="action", required=True).add_parser("list", help="列出 profile")
 
+    skills = commands.add_parser("skills", help="Skill 脚本与唯一确认事项")
+    skills_actions = skills.add_subparsers(dest="action", required=True)
+    skills_actions.add_parser("status", help="读取 Skill 列表、脚本和待办")
+    skills_run = skills_actions.add_parser("run", help="复用正式 skill_use run 执行已批准脚本")
+    skills_run.add_argument("skill_name")
+    skills_run.add_argument("resource_name")
+    skills_run.add_argument("--input-file", help="UTF-8 stdin 内容文件；使用凭证引用，不要写真实密钥")
+    skills_run.add_argument("--timeout-seconds", type=int, default=30)
+    skills_propose = skills_actions.add_parser("propose", help="提交正式注册或变更提案，仍需聊天 UI 人工批准")
+    skills_propose.add_argument("operation", choices=("register", "edit"))
+    skills_propose.add_argument("--payload-file", required=True, help="包含正式工具参数的 JSON 文件")
+
     logs = commands.add_parser("logs", help="读取应用诊断日志")
     logs_actions = logs.add_subparsers(dest="action", required=True)
     tail = logs_actions.add_parser("tail", help="读取日志尾部")
@@ -333,6 +346,19 @@ def bridge_command(args: argparse.Namespace) -> tuple[str, dict[str, object], fl
         return "__local.inspect.all", {}, None
     if args.group == "credentials":
         return "credentials.list", {}, None
+    if args.group == "skills":
+        if args.action == "status":
+            return "skills.status", {}, None
+        if args.action == "propose":
+            payload = json.loads(Path(args.payload_file).read_text(encoding="utf-8-sig"))
+            if not isinstance(payload, dict):
+                raise CliError("Skill 参数必须是 JSON 对象")
+            return "skills.tool", {"operation": f"skill.{args.operation}", "payload": payload}, None
+        payload = {"skill_name": args.skill_name, "resource_name": args.resource_name,
+                   "mode": "run", "timeout_seconds": args.timeout_seconds}
+        if args.input_file:
+            payload["input"] = Path(args.input_file).read_text(encoding="utf-8-sig")
+        return "skills.tool", {"operation": "skill.use", "payload": payload}, float(args.timeout_seconds + 15)
     if args.group == "logs":
         return f"__local.logs.{args.action}", {key: value for key, value in vars(args).items() if key in {"lines", "pattern"}}, None
     if args.group == "key":

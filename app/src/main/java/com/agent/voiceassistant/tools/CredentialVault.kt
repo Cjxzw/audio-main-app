@@ -79,6 +79,12 @@ class CredentialVault(context: Context, private val now: () -> Long = System::cu
         require(CredentialPolicy.allows(url, record.allowedUrls)) { "URL 不在凭证 ${record.name} 的允许范围内" }
         field.value
     }
+
+    /** Trusted Skill scripts may resolve a credential without an HTTP URL context. */
+    fun resolveForScript(token: String): String = access { records ->
+        val (_, field) = find(records, token) ?: error("凭证引用不存在或已到期：$token")
+        field.value
+    }
     fun save(record: VaultCredential) = access { records ->
         require(record.name.isNotBlank()) { "请填写凭证名称" }
         require(record.fields.any { !it.archived }) { "凭证至少需要一个键值" }

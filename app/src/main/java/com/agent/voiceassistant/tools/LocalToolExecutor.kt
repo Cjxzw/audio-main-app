@@ -2,6 +2,7 @@ package com.agent.voiceassistant.tools
 
 import com.agent.voiceassistant.agent.AgentAction
 import com.agent.voiceassistant.agent.runtime.SkillRegistry
+import com.agent.voiceassistant.agent.runtime.SkillApprovalStore
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.data.ConversationStore
 import kotlinx.serialization.json.JsonArray
@@ -20,6 +21,7 @@ class LocalToolExecutor(
     private val executionEnv: AndroidExecutionEnv? = null,
     private val codeGraph: CodeGraphIndex? = null,
     private val skillRegistry: SkillRegistry? = null,
+    private val skillApprovals: SkillApprovalStore? = null,
 ) {
 
     data class ToolResult(
@@ -32,9 +34,23 @@ class LocalToolExecutor(
 
     suspend fun execute(action: AgentAction): ToolResult {
         Timber.i("LocalToolExecutor: execute ${action.actionType}")
-        if (action.actionType in setOf("write", "exec", "memory.edit", "memory.create", "note.create", "skill.create", "skill.edit", "skill.register") &&
+        if (action.actionType in setOf("skill.create", "skill.edit", "skill.register")) {
+            val approvals = skillApprovals ?: return unavailable(action.actionType)
+            return runCatching { approvals.propose(action.actionType, action.payload, store.currentConversationId) }.fold(
+                onSuccess = { request ->
+                    val message = store.addMessageToConversation(request.conversationId, "system", request.summary, llmVisible = false)
+                    com.agent.voiceassistant.service.EventBus.emitChatMessage(com.agent.voiceassistant.ui.ChatMessage(
+                        com.agent.voiceassistant.ui.ChatRole.SYSTEM, request.summary, messageId = message.id, conversationId = request.conversationId,
+                    ))
+                    ToolResult(action.actionType, "等待用户确认：${request.name}",
+                        "status=pending request_id=${request.id}\n${request.summary}\n尚未生效。用户需主动选择批准、拒绝或再议；不要自行批准、重试或宣称完成。", true)
+                },
+                onFailure = { error -> failed(action.actionType, "Skill 请求未提交", error) },
+            )
+        }
+        if (action.actionType in setOf("exec", "memory.edit", "memory.create", "note.create") &&
             CredentialPolicy.anyReference.containsMatchIn(action.payload.toString())) {
-            return ToolResult(action.actionType, "此工具不接受凭证引用", "凭证引用只能交给 http_request；不能写入文件、记忆、Skill 或命令。", false, false)
+                return ToolResult(action.actionType, "此工具不接受凭证引用", "此工具不支持凭证引用；引用可写入工作区和 Skill，并由 http_request 或 skill_use 的 run 模式解析。", false, false)
         }
         return when (action.actionType) {
             "describe_credentials" -> ToolResult("describe_credentials", "查询凭证", executionEnv?.describeCredentials(action.payload.string("query").orEmpty(), action.payload.int("limit") ?: 10) ?: "凭证存储不可用", false)
@@ -54,9 +70,6 @@ class LocalToolExecutor(
             "code.graph.search" -> codeGraphSearch(action.payload)
             "code.graph.explain" -> codeGraphExplain(action.payload)
             "skill.use" -> useSkill(action.payload)
-            "skill.create" -> createSkill(action.payload)
-            "skill.edit" -> editSkill(action.payload)
-            "skill.register" -> registerSkill(action.payload)
             else -> ToolResult(
                 actionType = action.actionType,
                 displayText = "未知本地工具：${action.actionType}",
@@ -618,79 +631,52 @@ class LocalToolExecutor(
         }
     }
 
-    private fun registerSkill(payload: JsonObject): ToolResult {
-        val env = executionEnv ?: return unavailable("skill.register")
-        val registry = skillRegistry ?: return unavailable("skill.register")
-        val sourcePath = payload.string("source_path")
-            ?: return invalidArguments("skill.register", "缺少 source_path")
-        if (sourcePath != "/workspace" && !sourcePath.startsWith("/workspace/")) {
-            return invalidArguments("skill.register", "source_path 必须是 /workspace 下的虚拟路径")
-        }
-        val name = payload.string("name")
-            ?: return invalidArguments("skill.register", "缺少 name")
-        val description = payload.string("description")
-            ?: return invalidArguments("skill.register", "缺少 description")
-        val coreFile = payload.string("core_file") ?: "SKILL.md"
-        val compatibilityNotes = payload.string("compatibility_notes")
-            ?: return invalidArguments("skill.register", "缺少 compatibility_notes")
-        val reviewedFiles = payload.stringList("reviewed_files")
-        if (reviewedFiles.isEmpty()) return invalidArguments("skill.register", "缺少 reviewed_files")
-        return runCatching {
-            registry.registerFromWorkspace(
-                workspaceRoot = env.workspaceRoot,
-                sourcePath = sourcePath,
-                name = name,
-                description = description,
-                coreFile = coreFile,
-                compatibilityNotes = compatibilityNotes,
-                reviewedFiles = reviewedFiles,
-            )
-        }.fold(
-            onSuccess = { registration ->
-                ToolResult(
-                    actionType = "skill.register",
-                    displayText = "注册 Skill：${registration.skill.name}",
-                    contextText = buildString {
-                        appendLine("Skill 注册成功：${registration.skill.name}")
-                        appendLine("路径：${registration.skill.virtualPath}")
-                        appendLine("兼容性说明：${registration.compatibilityNotes}")
-                        append("该 Skill 以知识和流程说明方式运行，不保证原项目的脚本能力可用。")
-                    },
-                    shouldAskLlm = true,
-                )
-            },
-            onFailure = { error -> registerSkillFailure(error) },
-        )
-    }
-
-    private fun registerSkillFailure(error: Throwable): ToolResult {
-        val detail = error.message ?: error.javaClass.simpleName
-        val guidance = if (detail.startsWith("Skill 名称已存在")) {
-            "请不要改名绕过冲突，也不要尝试覆盖。先引导用户到“设置 → 上下文管理 → 技能”手动删除旧 Skill，用户确认删除后再重新调用 skill_register。"
-        } else {
-            "请根据错误修正 /workspace 中的候选文件后再重试；不得直接修改已注册 Skill。"
-        }
-        return ToolResult(
-            actionType = "skill.register",
-            displayText = "Skill 注册失败：$detail",
-            contextText = "Skill 注册失败：$detail\n$guidance",
-            shouldAskLlm = true,
-            success = false,
-        )
-    }
-
-    private fun useSkill(payload: JsonObject): ToolResult {
+    private suspend fun useSkill(payload: JsonObject): ToolResult {
         val registry = skillRegistry ?: return unavailable("skill.use")
         val name = payload.string("skill_name") ?: return invalidArguments("skill.use", "缺少 skill_name")
+        val mode = payload.string("mode")?.lowercase() ?: "load"
         val resource = payload.string("resource_name")
-        if (resource.equals("SKILL.md", ignoreCase = true)) {
-            return ToolResult(
-                actionType = "skill.use",
-                displayText = "Skill 核心说明已加载",
-                contextText = "SKILL.md 已在首次加载时完整提供，无需再次加载。请直接遵循已加载内容继续当前任务。",
-                shouldAskLlm = true,
+        if (mode == "run") {
+            val scriptName = resource ?: return invalidArguments("skill.use", "run 模式缺少 resource_name")
+            val script = runCatching { registry.script(name, scriptName) }.getOrElse { error ->
+                return failed("skill.use", "Skill 脚本不可执行", error)
+            }
+            val env = executionEnv ?: return unavailable("skill.use")
+            return runCatching {
+                env.runSkillScript(
+                    script = script,
+                    input = payload.rawString("input"),
+                    timeoutSeconds = payload.int("timeout_seconds") ?: 120,
+                )
+            }.fold(
+                onSuccess = { result ->
+                    val status = when {
+                        result.timedOut -> "超时"
+                        result.exitCode == 0 -> "完成"
+                        else -> "退出码 ${result.exitCode}"
+                    }
+                    ToolResult(
+                        actionType = "skill.use",
+                        displayText = "运行 Skill：${result.skillName} · $status",
+                        contextText = buildString {
+                            appendLine("Skill：${result.skillName}")
+                            appendLine("脚本：${result.resource}")
+                            appendLine("版本：${result.version}")
+                            appendLine("状态：$status")
+                            append(result.output.ifBlank { "[无输出]" })
+                            if (result.truncated) append("\n[输出已截断]")
+                        },
+                        shouldAskLlm = true,
+                        success = !result.timedOut && result.exitCode == 0,
+                    )
+                },
+                onFailure = { error ->
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    failed("skill.use", "Skill 脚本运行失败", error)
+                },
             )
         }
+        if (mode != "load") return invalidArguments("skill.use", "mode 只能是 load 或 run")
         return runCatching { registry.use(name, resource) }.fold(
             onSuccess = { loaded ->
                 val attachments = loaded.resources.filter { it.relativePath != "SKILL.md" }
@@ -700,6 +686,9 @@ class LocalToolExecutor(
                     contextText = buildString {
                         appendLine("Skill：${loaded.skill.name}")
                         appendLine("skill_id=${loaded.skill.id} version=${loaded.skill.version} residency=${loaded.skill.residency}")
+                        loaded.resources.firstOrNull { it.relativePath == loaded.resourceName }?.let {
+                            appendLine("resource_sha256=${it.sha256}")
+                        }
                         if (resource == null && attachments.isEmpty()) {
                             appendLine("状态：该 Skill 为单文件 Skill，已全部加载。")
                         } else {
@@ -720,47 +709,6 @@ class LocalToolExecutor(
                 )
             },
             onFailure = { error -> failed("skill.use", "Skill 加载失败", error) },
-        )
-    }
-
-    private fun createSkill(payload: JsonObject): ToolResult {
-        val registry = skillRegistry ?: return unavailable("skill.create")
-        val name = payload.string("skill_name") ?: return invalidArguments("skill.create", "缺少 skill_name")
-        val description = payload.string("description") ?: return invalidArguments("skill.create", "缺少 description")
-        val content = payload.rawString("content") ?: return invalidArguments("skill.create", "缺少 content")
-        return runCatching { registry.create(name, description, content) }.fold(
-            onSuccess = { skill -> ToolResult(
-                "skill.create",
-                "创建 Skill：${skill.name}",
-                "Skill '${skill.name}' 已创建，residency=CONVERSATION，version=${skill.version}。需要使用时请调用 skill_use。",
-                true,
-            ) },
-            onFailure = { error -> failed("skill.create", "Skill 创建失败", error) },
-        )
-    }
-
-    private fun editSkill(payload: JsonObject): ToolResult {
-        val registry = skillRegistry ?: return unavailable("skill.edit")
-        val name = payload.string("skill_name") ?: return invalidArguments("skill.edit", "缺少 skill_name")
-        val operation = payload.string("operation") ?: return invalidArguments("skill.edit", "缺少 operation")
-        val expected = payload.string("expected_sha256") ?: return invalidArguments("skill.edit", "缺少 expected_sha256")
-        return runCatching {
-            registry.edit(
-                skillName = name,
-                operation = operation,
-                resourceName = payload.string("resource_name") ?: "SKILL.md",
-                expectedSha256 = expected,
-                oldText = payload.rawString("old_text"),
-                newText = payload.rawString("new_text"),
-            )
-        }.fold(
-            onSuccess = { skill -> ToolResult(
-                "skill.edit",
-                "编辑 Skill：${skill.name}",
-                "Skill '${skill.name}' 已更新，旧会话快照已失效，version=${skill.version}。继续使用前请重新调用 skill_use。",
-                true,
-            ) },
-            onFailure = { error -> failed("skill.edit", "Skill 编辑失败", error) },
         )
     }
 

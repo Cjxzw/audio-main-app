@@ -50,6 +50,9 @@ agent sleep
 turn run TEXT [--turn-timeout SECONDS]
 realtime start|stop
 credentials list
+skills status
+skills propose register|edit --payload-file FILE
+skills run SKILL_NAME scripts/entry.sh [--input-file FILE] [--timeout-seconds SECONDS]
 inspect all|runtime
 logs tail|grep PATTERN|snapshot
 http request URL [--method METHOD] [--body BODY] [--credential-profile PROFILE] [--download-to /workspace/path]
@@ -60,3 +63,5 @@ http request URL [--method METHOD] [--body BODY] [--credential-profile PROFILE] 
 `status` 同时返回当前会话的上下文用量、最近活动时间、非活跃时长，以及会话生命周期的阈值设置；`conversation list` 包含各会话的域和上下文用量，可配合 `logs grep conversation.cold_rotated` 验证冷会话自动新建。后台每分钟检查一次，文字输入和启动 Realtime 前也会补查；执行中、等待恢复的任务和正在进行的 Realtime 通话不会被自动切走。
 
 `credentials list` 返回新版凭证和旧版 profile 的元数据与引用（默认最多各 10 条），不返回真实值。新版引用形如 `{{cred:凭证UID.字段UID}}`，可直接放在 `http request` 的 Header 或 body 中；旧版 `{{credential.profile.key}}` 继续搭配 `--credential-profile` 使用。URL 本身不能包含凭证引用，引用过期或删除后会失败。大响应超过展示限制时，App 会自动保存到 `/workspace/.http-cache/`，文件最多保存 128 MiB，缓存保留 3 天。指定 `--download-to` 时以流式方式写入持久文件，路径必须位于 `/workspace`，并返回文件大小、SHA-256 和是否达到上限。当前自动缓存与下载保存原始响应，不做脱敏。
+
+`skills status` 查看 Skill、脚本资源、唯一待办和原生路径库；`skills propose` 复用正式注册/变更工具，仍需聊天确认；`skills run` 复用正式 `skill_use(mode=run)`。没有 CLI 批准命令。完整协议和环境边界见 [Skill 脚本](skill-scripts.md)。

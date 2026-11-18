@@ -94,6 +94,8 @@ class MainActivity : AppCompatActivity() {
     private var agentListening = false
     private var agentRunning = false
     private var pendingLegacyShareUris: List<Uri> = emptyList()
+    private var skillApprovalDialog: androidx.appcompat.app.AlertDialog? = null
+    private var skillApprovalDialogId: String? = null
     private var chatTailFollowPending = false
     private var chatTailFollowEnabled = true
 
@@ -349,6 +351,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         observeEventBus()
+        homeBinding.btnSkillPending.setOnClickListener { showSkillApproval() }
+        lifecycleScope.launch {
+            com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this@MainActivity).pending.collectLatest { request ->
+                homeBinding.skillPendingContainer.visibility = if (request?.deferred == true) View.VISIBLE else View.GONE
+                if (request == null || request.deferred) {
+                    skillApprovalDialog?.dismiss()
+                    skillApprovalDialog = null
+                    skillApprovalDialogId = null
+                } else if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) showSkillApproval()
+            }
+        }
         handleIncomingIntent(intent)
     }
 
@@ -382,6 +395,37 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         chatAdapter.refreshCredentials()
         refreshConversations()
+        val request = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this).pending.value
+        if (request != null && !request.deferred) showSkillApproval()
+    }
+
+    private fun showSkillApproval() {
+        val request = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this).pending.value ?: return
+        if (skillApprovalDialog?.isShowing == true && skillApprovalDialogId == request.id) return
+        if (request.phase != "pending") return
+        skillApprovalDialog?.dismiss()
+        skillApprovalDialogId = request.id
+        val dialog = MaterialAlertDialogBuilder(this, R.style.Theme_VoiceAssistant_PreferenceDialog)
+            .setTitle("Skill 注册/变更确认")
+            .setMessage(request.summary)
+            .setPositiveButton("批准", null)
+            .setNegativeButton("拒绝", null)
+            .setNeutralButton("再议", null)
+            .create()
+        skillApprovalDialog = dialog
+        dialog.setOnShowListener {
+            fun decide(status: String) {
+                VoiceAgentService.skillDecision(this, request.id, status)
+                // Re-deferring an already deferred request does not emit a new StateFlow value.
+                if (status == "deferred") dialog.dismiss()
+            }
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener { decide("approved") }
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE).setOnClickListener { decide("rejected") }
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener { decide("deferred") }
+        }
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setOnCancelListener { VoiceAgentService.skillDecision(this, request.id, "deferred") }
+        dialog.show()
     }
 
     private fun sendTextInput() {

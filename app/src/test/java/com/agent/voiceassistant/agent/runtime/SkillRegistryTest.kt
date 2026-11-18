@@ -75,29 +75,29 @@ class SkillRegistryTest {
     }
 
     @Test
-    fun `registration rejects script dependent skill`() {
+    fun `registration accepts shell script skill`() {
         val runtime = Files.createTempDirectory("skill-script").toFile()
         val workspace = runtime.resolve("workspace").apply { mkdirs() }
         val candidate = workspace.resolve("scripted").apply { mkdirs() }
         candidate.resolve("SKILL.md").writeText("# Scripted")
-        candidate.resolve("run.py").writeText("print('hello')")
+        candidate.resolve("run.sh").writeText("#!/system/bin/sh\nprintf '{\\\"ok\\\":true}'")
         val registry = SkillRegistry(
             runtime.resolve("skills"),
             runtime.resolve("skills-disabled"),
             runtime.resolve("skills-deleted"),
         )
 
-        assertThrows(IllegalArgumentException::class.java) {
-            registry.registerFromWorkspace(
-                workspace,
-                "/workspace/scripted",
-                "scripted",
-                "requires python",
-                "SKILL.md",
-                "依赖 Python。",
-                listOf("SKILL.md", "run.py"),
-            )
-        }
+        val result = registry.registerFromWorkspace(
+            workspace,
+            "/workspace/scripted",
+            "scripted",
+            "runs a shell script",
+            "SKILL.md",
+            "trusted shell script",
+            listOf("SKILL.md", "run.sh"),
+        )
+        assertEquals("scripted", result.skill.name)
+        assertEquals("run.sh", registry.script("scripted", "run.sh").resourceName)
     }
 
     @Test

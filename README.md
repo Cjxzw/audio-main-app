@@ -16,12 +16,14 @@ Hanwo（喊我）是 Shroudway 的 Android 语音 Agent 主应用。它把手机
 - 对话文本中的凭证自动收纳，以及 HTTP 工具按引用使用凭证
 - HTTP 大响应自动缓存，以及流式下载到工作区
 - Debug 调试 CLI
+- 可信 Skill Shell 脚本、聊天确认注册与变更
 
 ## 开发环境
 
 - Windows 或 macOS/Linux
 - JDK 17
 - Android SDK 34
+- Android NDK 27.2.12479018、CMake 3.22.1（构建脚本路径映射库）
 - Android Studio 或 Gradle 命令行
 - Android 8.0 及以上设备
 
@@ -60,6 +62,7 @@ Debug 调试 CLI 位于 `tools/hanwo-dev`，完整用法和安全边界见[调�
 - [开发日志](开发日志.md)：架构、技术细节、每次改动、测试验证、实机记录和已知边界，是多地接力开发的核心文档。
 - [Development Status](docs/development-status.md)：当前能力和限制的简要状态。
 - [Agent 调试 CLI](docs/agent-debug-cli.md)：通过 ADB 进行状态、配置、会话和 Agent 回合诊断。
+- [Skill 脚本](docs/skill-scripts.md)：脚本运行、凭证引用与聊天确认流程。
 
 ## 许可证
 

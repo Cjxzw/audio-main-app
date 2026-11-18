@@ -52,19 +52,35 @@ class SkillRegistry(
         val resources: List<SkillFile>,
     )
 
+    data class ScriptResource(
+        val skill: Skill,
+        val resourceName: String,
+        val file: File,
+        val root: File,
+        val sha256: String,
+    )
+
     init {
         skillsRoot.mkdirs()
         disabledSkillsRoot.mkdirs()
         systemSkillsRoot.mkdirs()
+        listOf(skillsRoot, disabledSkillsRoot).forEach { root ->
+            root.listFiles().orEmpty().filter { it.isDirectory && it.name.startsWith(".backup-") }.forEach { backup ->
+                val target = File(root, backup.name.removePrefix(".backup-"))
+                if (target.exists()) backup.deleteRecursively() else check(backup.renameTo(target)) { "无法恢复 Skill 发布备份" }
+            }
+        }
     }
 
     fun list(): List<Skill> = listAll().filter(Skill::enabled)
 
+    fun findByName(name: String): Skill? = listAll().singleOrNull { normalizeName(it.name) == normalizeName(name) }
+
     fun listAll(): List<Skill> = buildList {
-        skillsRoot.listFiles().orEmpty().filter(File::isDirectory).mapNotNullTo(this) {
+        skillsRoot.listFiles().orEmpty().filter { it.isDirectory && !it.name.startsWith('.') }.mapNotNullTo(this) {
             loadSkill(it, enabled = true)
         }
-        disabledSkillsRoot.listFiles().orEmpty().filter(File::isDirectory).mapNotNullTo(this) {
+        disabledSkillsRoot.listFiles().orEmpty().filter { it.isDirectory && !it.name.startsWith('.') }.mapNotNullTo(this) {
             loadSkill(it, enabled = false)
         }
         systemSkillsRoot.listFiles().orEmpty().filter(File::isDirectory).mapNotNullTo(this) {
@@ -231,6 +247,56 @@ class SkillRegistry(
         return UseResult(skill, requested, file.readText(Charsets.UTF_8), files(skill.id))
     }
 
+    fun script(skillName: String, resourceName: String): ScriptResource {
+        val normalized = normalizeName(skillName)
+        val skill = listAll().singleOrNull { normalizeName(it.name) == normalized }
+            ?: error("没有找到名称为 '$skillName' 的 Skill")
+        require(skill.enabled) { "Skill '${skill.name}' 已停用" }
+        val resource = resourceName.trim().replace('\\', '/')
+        require(resource.isNotBlank() && !resource.startsWith('/') && ".." !in resource.split('/')) { "脚本必须使用 Skill 内的相对路径" }
+        require(resource.lowercase(Locale.ROOT).endsWith(".sh")) { "run 模式只能执行 .sh 脚本" }
+        val root = skillRoot(skill).canonicalFile
+        val file = File(root, resource).canonicalFile
+        require(file.toPath().startsWith(root.toPath()) && file.isFile) { "Skill 脚本不存在" }
+        require(!Files.isSymbolicLink(file.toPath())) { "不支持执行符号链接脚本" }
+        return ScriptResource(skill, resource, file, root, sha256(file.readBytes()))
+    }
+
+    fun exportTo(id: String, target: File): Skill {
+        val skill = requireSkill(id)
+        skillRoot(skill).copyRecursively(target, overwrite = false)
+        return skill
+    }
+
+    /** Publish an already reviewed complete package; old content is recoverable until rename succeeds. */
+    fun publish(id: String, candidate: File, expectedVersion: String?, expectedDigest: String = SkillApprovalStore.hashTree(candidate)): Skill {
+        val current = listAll().firstOrNull { it.id == id }
+        require(current?.version == expectedVersion) { "Skill 已变化，请拒绝此请求并重新提交变更" }
+        require(current?.system != true) { "系统 Skill 不能编辑" }
+        val preview = loadSkill(candidate, enabled = true) ?: error("候选 Skill 无法解析")
+        requireUniqueName(preview.name, id)
+        val parent = if (current?.enabled == false) disabledSkillsRoot else skillsRoot
+        val target = File(parent, requireSafeId(id))
+        val staging = File(parent, ".publish-$id")
+        val backup = File(parent, ".backup-$id")
+        require(!backup.exists()) { "Skill 存在未恢复的发布备份" }
+        staging.deleteRecursively()
+        candidate.copyRecursively(staging)
+        try {
+            require(SkillApprovalStore.hashTree(staging) == expectedDigest) { "候选文件在发布时发生变化，请拒绝后重新提交" }
+            require(listAll().firstOrNull { it.id == id }?.version == expectedVersion) { "Skill 在发布时发生变化，请重新提交" }
+            if (target.exists()) require(target.renameTo(backup)) { "无法备份旧 Skill" }
+            if (!staging.renameTo(target)) {
+                if (backup.exists()) backup.renameTo(target)
+                error("无法发布 Skill")
+            }
+            markModified(id)
+            removeDeletedTombstone(id)
+            backup.deleteRecursively()
+            return requireSkill(id)
+        } finally { staging.deleteRecursively() }
+    }
+
     fun edit(
         skillName: String,
         operation: String,
@@ -372,10 +438,7 @@ class SkillRegistry(
         require(files.size <= MAX_FILES) { "Skill 文件过多，最多 $MAX_FILES 个" }
         require(files.none { Files.isSymbolicLink(it.toPath()) }) { "Skill 不允许包含符号链接" }
         require(files.sumOf(File::length) <= MAX_TOTAL_BYTES) { "Skill 总大小超过限制" }
-        val scripts = files.filter { it.extension.lowercase(Locale.ROOT) in SCRIPT_EXTENSIONS }
-        require(scripts.isEmpty()) {
-            "该 Skill 包含不受支持的脚本：${scripts.joinToString { it.name }}。请先改写为说明流程或内置工具调用。"
-        }
+        require(files.none { it.extension.lowercase(Locale.ROOT) in setOf("py", "jar", "class", "dex", "so", "exe", "bat", "cmd", "ps1") }) { "当前只支持 sh 脚本运行时" }
         files.forEach { file ->
             require(file.length() <= MAX_FILE_BYTES) { "文件过大：${file.name}" }
             val bytes = file.readBytes()
@@ -537,10 +600,9 @@ class SkillRegistry(
         const val MAX_FILE_BYTES = 512 * 1_024L
         const val MAX_CORE_BYTES = 256 * 1_024
         const val MAX_TOTAL_BYTES = 2 * 1_024 * 1_024L
-        val SCRIPT_EXTENSIONS = setOf("py", "sh", "js", "ts", "jar", "class", "dex", "so", "exe", "bat", "cmd", "ps1")
         val EDITABLE_EXTENSIONS = setOf(
             "md", "markdown", "txt", "json", "xml", "yaml", "yml", "csv", "html", "htm",
-            "kt", "java", "js", "ts", "css", "properties", "toml", "ini",
+            "kt", "java", "js", "ts", "css", "properties", "toml", "ini", "sh",
         )
     }
 }

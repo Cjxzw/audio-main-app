@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Base64
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.workspace.WorkspaceTrashRepository
+import com.agent.voiceassistant.agent.runtime.SkillRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -63,6 +64,16 @@ class AndroidExecutionEnv(
     data class ExecResult(
         val command: String,
         val cwd: String,
+        val exitCode: Int?,
+        val output: String,
+        val timedOut: Boolean,
+        val truncated: Boolean,
+    )
+
+    data class ScriptResult(
+        val skillName: String,
+        val resource: String,
+        val version: String,
         val exitCode: Int?,
         val output: String,
         val timedOut: Boolean,
@@ -231,7 +242,7 @@ class AndroidExecutionEnv(
         endLine: Int? = null,
         expectedSha256: String? = null,
     ): WriteResult {
-        require(!CredentialPolicy.anyReference.containsMatchIn(path + content)) { "凭证引用不能写入文件，请通过 http_request 使用" }
+        require(!CredentialPolicy.anyReference.containsMatchIn(path)) { "路径不能包含凭证引用" }
         val file = pathResolver.resolve(path, write = true)
         file.parentFile?.mkdirs()
         val normalizedMode = mode.lowercase()
@@ -333,6 +344,127 @@ class AndroidExecutionEnv(
                 if (process.isAlive) process.destroyForcibly()
             }
         }
+    }
+
+    suspend fun runSkillScript(
+        script: SkillRegistry.ScriptResource,
+        input: String? = null,
+        timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
+    ): ScriptResult = withContext(Dispatchers.IO) {
+        val runRoot = File(appContext.cacheDir, "skill-runs/${UUID.randomUUID()}").canonicalFile
+        val copiedSkill = File(runRoot, "skill").canonicalFile
+        val entry = File(copiedSkill, script.resourceName).canonicalFile
+        try {
+            require(entry.toPath().startsWith(copiedSkill.toPath()))
+            script.root.copyRecursively(copiedSkill, overwrite = false)
+            require(com.agent.voiceassistant.agent.runtime.SkillApprovalStore.hashTree(copiedSkill) == script.skill.version) { "Skill 在启动时发生变化，请重新读取后运行" }
+            val secrets = linkedMapOf<String, String>()
+            copiedSkill.walkTopDown().filter(File::isFile).forEachIndexed { index, file ->
+                if (file.extension.equals("sh", ignoreCase = true)) {
+                    val original = file.readText(Charsets.UTF_8).removePrefix("\uFEFF").replace("\r\n", "\n")
+                    val expanded = ScriptCredentials.expand(original, "HANWO_CREDENTIAL_${index}_", ::resolveScriptCredential)
+                    secrets.putAll(expanded.environment)
+                    file.writeText(expanded.source, Charsets.UTF_8)
+                }
+            }
+            require(entry.isFile) { "脚本快照不存在：${script.resourceName}" }
+              val expandedInput = input?.let(::expandScriptInput)
+            val pathBridge = File(appContext.applicationInfo.nativeLibraryDir, "libhanwo_paths.so")
+            require(pathBridge.isFile) { "脚本路径解析库缺失，请重新安装完整 APK" }
+            val launcher = File(runRoot, "launch.sh").apply {
+                writeText("test -d /workspace || { echo 'HANWO_PATH_MAPPING_UNAVAILABLE' >&2; exit 125; }\nexec /system/bin/sh \"\$1\"\n")
+            }
+            val process = ProcessBuilder("/system/bin/sh", launcher.absolutePath, entry.absolutePath)
+                .directory(copiedSkill)
+                .redirectErrorStream(true)
+                .also { builder ->
+                    builder.environment().clear()
+                    builder.environment()["PATH"] = "/system/bin:/system/xbin"
+                    builder.environment()["HANWO_WORKSPACE"] = workspaceRoot.canonicalPath
+                    builder.environment()["HANWO_SOURCE"] = sourceRoot.canonicalPath
+                    builder.environment()["HANWO_LOGS"] = logsRoot.canonicalPath
+                    builder.environment()["HANWO_SKILL_ROOT"] = copiedSkill.canonicalPath
+                    builder.environment()["LD_PRELOAD"] = pathBridge.absolutePath
+                    builder.environment().putAll(secrets)
+                }
+                .start()
+            try {
+                return@withContext withContext(Dispatchers.IO) {
+                    coroutineScope {
+                        val output = async(Dispatchers.IO) { readScriptOutput(process) }
+                        val writer = async(Dispatchers.IO) {
+                              try {
+                                  process.outputStream.bufferedWriter(Charsets.UTF_8).use { stream ->
+                                      if (expandedInput != null) stream.write(expandedInput)
+                                  }
+                              } catch (_: java.io.IOException) {
+                                  // A script may exit without consuming stdin; retain its output and exit code.
+                              }
+                        }
+                        val completed = withTimeoutOrNull(timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS) * 1_000L) {
+                            while (process.isAlive) delay(40)
+                            writer.await()
+                            true
+                        } ?: false
+                        if (!completed) process.destroyForcibly()
+                        val captured = output.await()
+                        ScriptResult(
+                            skillName = script.skill.name,
+                            resource = script.resourceName,
+                            version = script.skill.version,
+                            exitCode = if (completed) process.exitValue() else null,
+                            output = captured.first,
+                            timedOut = !completed,
+                            truncated = captured.second,
+                        )
+                    }
+                }
+            } finally {
+                if (process.isAlive) process.destroyForcibly()
+                process.inputStream.close()
+                process.outputStream.close()
+            }
+        } finally {
+            runRoot.deleteRecursively()
+        }
+    }
+
+    private fun resolveScriptCredential(token: String): String =
+        if (token.startsWith("{{cred:")) credentialVault.resolveForScript(token)
+        else {
+            val name = token.removePrefix("{{credential.").removeSuffix("}}").substringBeforeLast('.')
+            credentialStore.expandReferences(name, token) ?: error("凭证引用无法解析：$token")
+        }
+
+    private fun expandScriptInput(input: String): String {
+        fun expand(value: String) = CredentialPolicy.anyReference.replace(value) { resolveScriptCredential(it.value) }
+        val parsed = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(input) }.getOrNull() ?: return expand(input)
+        fun visit(value: kotlinx.serialization.json.JsonElement): kotlinx.serialization.json.JsonElement = when (value) {
+            is kotlinx.serialization.json.JsonObject -> kotlinx.serialization.json.JsonObject(value.mapValues { visit(it.value) })
+            is kotlinx.serialization.json.JsonArray -> kotlinx.serialization.json.JsonArray(value.map(::visit))
+            is kotlinx.serialization.json.JsonPrimitive -> if (value.isString) kotlinx.serialization.json.JsonPrimitive(expand(value.content)) else value
+        }
+        return visit(parsed).toString()
+    }
+
+    private suspend fun readScriptOutput(process: Process): Pair<String, Boolean> {
+        val bytes = ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        var truncated = false
+        while (true) {
+            val available = process.inputStream.available()
+            if (available == 0) {
+                if (!process.isAlive) break
+                delay(20)
+                continue
+            }
+            val count = process.inputStream.read(buffer, 0, minOf(buffer.size, available))
+            if (count < 0) break
+            val retained = minOf(count, (MAX_EXEC_OUTPUT_CHARS - bytes.size()).coerceAtLeast(0))
+            bytes.write(buffer, 0, retained)
+            if (retained < count) truncated = true
+        }
+        return bytes.toString("UTF-8") to truncated
     }
 
     private fun writeTextAtomically(file: File, content: String) {

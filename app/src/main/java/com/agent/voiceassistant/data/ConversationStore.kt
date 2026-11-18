@@ -250,6 +250,16 @@ class ConversationStore(context: Context) {
         state.sessions.firstOrNull { it.id == conversationId }?.pendingCredentialNotices?.toList().orEmpty()
     }
 
+    /** Durable, idempotent user-decision delivery, also injected into a running loop. */
+    fun queueSkillDecision(conversationId: String, requestId: String, status: String, text: String) = synchronized(lock) {
+        val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized
+        val id = "skill-decision-$requestId-$status"
+        if (session.messages.any { it.id == id } || session.pendingCredentialNotices.any { it.id == id }) return@synchronized
+        val message = StoredMessage(id = id, role = "user", content = "[Skill 用户确认结果] $text", timestamp = System.currentTimeMillis())
+        session.pendingCredentialNotices += message
+        try { persistLocked(strict = true) } catch (error: Exception) { session.pendingCredentialNotices.remove(message); throw error }
+    }
+
     /** Acknowledge only after a model-context checkpoint contains the notice. */
     fun acknowledgeCredentialNotices(conversationId: String, contents: Set<String>): List<ChatMessage> = synchronized(lock) {
         val session = state.sessions.firstOrNull { it.id == conversationId } ?: return@synchronized emptyList()

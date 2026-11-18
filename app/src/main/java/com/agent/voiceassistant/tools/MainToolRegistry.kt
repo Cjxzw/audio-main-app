@@ -78,6 +78,7 @@ class MainToolRegistry(
             codeGraphSearch(),
             codeGraphExplain(),
             skillRegister(),
+            skillEdit(),
             skillUse(),
             voiceReply(),
             singSong(),
@@ -95,6 +96,9 @@ class MainToolRegistry(
 
     fun isAgentSleep(call: CloudSpeechClient.ToolCall): Boolean =
         call.name == TOOL_AGENT_SLEEP
+
+    fun isSkillRead(call: CloudSpeechClient.ToolCall): Boolean =
+        call.name == TOOL_SKILL_USE && parseArguments(call.arguments).text("mode")?.lowercase() != "run"
 
     fun isNativeTool(name: String): Boolean = name in NATIVE_TOOL_NAMES
 
@@ -470,15 +474,33 @@ class MainToolRegistry(
 
     private fun skillUse() = tool(
         name = TOOL_SKILL_USE,
-        description = "按名称加载一个已启用 Skill 的核心说明，并遵循加载结果完成当前任务。支持中文 Skill 名称。",
+        description = "按名称加载或运行一个已启用 Skill。默认 mode=load，只读取 SKILL.md 或指定文本资源；mode=run 时必须明确指定 Skill 内的 .sh 文件，进入脚本执行器。脚本可直接使用 /workspace、/source、/logs 路径并支持凭证引用。",
         required = listOf("skill_name"),
     ) {
         putJsonObject("skill_name") { put("type", "string") }
+        putJsonObject("mode") {
+            put("type", "string")
+            put("enum", buildJsonArray { add(JsonPrimitive("load")); add(JsonPrimitive("run")) })
+            put("description", "load 读取资源；run 执行 Skill 内指定的 .sh 脚本")
+        }
+        putJsonObject("resource_name") {
+            put("type", "string")
+            put("description", "Skill 内相对路径；run 模式必须是 .sh，例如 scripts/check-server.sh")
+        }
+        putJsonObject("input") {
+            put("type", "string")
+            put("description", "run 模式传给脚本 stdin 的 JSON 或文本")
+        }
+        putJsonObject("timeout_seconds") {
+            put("type", "integer")
+            put("minimum", 1)
+            put("maximum", 120)
+        }
     }
 
     private fun skillRegister() = tool(
         name = TOOL_SKILL_REGISTER,
-        description = "仅将已在 /workspace 中完成审查和兼容性转换的全新 Skill 注册到 App；本工具只负责新建，绝不修改、覆盖或删除已有 Skill。调用前必须先完整读取候选目录和核心文件，确认其主要是知识或流程说明；纯脚本型、依赖 Python/Node/二进制运行时且无法改写为 read/write/exec/http_request 流程的 Skill 不得注册。若用户要更新已有 Skill，先把完整新版写入 /workspace 候选目录，再引导用户到“设置 → 上下文管理 → 技能”手动删除旧 Skill，删除完成后才能重新调用本工具注册；遇到同名冲突时不得自动改名、覆盖或删除。注册成功后候选文件会移出工作区。",
+        description = "将 /workspace 中准备好的 Skill 候选提交注册请求。Skill 可以包含 SKILL.md、文本资源和 .sh 脚本；脚本 Skill 注册或变更必须等待用户在聊天中批准后才生效。已有待处理事项时不得创建新的注册或变更请求。",
         required = listOf("source_path", "name", "description", "core_file", "compatibility_notes", "reviewed_files"),
     ) {
         putJsonObject("source_path") {
@@ -507,6 +529,30 @@ class MainToolRegistry(
             put("maxItems", 50)
             put("description", "已经逐项读取或检查的候选目录相对文件路径；必须完整覆盖全部文件")
             put("items", buildJsonObject { put("type", "string") })
+        }
+    }
+
+    private fun skillEdit() = tool(
+        name = TOOL_SKILL_EDIT,
+        description = "提交已注册 Skill 的变更候选，用户在聊天中批准后才生效，无需手动删除旧 Skill。可替换全文、局部文本、新增或删除资源、改名，或使用 replace_from_workspace 发布完整候选目录。已有唯一待办时系统拒绝任何新请求。修改前用 skill_use 读取资源与 SHA-256。",
+        required = listOf("skill_name", "operation", "expected_sha256"),
+    ) {
+            listOf("skill_name", "resource_name", "old_text", "source_path", "name", "description").forEach { key ->
+            putJsonObject(key) { put("type", "string") }
+        }
+            putJsonObject("expected_sha256") {
+                put("type", "string")
+                put("description", "rename/create_resource/replace_from_workspace 使用 skill_use 返回的整个 Skill version；replace_text/replace_resource/delete_resource 使用目标资源 sha256")
+            }
+            putJsonObject("new_text") {
+                put("type", "string")
+                put("description", "rename 时是新名称；create_resource/replace_resource 时是完整文件内容；replace_text 时是替换文本")
+            }
+        putJsonObject("operation") {
+            put("type", "string")
+            put("enum", buildJsonArray {
+                listOf("rename", "create_resource", "replace_text", "replace_resource", "delete_resource", "replace_from_workspace").forEach { add(JsonPrimitive(it)) }
+            })
         }
     }
 

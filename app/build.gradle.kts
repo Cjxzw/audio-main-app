@@ -23,6 +23,7 @@ val generateAgentAssets by tasks.registering(Sync::class) {
             "app/build.gradle.kts",
             "app/proguard-rules.pro",
             "app/src/main/java/**/*.kt",
+            "app/src/main/cpp/**",
             "app/src/main/res/**/*.xml",
             "app/src/main/AndroidManifest.xml",
         )
@@ -47,6 +48,7 @@ val generateAgentAssets by tasks.registering(Sync::class) {
 
 android {
     namespace = "com.agent.voiceassistant"
+    ndkVersion = "27.2.12479018"
     compileSdk = 34
 
     signingConfigs {
@@ -113,6 +115,13 @@ android {
     buildFeatures {
         buildConfig = true
         viewBinding = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     sourceSets {

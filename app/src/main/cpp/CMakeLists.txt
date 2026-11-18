@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(hanwo_paths C)
+add_library(hanwo_paths SHARED virtual_paths.c)
+target_link_libraries(hanwo_paths dl)
+target_compile_options(hanwo_paths PRIVATE -Wall -Wextra -Werror)
