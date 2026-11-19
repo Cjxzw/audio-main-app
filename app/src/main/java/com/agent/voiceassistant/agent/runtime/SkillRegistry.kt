@@ -27,6 +27,7 @@ class SkillRegistry(
         val runtime: Runtime,
         val entry: String?,
         val permissions: Set<String>,
+        val permissionsDeclared: Boolean,
     )
 
     data class Skill(
@@ -42,6 +43,7 @@ class SkillRegistry(
         val runtime: Runtime = Runtime.TEXT,
         val entry: String? = null,
         val permissions: Set<String> = emptySet(),
+        val permissionsDeclared: Boolean = false,
     )
 
     data class Registration(
@@ -572,6 +574,7 @@ class SkillRegistry(
                 runtime = runtimeMetadata.runtime,
                 entry = runtimeMetadata.entry,
                 permissions = runtimeMetadata.permissions,
+                permissionsDeclared = runtimeMetadata.permissionsDeclared,
             )
         }.getOrNull()
     }
@@ -589,7 +592,7 @@ class SkillRegistry(
         appendLine("description: ${description.trim().replace('\n', ' ').take(300)}")
         runtime?.trim()?.takeIf(String::isNotBlank)?.let { appendLine("runtime: " + it.take(32)) }
         entry?.trim()?.takeIf(String::isNotBlank)?.let { appendLine("entry: " + it.take(160)) }
-        permissions?.trim()?.takeIf(String::isNotBlank)?.let { appendLine("permissions: " + it.take(500)) }
+        permissions?.let { appendLine("permissions: " + it.ifBlank { "[]" }) }
         appendLine("---")
         appendLine()
         append(body.trim())
@@ -608,13 +611,44 @@ class SkillRegistry(
         if (lines.firstOrNull()?.trim() != "---") return emptyMap()
         val end = lines.drop(1).indexOfFirst { it.trim() == "---" }
         if (end < 0) return emptyMap()
-        return lines.subList(1, end + 1).mapNotNull { line ->
-            val index = line.indexOf(':')
-            if (index <= 0) return@mapNotNull null
-            val key = line.substring(0, index).trim()
-            val value = line.substring(index + 1).trim().trim('"', '\'')
-            if (key in setOf("name", "description", "runtime", "entry", "permissions")) key to value else null
-        }.toMap()
+        val result = linkedMapOf<String, String>()
+        val header = lines.subList(1, end + 1)
+        var index = 0
+        while (index < header.size) {
+            val line = header[index++]
+            if (line.isBlank() || line.trimStart().startsWith("#")) continue
+            val colon = line.indexOf(':')
+            require(colon > 0 && !line.trimStart().startsWith("-")) { "无效的 Skill front matter 行" }
+            val key = line.substring(0, colon).trim()
+            if (key !in setOf("name", "description", "runtime", "entry", "permissions")) continue
+            require(key !in result) { "重复的 Skill 元数据：$key" }
+            val value = line.substring(colon + 1).trim()
+            if (key != "permissions") {
+                result[key] = value.trim('"', '\'')
+                continue
+            }
+            val raw = if (value.isEmpty()) {
+                val items = mutableListOf<String>()
+                while (index < header.size && (header[index].firstOrNull()?.isWhitespace() == true || header[index].startsWith("- ") || header[index].trim().isEmpty() || header[index].trim().startsWith("#"))) {
+                    val item = header[index++].trim()
+                    if (item.isEmpty() || item.startsWith("#")) continue
+                    require(item.startsWith("- ")) { "permissions 块列表必须使用 - command" }
+                    items += item.removePrefix("- ").trim()
+                }
+                require(items.isNotEmpty()) { "空权限请显式声明 permissions: []" }
+                items.joinToString(",")
+            } else value
+            val list = if (raw.startsWith("[")) {
+                require(raw.endsWith("]")) { "permissions 行内列表缺少 ]" }
+                raw.substring(1, raw.length - 1)
+            } else raw.trim('"', '\'')
+            require(list.none { it in "[]{}" }) { "permissions 必须是命令列表" }
+            val items = if (list.isBlank()) emptyList() else list.split(',').flatMap { it.trim().split(Regex("\\s+")) }
+                .map { it.trim().trim('"', '\'') }
+            require(items.all { it.matches(Regex("[a-z][a-z0-9_]*")) }) { "permissions 包含无效命令" }
+            result[key] = if (items.isEmpty()) "[]" else items.joinToString(", ")
+        }
+        return result
     }
 
     private fun uniqueId(base: String): String {
@@ -662,15 +696,11 @@ class SkillRegistry(
                     ?.relativeTo(directory)?.invariantSeparatorsPath
                 Runtime.TEXT -> null
             }
-        val permissions = metadata["permissions"]
-            ?.split(',', ' ', '\n', '\r', '\t')
-            ?.map(String::trim)
-            ?.filter(String::isNotBlank)
-            ?.toSet()
-            .orEmpty()
+        val permissions = metadata["permissions"]?.takeUnless { it == "[]" }
+            ?.split(',')?.map(String::trim)?.filter(String::isNotBlank)?.toSet().orEmpty()
         val unknownPermissions = permissions - RuntimeCommandRegistry.COMMANDS
         require(unknownPermissions.isEmpty()) {
-            "Skill permissions 包含未知运行时命令：${unknownPermissions.joinToString()}"
+            "Skill permissions 包含未知运行时命令：${unknownPermissions.joinToString()}；允许：${RuntimeCommandRegistry.COMMANDS.sorted().joinToString()}（emit 无需声明）"
         }
         when (runtime) {
             Runtime.QUICKJS -> {
@@ -680,7 +710,7 @@ class SkillRegistry(
             Runtime.LEGACY_SHELL -> requireEntry(directory, entry, setOf("sh"), "Shell")
             Runtime.TEXT -> require(entry == null) { "文本 Skill 不能声明 entry" }
         }
-        return RuntimeMetadata(runtime, entry, permissions)
+        return RuntimeMetadata(runtime, entry, permissions, "permissions" in metadata)
     }
 
     private fun validateRuntimePackage(directory: File, metadata: Map<String, String>) {

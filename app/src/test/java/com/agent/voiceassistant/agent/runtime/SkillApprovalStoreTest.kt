@@ -16,6 +16,17 @@ class SkillApprovalStoreTest {
             put("skill_name", name); put("description", "test flow"); put("content", "# original")
         }
     }
+    @Test fun `old pending policy must be resubmitted and can still be rejected`() {
+        val f = Fixture()
+        val request = f.approvals.propose("skill.create", f.create(), "origin")
+        val state = f.root.resolve("skill-approval.json")
+        state.writeText(state.readText().replace("\"manifestVersion\":2", "\"manifestVersion\":1").replace("\"reviewPolicyVersion\":2", "\"reviewPolicyVersion\":1"))
+        val restarted = SkillApprovalStore(f.root, f.workspace, f.registry)
+        assertThrows(IllegalArgumentException::class.java) { restarted.decide(request.id, "approved") }
+        assertTrue(f.registry.list().isEmpty())
+        restarted.decide(request.id, "rejected")
+        assertNull(restarted.pending.value)
+    }
     @Test fun `new skill is invisible until explicit approval`() {
         val f = Fixture()
         val request = f.approvals.propose("skill.create", f.create(), "origin")

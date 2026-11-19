@@ -14,7 +14,12 @@ class CredentialPolicyTest {
         hits.forEach { assertEquals(it.value, text.substring(it.start, it.end)) }
         assertEquals(listOf("password", "key"), hits.map { it.type })
         assertTrue(SensitiveInputDetector.detect("这是 monkey: banana，keyboard: qwerty").isEmpty())
-        assertEquals("abc!", SensitiveInputDetector.detect("token abc!").single().value)
+        assertTrue(SensitiveInputDetector.detect("token abc!").isEmpty())
+        listOf("这是节省 token 的设计", "讨论 API key 的用法", "token budget", "key value map").forEach {
+            assertTrue(it, SensitiveInputDetector.detect(it).isEmpty())
+        }
+        assertEquals("中文", SensitiveInputDetector.detect("密码是 中文").single().value)
+        assertEquals("abc!", SensitiveInputDetector.detect("token: abc!").single().value)
     }
 
     @Test fun `json expansion preserves structure and form expansion preserves one value`() {

@@ -11,7 +11,7 @@ import java.util.UUID
 object SensitiveInputDetector {
     data class Hit(val start: Int, val end: Int, val value: String, val type: String)
     private val introduction = Regex(
-        "(?i)(密码|口令|密钥|(?<![A-Za-z0-9_])(?:api[ _-]?key|access[ _-]?token|token|secret|password|key)(?![A-Za-z0-9_]))[\\\"'`]?\\s*(?:是|为|[:：=]|[ \t]+)\\s*",
+        "(?i)(密码|口令|密钥|(?<![A-Za-z0-9_])(?:api[ _-]?key|access[ _-]?token|token|secret|password|key)(?![A-Za-z0-9_]))[\\\"'`]?\\s*(?:是|为|[:：=])\\s*",
     )
 
     fun detect(text: String): List<Hit> {

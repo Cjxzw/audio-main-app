@@ -9,6 +9,9 @@
 
 typedef struct {
     JavaVM *vm;
+    JNIEnv *env;
+    jobject thread;
+    jmethodID is_interrupted;
     jobject host;
     jmethodID call_method;
     jmethodID emit_method;
@@ -31,9 +34,48 @@ static JNIEnv *current_env(HostState *state, int *attached) {
     return env;
 }
 
+/* JNI modified UTF-8 is not ECMAScript UTF-8 (notably emoji and NUL).
+ * Cross the boundary with the real UTF-8 charset, including error messages. */
+static char *java_utf8(JNIEnv *env, jstring value) {
+    jclass cls = (*env)->FindClass(env, "java/lang/String");
+    jmethodID method = (*env)->GetMethodID(env, cls, "getBytes", "(Ljava/lang/String;)[B");
+    jstring encoding = (*env)->NewStringUTF(env, "UTF-8");
+    jbyteArray bytes = (jbyteArray)(*env)->CallObjectMethod(env, value, method, encoding);
+    (*env)->DeleteLocalRef(env, encoding);
+    (*env)->DeleteLocalRef(env, cls);
+    if (!bytes || (*env)->ExceptionCheck(env)) return NULL;
+    jsize length = (*env)->GetArrayLength(env, bytes);
+    char *result = malloc((size_t)length + 1);
+    if (result) { (*env)->GetByteArrayRegion(env, bytes, 0, length, (jbyte *)result); result[length] = 0; }
+    (*env)->DeleteLocalRef(env, bytes);
+    return result;
+}
+
+static jstring new_java_utf8_length(JNIEnv *env, const char *value, size_t length) {
+    jbyteArray bytes = (*env)->NewByteArray(env, (jsize)length);
+    if (!bytes) return NULL;
+    (*env)->SetByteArrayRegion(env, bytes, 0, (jsize)length, (const jbyte *)value);
+    jclass cls = (*env)->FindClass(env, "java/lang/String");
+    jmethodID constructor = (*env)->GetMethodID(env, cls, "<init>", "([BLjava/lang/String;)V");
+    jstring encoding = (*env)->NewStringUTF(env, "UTF-8");
+    jstring result = (jstring)(*env)->NewObject(env, cls, constructor, bytes, encoding);
+    (*env)->DeleteLocalRef(env, encoding); (*env)->DeleteLocalRef(env, bytes); (*env)->DeleteLocalRef(env, cls);
+    return result;
+}
+
+static jstring new_java_utf8(JNIEnv *env, const char *value) {
+    return new_java_utf8_length(env, value, strlen(value));
+}
+
 static void throw_runtime(JNIEnv *env, const char *message) {
     jclass error = (*env)->FindClass(env, "java/lang/RuntimeException");
-    if (error != NULL) (*env)->ThrowNew(env, error, message != NULL ? message : "QuickJS runtime error");
+    if (error != NULL) {
+        jmethodID constructor = (*env)->GetMethodID(env, error, "<init>", "(Ljava/lang/String;)V");
+        jstring text = new_java_utf8(env, message != NULL ? message : "QuickJS runtime error");
+        jthrowable exception = (jthrowable)(*env)->NewObject(env, error, constructor, text);
+        if (exception) (*env)->Throw(env, exception);
+        (*env)->DeleteLocalRef(env, text); (*env)->DeleteLocalRef(env, exception); (*env)->DeleteLocalRef(env, error);
+    }
 }
 
 static void clear_java_exception(JNIEnv *env) {
@@ -93,8 +135,8 @@ static JSValue js_hanwo_call(JSContext *ctx, JSValueConst this_val, int argc, JS
         JS_FreeCString(ctx, args_json);
         return throw_js_error(ctx, "无法附加 QuickJS 宿主线程");
     }
-    jstring command_string = (*env)->NewStringUTF(env, command);
-    jstring args_string = (*env)->NewStringUTF(env, args_json);
+    jstring command_string = new_java_utf8(env, command);
+    jstring args_string = new_java_utf8(env, args_json);
     if (command_string == NULL || args_string == NULL) {
         if (command_string != NULL) (*env)->DeleteLocalRef(env, command_string);
         if (args_string != NULL) (*env)->DeleteLocalRef(env, args_string);
@@ -110,19 +152,28 @@ static JSValue js_hanwo_call(JSContext *ctx, JSValueConst this_val, int argc, JS
     JS_FreeCString(ctx, command);
     JS_FreeCString(ctx, args_json);
     if ((*env)->ExceptionCheck(env)) {
+        jthrowable exception = (*env)->ExceptionOccurred(env);
+        (*env)->ExceptionClear(env);
+        jclass cls = (*env)->GetObjectClass(env, exception);
+        jmethodID get_message = (*env)->GetMethodID(env, cls, "getMessage", "()Ljava/lang/String;");
+        jstring message = (jstring)(*env)->CallObjectMethod(env, exception, get_message);
+        char *detail = message ? java_utf8(env, message) : NULL;
+        JSValue failure = JS_ThrowInternalError(ctx, "%s", detail ? detail : "runtime_failed: 运行时命令执行失败");
+        free(detail);
+        (*env)->DeleteLocalRef(env, message); (*env)->DeleteLocalRef(env, cls); (*env)->DeleteLocalRef(env, exception);
         clear_java_exception(env);
         if (attached) (*state->vm)->DetachCurrentThread(state->vm);
-        return JS_ThrowInternalError(ctx, "运行时命令执行失败");
+        return failure;
     }
     if (result_string == NULL) {
         if (attached) (*state->vm)->DetachCurrentThread(state->vm);
         return throw_js_error(ctx, "运行时命令没有返回结果");
     }
-    const char *result_json = (*env)->GetStringUTFChars(env, result_string, NULL);
+    const char *result_json = java_utf8(env, result_string);
     JSValue result = result_json == NULL
         ? JS_EXCEPTION
         : JS_ParseJSON(ctx, result_json, strlen(result_json), "<runtime-result>");
-    if (result_json != NULL) (*env)->ReleaseStringUTFChars(env, result_string, result_json);
+    if (result_json != NULL) free((void *)result_json);
     (*env)->DeleteLocalRef(env, result_string);
     if (attached) (*state->vm)->DetachCurrentThread(state->vm);
     return result;
@@ -140,7 +191,7 @@ static int install_named_commands(JNIEnv *env, JSContext *ctx, JSValueConst hanw
     for (jsize index = 0; index < count; index++) {
         jstring command = (jstring)(*env)->GetObjectArrayElement(env, commands, index);
         if (command == NULL) return -1;
-        const char *name = (*env)->GetStringUTFChars(env, command, NULL);
+        const char *name = java_utf8(env, command);
         int status = -1;
         if (name != NULL) {
             JSValue data = JS_NewString(ctx, name);
@@ -149,7 +200,7 @@ static int install_named_commands(JNIEnv *env, JSContext *ctx, JSValueConst hanw
                 if (!JS_IsException(function)) status = JS_SetPropertyStr(ctx, hanwo, name, function);
                 JS_FreeValue(ctx, data);
             }
-            (*env)->ReleaseStringUTFChars(env, command, name);
+            free((void *)name);
         }
         (*env)->DeleteLocalRef(env, command);
         if (status < 0) return status;
@@ -162,7 +213,8 @@ static JSValue js_hanwo_emit(JSContext *ctx, JSValueConst this_val, int argc, JS
     HostState *state = (HostState *)JS_GetContextOpaque(ctx);
     if (state == NULL) return throw_js_error(ctx, "QuickJS host is unavailable");
     JSValue value = argc >= 1 ? argv[0] : JS_NewString(ctx, "");
-    const char *text = JS_ToCString(ctx, value);
+    size_t text_length;
+    const char *text = JS_ToCStringLen(ctx, &text_length, value);
     if (argc < 1) JS_FreeValue(ctx, value);
     if (text == NULL) return JS_EXCEPTION;
     int attached = 0;
@@ -171,7 +223,7 @@ static JSValue js_hanwo_emit(JSContext *ctx, JSValueConst this_val, int argc, JS
         JS_FreeCString(ctx, text);
         return throw_js_error(ctx, "无法附加 QuickJS 宿主线程");
     }
-    jstring output = (*env)->NewStringUTF(env, text);
+    jstring output = new_java_utf8_length(env, text, text_length);
     if (output == NULL) {
         JS_FreeCString(ctx, text);
         clear_java_exception(env);
@@ -193,7 +245,7 @@ static JSValue js_hanwo_emit(JSContext *ctx, JSValueConst this_val, int argc, JS
 static int quickjs_interrupt(JSRuntime *runtime, void *opaque) {
     (void)runtime;
     HostState *state = (HostState *)opaque;
-    return state != NULL && monotonic_millis() >= state->deadline_ms;
+    return state != NULL && (monotonic_millis() >= state->deadline_ms || (*state->env)->CallBooleanMethod(state->env, state->thread, state->is_interrupted));
 }
 
 JNIEXPORT jstring JNICALL
@@ -211,11 +263,11 @@ Java_com_agent_voiceassistant_tools_runtime_QuickJsNative_execute(
         throw_runtime(env, "QuickJS 参数不能为空");
         return NULL;
     }
-    const char *source = (*env)->GetStringUTFChars(env, source_string, NULL);
-    const char *input = (*env)->GetStringUTFChars(env, input_string, NULL);
+    const char *source = java_utf8(env, source_string);
+    const char *input = java_utf8(env, input_string);
     if (source == NULL || input == NULL) {
-        if (source != NULL) (*env)->ReleaseStringUTFChars(env, source_string, source);
-        if (input != NULL) (*env)->ReleaseStringUTFChars(env, input_string, input);
+        if (source != NULL) free((void *)source);
+        if (input != NULL) free((void *)input);
         throw_runtime(env, "QuickJS 输入编码失败");
         return NULL;
     }
@@ -228,15 +280,23 @@ Java_com_agent_voiceassistant_tools_runtime_QuickJsNative_execute(
     if (call_method == NULL || emit_method == NULL) {
         (*env)->ExceptionClear(env);
         (*env)->DeleteLocalRef(env, host_class);
-        (*env)->ReleaseStringUTFChars(env, source_string, source);
-        (*env)->ReleaseStringUTFChars(env, input_string, input);
+        free((void *)source);
+        free((void *)input);
         throw_runtime(env, "QuickJS 宿主回调接口不匹配");
         return NULL;
     }
     (*env)->DeleteLocalRef(env, host_class);
 
+    jclass thread_class = (*env)->FindClass(env, "java/lang/Thread");
+    jmethodID current_thread = (*env)->GetStaticMethodID(env, thread_class, "currentThread", "()Ljava/lang/Thread;");
+    jobject thread = (*env)->CallStaticObjectMethod(env, thread_class, current_thread);
+    jmethodID is_interrupted = (*env)->GetMethodID(env, thread_class, "isInterrupted", "()Z");
+    (*env)->DeleteLocalRef(env, thread_class);
     HostState state = {
         .vm = vm,
+        .env = env,
+        .thread = thread,
+        .is_interrupted = is_interrupted,
         .host = (*env)->NewGlobalRef(env, host),
         .call_method = call_method,
         .emit_method = emit_method,
@@ -301,6 +361,11 @@ Java_com_agent_voiceassistant_tools_runtime_QuickJsNative_execute(
         JS_FreeValue(ctx, global);
         goto cleanup;
     }
+    if ((int)JS_PromiseState(ctx, returned) >= 0) {
+        throw_runtime(env, "QuickJS main() 必须同步返回 JSON，不支持 Promise/async");
+        JS_FreeValue(ctx, returned); JS_FreeValue(ctx, input_value); JS_FreeValue(ctx, global);
+        goto cleanup;
+    }
     JSValue json_object = JS_GetPropertyStr(ctx, global, "JSON");
     JSValue stringify = JS_GetPropertyStr(ctx, json_object, "stringify");
     JSValue result_args[1] = {returned};
@@ -328,7 +393,7 @@ Java_com_agent_voiceassistant_tools_runtime_QuickJsNative_execute(
         throw_runtime(env, "QuickJS 结果编码失败");
         goto cleanup;
     }
-    result_string = (*env)->NewStringUTF(env, json_text);
+    result_string = new_java_utf8(env, json_text);
     JS_FreeCString(ctx, json_text);
     JS_FreeValue(ctx, json_result);
 
@@ -336,7 +401,8 @@ cleanup:
     if (ctx != NULL) JS_FreeContext(ctx);
     if (runtime != NULL) JS_FreeRuntime(runtime);
     (*env)->DeleteGlobalRef(env, state.host);
-    (*env)->ReleaseStringUTFChars(env, source_string, source);
-    (*env)->ReleaseStringUTFChars(env, input_string, input);
+    (*env)->DeleteLocalRef(env, thread);
+    free((void *)source);
+    free((void *)input);
     return result_string;
 }

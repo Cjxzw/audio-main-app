@@ -26,7 +26,9 @@ class RuntimeCommandRegistry(
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    fun execute(command: String, args: JsonElement): RuntimeCommandResult {
+    val effectiveCommands: Set<String> get() = allowedCommands ?: COMMANDS
+
+    fun execute(command: String, args: JsonElement, deadlineNanos: Long = Long.MAX_VALUE): RuntimeCommandResult {
         require(command in COMMANDS) { "不支持的运行时命令：$command" }
         require(allowedCommands == null || command in allowedCommands) { "Skill 未获准使用运行时命令：$command" }
         val objectArgs = args as? JsonObject ?: error("运行时命令参数必须是 JSON 对象")
@@ -42,7 +44,9 @@ class RuntimeCommandRegistry(
                 "http_request" -> httpRequest(objectArgs)
                 "delete" -> delete(objectArgs)
                 "describe_credentials" -> describeCredentials(objectArgs)
-                "sha256" -> sha256(objectArgs)
+                "sha256" -> sha256(objectArgs, deadlineNanos)
+                "gunzip", "inflate", "gzip", "deflate" -> compress(command, objectArgs, deadlineNanos)
+                "zip", "unzip" -> zipArchive(command, objectArgs, deadlineNanos)
                 else -> error("未实现的运行时命令：$command")
             },
         )
@@ -59,11 +63,16 @@ class RuntimeCommandRegistry(
         require(paths.isNotEmpty()) { "read 缺少 path 或 paths" }
         require(paths.size <= MAX_BATCH_READ_ITEMS) { "paths 最多包含 $MAX_BATCH_READ_ITEMS 项" }
         if (paths.size == 1) return readOne(args, paths.single())
+        require((args.stringOrNull("encoding") ?: "utf8") == "utf8") { "二进制读取每次只接受一个 path" }
 
         return buildJsonObject {
             put("items", buildJsonArray {
                 paths.forEach { path ->
-                    runCatching { readOne(args, path) }.fold(
+                    runCatching {
+                        val item = readOne(args, path) as JsonObject
+                        val content = item["content"]!!.jsonPrimitive.content
+                        JsonObject(item + mapOf("content" to JsonPrimitive(content.take(1000)), "truncated" to JsonPrimitive(content.length > 1000 || item["truncated"]!!.jsonPrimitive.content == "true")))
+                    }.fold(
                         onSuccess = { result ->
                             add(buildJsonObject {
                                 put("ok", true)
@@ -85,6 +94,7 @@ class RuntimeCommandRegistry(
     }
 
     private fun readOne(args: JsonObject, path: String): JsonElement {
+        require((args.stringOrNull("encoding") ?: "utf8") == "utf8" || listOf("offset", "limit", "tail_lines", "log_levels", "log_tags", "event_prefixes", "query").none { it in args }) { "二进制读取不能混用行参数或日志筛选" }
         val result = executionEnv.read(
             path = path,
             offset = args.int("offset"),
@@ -94,6 +104,9 @@ class RuntimeCommandRegistry(
             logTags = args.stringList("log_tags"),
             eventPrefixes = args.stringList("event_prefixes"),
             query = args.string("query"),
+            encoding = args.stringOrNull("encoding") ?: "utf8",
+            byteOffset = args.long("byte_offset"),
+            byteLimit = args.int("byte_limit"),
         )
         require(result.kind != "directory") { "read 只能读取文件；列出目录请使用 list" }
         return readResult(result)
@@ -119,6 +132,7 @@ class RuntimeCommandRegistry(
         return buildJsonObject {
             put("root", result.root)
             put("query", result.query)
+            put("match_mode", "literal_substring")
             put("matches", JsonArray(result.matches.map(::JsonPrimitive)))
             put("truncated", result.truncated)
         }
@@ -171,7 +185,7 @@ class RuntimeCommandRegistry(
     }
 
     private fun readResult(result: AndroidExecutionEnv.ReadResult): JsonElement {
-        return buildJsonObject {
+        val value = buildJsonObject {
             put("path", result.path)
             put("kind", result.kind)
             put("content", result.content)
@@ -179,9 +193,26 @@ class RuntimeCommandRegistry(
             put("end_line", result.endLine)
             put("total_lines", result.totalLines)
             put("truncated", result.truncated)
+            put("encoding", result.encoding)
+            result.totalBytes?.let { put("total_bytes", it) }
+            result.byteOffset?.let { put("byte_offset", it) }
+            result.bytesRead?.let { put("bytes_read", it) }
+            result.nextByteOffset?.let { put("next_byte_offset", it) }
+            if (result.byteOffset != null) put("has_more", result.hasMore)
             result.filterSummary?.let { put("filter_summary", it) }
             result.sha256?.let { put("sha256", it) }
         }
+        if (value.toString().length <= 40_000) return value
+        require(result.encoding == "utf8") { "二进制结果超出输出预算，请减小 byte_limit" }
+        // JSON escaping also consumes the model-output budget. Keep metadata and mark truncation.
+        var low = 0
+        var high = result.content.length
+        while (low < high) {
+            val mid = (low + high + 1) / 2
+            val candidate = JsonObject(value + mapOf("content" to JsonPrimitive(result.content.take(mid)), "truncated" to JsonPrimitive(true)))
+            if (candidate.toString().length <= 40_000) low = mid else high = mid - 1
+        }
+        return JsonObject(value + mapOf("content" to JsonPrimitive(result.content.take(low)), "truncated" to JsonPrimitive(true)))
     }
 
     private fun write(args: JsonObject): JsonElement {
@@ -192,6 +223,7 @@ class RuntimeCommandRegistry(
             startLine = args.int("start_line"),
             endLine = args.int("end_line"),
             expectedSha256 = args.string("expected_sha256"),
+            encoding = args.stringOrNull("encoding") ?: "utf8",
         )
         return buildJsonObject {
             put("path", result.path)
@@ -250,14 +282,40 @@ class RuntimeCommandRegistry(
     }
 
     private fun describeCredentials(args: JsonObject): JsonElement =
-        JsonPrimitive(executionEnv.describeCredentials(args.string("query").orEmpty(), args.int("limit") ?: 10))
+        buildJsonObject { put("summary", executionEnv.describeCredentials(args.string("query").orEmpty(), args.int("limit") ?: 10)) }
 
-    private fun sha256(args: JsonObject): JsonElement {
-        val value = args.stringOrNull("value") ?: error("sha256 缺少 value")
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest(value.toByteArray(Charsets.UTF_8))
-            .joinToString("") { byte -> "%02x".format(byte) }
+    private fun sha256(args: JsonObject, deadlineNanos: Long): JsonElement {
+        require(("path" in args) != ("value" in args)) { "sha256 的 path 与 value 必须二选一" }
+        val path = if ("path" in args) args.string("path") ?: error("sha256 path 不能为空") else null
+        val value = if ("value" in args) args.stringOrNull("value") ?: error("sha256 value 必须是字符串") else null
+        val digest = if (path != null) executionEnv.fileSha256(path, deadlineNanos)
+        else MessageDigest.getInstance("SHA-256").digest(value!!.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
         return buildJsonObject { put("sha256", digest) }
+    }
+
+    private fun compress(command: String, args: JsonObject, deadlineNanos: Long): JsonElement {
+        require(("path" in args) != ("base64" in args)) { "path 与 base64 必须二选一" }
+        require("output_path" !in args || args.string("output_path") != null) { "output_path 不能为空" }
+        return executionEnv.compress(command, args.string("path"), args.stringOrNull("base64"), args.string("output_path"),
+            args.long("max_bytes") ?: 8L * 1024 * 1024, args.int("preview_chars") ?: 0,
+            args.boolean("overwrite") ?: false, deadlineNanos)
+    }
+
+    private fun zipArchive(command: String, args: JsonObject, deadlineNanos: Long): JsonElement {
+        val maxBytes = args.long("max_bytes") ?: 8L * 1024 * 1024
+        return if (command == "zip") {
+            require(("path" in args) != ("paths" in args)) { "zip 的 path 与 paths 必须二选一" }
+            val inputs = if ("path" in args) listOf(args.string("path") ?: error("zip path 不能为空")) else {
+                val values = args["paths"] as? JsonArray ?: error("zip paths 必须是字符串数组")
+                values.map { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content?.takeIf(String::isNotBlank) ?: error("zip paths 必须是非空字符串数组") }
+            }
+            require("overwrite" !in args || args.boolean("overwrite") != null) { "overwrite 必须是布尔值" }
+            executionEnv.zip(inputs, args.string("output_path") ?: error("zip 缺少 output_path"), maxBytes, args.boolean("overwrite") ?: false, deadlineNanos)
+        } else {
+            require("overwrite" !in args && "paths" !in args && "output_path" !in args) { "unzip 使用 path 和新的 output_dir，不支持 overwrite 或 output_path" }
+            executionEnv.unzip(args.string("path") ?: error("unzip 缺少 path"), args.string("output_dir") ?: error("unzip 缺少 output_dir"),
+                maxBytes, args.int("max_entries") ?: 1000, args.string("filename_charset") ?: "UTF-8", deadlineNanos)
+        }
     }
 
     companion object {
@@ -270,7 +328,7 @@ class RuntimeCommandRegistry(
             "sha256",
         )
 
-        val COMMANDS = RUN_COMMANDS + setOf("read", "write", "delete", "http_request", "describe_credentials")
+        val COMMANDS = RUN_COMMANDS + setOf("read", "write", "delete", "http_request", "describe_credentials", "gunzip", "inflate", "gzip", "deflate", "zip", "unzip")
 
         fun JsonObject.string(key: String): String? =
             (this[key] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotBlank)
@@ -279,7 +337,10 @@ class RuntimeCommandRegistry(
             (this[key] as? JsonPrimitive)?.contentOrNull
 
         fun JsonObject.int(key: String): Int? =
-            (this[key] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
+            this[key]?.let { (it as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: error("$key 必须是整数") }
+
+        fun JsonObject.long(key: String): Long? =
+            this[key]?.let { (it as? JsonPrimitive)?.contentOrNull?.toLongOrNull() ?: error("$key 必须是整数") }
 
         fun JsonObject.boolean(key: String): Boolean? =
             (this[key] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull()

@@ -20,8 +20,9 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
         val runtime: String = "text",
         val entry: String? = null,
         val permissions: Set<String> = emptySet(),
-        val manifestVersion: Int = SkillReviewPolicy.MANIFEST_VERSION,
-        val reviewPolicyVersion: Int = SkillReviewPolicy.VERSION,
+        val permissionsDeclared: Boolean = false,
+        val manifestVersion: Int = 1,
+        val reviewPolicyVersion: Int = 1,
         val expectedVersion: String? = null,
         val candidate: String,
         val digest: String,
@@ -112,7 +113,7 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
                 if (existing != null) appendLine("原版本：${existing.version}")
                 appendLine("运行时：${prepared.runtime.name.lowercase(Locale.ROOT)}")
                 prepared.entry?.let { appendLine("入口：$it") }
-                appendLine("权限：${prepared.permissions.ifEmpty { setOf("全部内置运行时命令") }.joinToString()}")
+                appendLine("权限：${(if (!prepared.permissionsDeclared) "全部内置运行时命令（未声明，兼容模式）" else prepared.permissions.joinToString().ifEmpty { "无命令权限" })}")
                 appendLine("清单版本：${SkillReviewPolicy.MANIFEST_VERSION}；审查策略版本：${SkillReviewPolicy.VERSION}")
                 appendLine("文件：\n${files.joinToString("\n")}")
                 appendLine("批准后生效")
@@ -127,6 +128,9 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
                 runtime = prepared.runtime.name.lowercase(Locale.ROOT),
                 entry = prepared.entry,
                 permissions = prepared.permissions,
+                permissionsDeclared = prepared.permissionsDeclared,
+                manifestVersion = SkillReviewPolicy.MANIFEST_VERSION,
+                reviewPolicyVersion = SkillReviewPolicy.VERSION,
                 expectedVersion = existing?.version,
                 candidate = candidate.canonicalPath,
                 digest = hashTree(candidate),
@@ -150,6 +154,7 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
             }
             "rejected" -> finish(request, decision, "用户拒绝${if (request.operation == "skill.edit") "变更" else "注册"} Skill「${request.name}」；未生效")
             "approved" -> {
+                require(request.manifestVersion == SkillReviewPolicy.MANIFEST_VERSION && request.reviewPolicyVersion == SkillReviewPolicy.VERSION) { "审批策略已更新，请拒绝旧待办并重新提交" }
                 val candidate = File(request.candidate)
                 require(hashTree(candidate) == request.digest) { "候选文件已变化。请拒绝当前事项后重新提交，不能批准未审阅的新内容" }
                 save(state.copy(pending = request.copy(phase = "publishing")))
@@ -172,6 +177,7 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
         runtime = request.runtime,
         entry = request.entry,
         permissions = request.permissions,
+        permissionsDeclared = request.permissionsDeclared,
         manifestVersion = request.manifestVersion,
         reviewPolicyVersion = request.reviewPolicyVersion,
         candidateDigest = request.digest,

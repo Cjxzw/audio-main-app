@@ -63,7 +63,16 @@ class QuickJsRuntimeExecutor(
                     require(System.nanoTime() < deadlineNanos) { "QuickJS runtime timeout exceeded" }
                     args
                 }
-                return commands.execute(command, effectiveArgs).value.toString()
+                return try { commands.execute(command, effectiveArgs, deadlineNanos).value.toString() }
+                catch (error: Exception) {
+                    val code = when {
+                        command !in commands.effectiveCommands -> "permission_denied"
+                        error.message.orEmpty().contains("timeout") -> "runtime_timeout"
+                        error is IllegalArgumentException -> "invalid_arguments"
+                        else -> "command_failed"
+                    }
+                    throw IllegalStateException("$code command=$command keys=${args.keys.sorted().joinToString(",")}: ${error.message ?: error.javaClass.simpleName}")
+                }
             }
 
             override fun emit(text: String) {
@@ -73,7 +82,7 @@ class QuickJsRuntimeExecutor(
             }
         }
         val result = QuickJsNative.execute(
-            source, inputJson, host, RuntimeCommandRegistry.COMMANDS.toTypedArray(), timeoutMs, memoryBytes,
+            source, inputJson, host, commands.effectiveCommands.toTypedArray(), timeoutMs, memoryBytes,
         )
         return Result(result, output.toString())
     }

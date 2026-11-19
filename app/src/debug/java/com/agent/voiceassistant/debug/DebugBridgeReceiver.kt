@@ -88,6 +88,7 @@ class DebugBridgeReceiver : BroadcastReceiver() {
                 put("skills", buildJsonArray { registry.listAll().forEach { skill -> add(buildJsonObject {
                     put("id", skill.id); put("name", skill.name); put("enabled", skill.enabled); put("version", skill.version)
                     put("runtime", skill.runtime.name.lowercase()); skill.entry?.let { put("entry", it) }
+                    put("permissions_declared", skill.permissionsDeclared)
                     put("permissions", buildJsonArray { skill.permissions.sorted().forEach { add(it) } })
                     put("resources", buildJsonArray { registry.files(skill.id).forEach { add(it.relativePath) } })
                 }) } })

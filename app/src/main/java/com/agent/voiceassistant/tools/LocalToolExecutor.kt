@@ -54,7 +54,7 @@ class LocalToolExecutor(
         }
         if (action.actionType in setOf("memory.edit", "memory.create", "note.create") &&
             CredentialPolicy.anyReference.containsMatchIn(action.payload.toString())) {
-                return ToolResult(action.actionType, "此工具不接受凭证引用", "此工具不支持凭证引用；引用可写入工作区和 Skill，并由 http_request 或 skill_use 的 run 模式解析。", false, false)
+                return ToolResult(action.actionType, "此工具不接受凭证引用", "此工具不支持凭证引用；引用不能通过 write 写入文件；请经 Skill input 传入，由 http_request 在发送前解析。", false, false)
         }
         return when (action.actionType) {
             "describe_credentials" -> describeCredentials(action.payload)
@@ -235,51 +235,12 @@ class LocalToolExecutor(
     }
 
     private fun formatReadResult(value: JsonElement): ToolResult {
-        val objectValue = value as? JsonObject ?: return failed("read", "读取失败", IllegalArgumentException("读取结果格式无效"))
-        val items = objectValue["items"] as? JsonArray
-        if (items == null) return formatSingleReadResult(objectValue)
-
-        val successful = items.count { item -> (item as? JsonObject)?.boolean("ok") == true }
-        return ToolResult(
-            actionType = "read",
-            displayText = "批量读取：$successful/${items.size} 成功",
-            contextText = buildString {
-                appendLine("批量读取结果：$successful 项成功，${items.size - successful} 项失败。")
-                items.forEachIndexed { index, item ->
-                    val itemObject = item as? JsonObject ?: return@forEachIndexed
-                    appendLine()
-                    if (itemObject.boolean("ok") == true) {
-                        val result = itemObject["result"] as? JsonObject
-                        appendLine("[${index + 1}] 成功：${result?.text("path") ?: itemObject.text("requested_path")}")
-                        appendLine("范围：${result?.int("start_line") ?: 0}-${result?.int("end_line") ?: 0}/${result?.int("total_lines") ?: 0}")
-                        val content = result?.text("content").orEmpty()
-                        append(content.take(MAX_BATCH_READ_ITEM_CHARS))
-                        if (content.length > MAX_BATCH_READ_ITEM_CHARS || result?.boolean("truncated") == true) {
-                            append("\n[该项输出已截断，可单独读取以查看更多]")
-                        }
-                    } else {
-                        append("[${index + 1}] 失败：${itemObject.text("requested_path") ?: "未知路径"}：${itemObject.text("error") ?: "未知错误"}")
-                    }
-                }
-            },
-            shouldAskLlm = true,
-            success = successful > 0,
-        )
+        val result = value as? JsonObject ?: return failed("read", "读取失败", IllegalArgumentException("读取结果格式无效"))
+        val items = result["items"] as? JsonArray
+        val successful = items?.count { (it as? JsonObject)?.boolean("ok") == true }
+        return ToolResult("read", if (items == null) "读取 ${result.text("path")}" else "批量读取：$successful/${items.size} 成功",
+            result.toString(), true, items == null || successful!! > 0)
     }
-
-    private fun formatSingleReadResult(result: JsonObject) = ToolResult(
-        actionType = "read",
-        displayText = if (result.text("kind") == "directory") "列出 ${result.text("path")}" else "读取 ${result.text("path")}",
-        contextText = buildString {
-            appendLine("${if (result.text("kind") == "directory") "目录" else "文件"}：${result.text("path")}")
-            result.text("filter_summary")?.let { appendLine("日志筛选：$it") }
-            appendLine("范围：${result.int("start_line") ?: 0}-${result.int("end_line") ?: 0}/${result.int("total_lines") ?: 0}")
-            result.text("sha256")?.let { appendLine("文件 sha256：$it") }
-            append(result.text("content").orEmpty())
-            if (result.boolean("truncated") == true) append("\n[输出已截断，可调整 offset/limit 或 tail_lines 继续读取]")
-        },
-        shouldAskLlm = true,
-    )
 
     private fun writeFile(payload: JsonObject): ToolResult {
         val registry = runtimeCommands ?: return unavailable("write")
@@ -289,11 +250,7 @@ class LocalToolExecutor(
                 ToolResult(
                     actionType = "write",
                     displayText = if (warning == null) "写入成功：${result.text("path")}" else "写入成功，但有警告：${result.text("path")}",
-                    contextText = buildString {
-                        append(if (warning == null) "写入成功。" else "写入成功，但有警告；不要重复写入本次内容。")
-                        append("路径：${result.text("path")}，${result.int("bytes_written") ?: 0} 字节，模式 ${result.text("mode")}，sha256=${result.text("sha256")}。")
-                        warning?.let { append(" $it") }
-                    },
+                    contextText = result.toString(),
                     shouldAskLlm = true,
                 )
             },
@@ -308,7 +265,7 @@ class LocalToolExecutor(
                 ToolResult(
                     actionType = "delete",
                     displayText = "移入回收站：${entry.text("name")}",
-                    contextText = "已将 ${entry.text("path")} 移入回收站，保留 30 天。",
+                    contextText = entry.toString(),
                     shouldAskLlm = true,
                 )
             },
@@ -340,7 +297,7 @@ class LocalToolExecutor(
     private fun describeCredentials(payload: JsonObject): ToolResult {
         val registry = runtimeCommands ?: return unavailable("describe_credentials")
         return runCatching { registry.execute("describe_credentials", payload).value }.fold(
-            onSuccess = { value -> ToolResult("describe_credentials", "查询凭证", value.jsonPrimitive.content, false) },
+            onSuccess = { value -> ToolResult("describe_credentials", "查询凭证", value.toString(), false) },
             onFailure = { error -> failed("describe_credentials", "查询凭证失败", error) },
         )
     }
@@ -357,29 +314,7 @@ class LocalToolExecutor(
                 ToolResult(
                     actionType = "http_request",
                     displayText = "HTTP " + status + "：" + url.take(80),
-                    contextText = buildString {
-                        appendLine("HTTP 状态：" + status)
-                        (result["headers"] as? JsonObject).orEmpty().forEach { (name, value) ->
-                            val values = (value as? JsonArray).orEmpty().mapNotNull { it.jsonPrimitive.contentOrNull }
-                            appendLine(name + ": " + values.joinToString())
-                        }
-                        if (result.boolean("binary") == true) {
-                            appendLine("响应为二进制内容，正文未放入模型上下文。")
-                        } else {
-                            append(result.text("body").orEmpty().ifBlank { "[空响应]" })
-                        }
-                        if (result.boolean("truncated") == true) append("\n[响应已截断]")
-                        result.text("saved_path")?.let { path ->
-                            appendLine()
-                            appendLine("完整响应已保存：[$path]($path)")
-                            result.long("saved_bytes")?.let { appendLine("保存大小：" + it + " bytes") }
-                            result.text("saved_sha256")?.let { appendLine("SHA-256：" + it) }
-                            if (result.boolean("saved_truncated") == true) appendLine("保存结果已达到 128 MiB 上限，文件不完整。")
-                            result.long("saved_expires_at")?.let { expiresAt ->
-                                appendLine("缓存自动删除时间：" + java.text.DateFormat.getDateTimeInstance().format(java.util.Date(expiresAt)))
-                            }
-                        }
-                    },
+                    contextText = result.toString(),
                     shouldAskLlm = true,
                     success = status in 200..399,
                 )
@@ -426,7 +361,7 @@ class LocalToolExecutor(
         val mode = payload.string("mode")?.lowercase() ?: "load"
         val resource = payload.string("resource_name")
         if (mode == "run") {
-            return runQuickJsSkill(registry, name, resource, payload)
+            return kotlinx.coroutines.runInterruptible(kotlinx.coroutines.Dispatchers.IO) { runQuickJsSkill(registry, name, resource, payload) }
         }
         if (mode != "load") return invalidArguments("skill.use", "mode 只能是 load 或 run")
         return runCatching { registry.use(name, resource) }.fold(
@@ -474,8 +409,7 @@ class LocalToolExecutor(
             return failed("skill.use", "QuickJS Skill 不可执行", error)
         }
         runtimeCommands ?: return unavailable("skill.use")
-        val allowedCommands = script.skill.permissions.takeIf { it.isNotEmpty() }
-            ?: RuntimeCommandRegistry.COMMANDS
+        val allowedCommands = if (script.skill.permissionsDeclared) script.skill.permissions else RuntimeCommandRegistry.COMMANDS
         val scopedCommands = RuntimeCommandRegistry(
             executionEnv ?: return unavailable("skill.use"),
             allowedCommands = allowedCommands,

@@ -1,6 +1,7 @@
 package com.agent.voiceassistant.tools
 
 import java.io.File
+import java.nio.file.Files
 
 internal class VirtualPathResolver(
     sourceRoot: File,
@@ -23,6 +24,19 @@ internal class VirtualPathResolver(
         val relative = normalized.removePrefix(mount.virtualRoot).trimStart('/')
         val target = File(mount.physicalRoot, relative).canonicalFile
         require(target.toPath().startsWith(mount.physicalRoot.toPath())) { "路径越界：$path" }
+        return target
+    }
+
+    /** Archive traversal must not follow a link, even when its target is inside a mount. */
+    fun resolveWithoutSymlinks(path: String, write: Boolean): File {
+        val normalized = normalize(path)
+        val target = resolve(normalized, write)
+        val mount = mounts.first { normalized == it.virtualRoot || normalized.startsWith("${it.virtualRoot}/") }
+        var current = mount.physicalRoot
+        normalized.removePrefix(mount.virtualRoot).split('/').filter(String::isNotEmpty).forEach {
+            current = File(current, it)
+            require(!Files.isSymbolicLink(current.toPath())) { "ZIP 路径不能包含符号链接：$path" }
+        }
         return target
     }
 

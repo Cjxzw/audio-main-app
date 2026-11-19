@@ -7,6 +7,52 @@ import org.junit.Test
 import java.nio.file.Files
 
 class SkillRegistryTest {
+    @Test fun `permission syntaxes survive registration edits and reload including explicit empty`() {
+        for (declaration in listOf("permissions: read, write", "permissions: [read, 'write']", "permissions:\n  - read\n  - write", "permissions:\n- read\n- write", "permissions:\n  - read\n  # comment\n\n  - write", "permissions: []", "")) {
+            val runtime = Files.createTempDirectory("permission-syntax").toFile()
+            try {
+                val candidate = runtime.resolve("workspace/flow").apply { mkdirs() }
+                candidate.resolve("SKILL.md").writeText("---\nname: flow\ndescription: test\nruntime: quickjs\nentry: main.js\n$declaration\n---\nFlow")
+                candidate.resolve("main.js").writeText("function main(input) { return input; }")
+                val registry = SkillRegistry(runtime.resolve("skills"))
+                val registered = registry.registerFromWorkspace(runtime.resolve("workspace"), "/workspace/flow", "flow", "test", "SKILL.md", "test", listOf("SKILL.md", "main.js")).skill
+                assertEquals(declaration.isNotEmpty(), registered.permissionsDeclared)
+                assertEquals(if (declaration.isEmpty() || declaration == "permissions: []") emptySet<String>() else setOf("read", "write"), registered.permissions)
+                registry.updateMetadata(registered.id, "flow", "changed")
+                val reloaded = SkillRegistry(runtime.resolve("skills")).list().single()
+                assertEquals(registered.permissions, reloaded.permissions)
+                assertEquals(registered.permissionsDeclared, reloaded.permissionsDeclared)
+            } finally { runtime.deleteRecursively() }
+        }
+    }
+
+    @Test fun `zip permissions survive registration and reload`() {
+        val runtime = Files.createTempDirectory("permission-zip").toFile()
+        try {
+            val candidate = runtime.resolve("workspace/archive").apply { mkdirs() }
+            candidate.resolve("SKILL.md").writeText("---\nname: archive\nruntime: quickjs\nentry: main.js\npermissions: [zip, unzip]\n---\nArchives")
+            candidate.resolve("main.js").writeText("function main(input) { return hanwo.zip(input); }")
+            SkillRegistry(runtime.resolve("skills")).registerFromWorkspace(runtime.resolve("workspace"), "/workspace/archive", "archive", "test", "SKILL.md", "test", listOf("SKILL.md", "main.js"))
+            val reloaded = SkillRegistry(runtime.resolve("skills")).list().single()
+            assertTrue(reloaded.permissionsDeclared)
+            assertEquals(setOf("zip", "unzip"), reloaded.permissions)
+        } finally { runtime.deleteRecursively() }
+    }
+
+    @Test fun `malformed permission metadata cannot fall back to all commands`() {
+        for (declaration in listOf("permissions:", "permissions: [read", "permissions: [read, nope]", "permissions: {read: true}", "permissions: [emit]", "permissions: read\npermissions: write", "permissions:\n  wrong: read")) {
+            val runtime = Files.createTempDirectory("permission-invalid").toFile()
+            try {
+                val candidate = runtime.resolve("workspace/flow").apply { mkdirs() }
+                candidate.resolve("SKILL.md").writeText("---\nname: flow\nruntime: quickjs\n$declaration\n---\nFlow")
+                candidate.resolve("main.js").writeText("function main(input) { return input; }")
+                assertTrue(declaration, runCatching {
+                    SkillRegistry(runtime.resolve("skills")).registerFromWorkspace(runtime.resolve("workspace"), "/workspace/flow", "flow", "test", "SKILL.md", "test", listOf("SKILL.md", "main.js"))
+                }.isFailure)
+            } finally { runtime.deleteRecursively() }
+        }
+    }
+
     @Test
     fun `loads only skill index metadata`() {
         val root = Files.createTempDirectory("skills").toFile()

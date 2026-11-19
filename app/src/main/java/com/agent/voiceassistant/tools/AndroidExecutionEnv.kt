@@ -49,12 +49,18 @@ class AndroidExecutionEnv(
         val path: String,
         val kind: String,
         val content: String,
-        val startLine: Int,
-        val endLine: Int,
-        val totalLines: Int,
+        val startLine: Int?,
+        val endLine: Int?,
+        val totalLines: Int?,
         val truncated: Boolean,
         val filterSummary: String? = null,
         val sha256: String? = null,
+        val encoding: String = "utf8",
+        val totalBytes: Long? = null,
+        val byteOffset: Long? = null,
+        val bytesRead: Int? = null,
+        val nextByteOffset: Long? = null,
+        val hasMore: Boolean = false,
     )
 
     data class WriteResult(
@@ -121,6 +127,7 @@ class AndroidExecutionEnv(
     val systemSkillsRoot = File(runtimeRoot, "system-skills")
     val disabledSystemSkillsManifest = File(runtimeRoot, "system-skills-disabled")
     private val pathResolver = VirtualPathResolver(sourceRoot, logsRoot, workspaceRoot)
+    private val zipArchives = ZipArchiveOperations(pathResolver)
     private val httpResponseStore = HttpResponseStore(workspaceRoot)
     private val workspaceTrash = WorkspaceTrashRepository(appContext)
 
@@ -141,7 +148,28 @@ class AndroidExecutionEnv(
         logTags: List<String> = emptyList(),
         eventPrefixes: List<String> = emptyList(),
         query: String? = null,
+        encoding: String = "utf8",
+        byteOffset: Long? = null,
+        byteLimit: Int? = null,
     ): ReadResult {
+        BinaryFileCodec.requireEncoding(encoding)
+        require(encoding != "utf8" || (byteOffset == null && byteLimit == null)) { "utf8 使用行参数，不支持 byte_offset/byte_limit" }
+        if (encoding != "utf8") {
+            require(offset == null && tailLines == null && limit == DEFAULT_READ_LINES && logLevels.isEmpty() && logTags.isEmpty() && eventPrefixes.isEmpty() && query == null) { "二进制读取不能混用行参数或日志筛选" }
+            val file = pathResolver.resolve(path, write = false)
+            require(file.isFile && file.length() <= MAX_BINARY_FILE_BYTES) { "二进制读取仅支持不超过 8 MiB 的文件" }
+            val start = byteOffset ?: 0L
+            require(start in 0..file.length()) { "byte_offset 超出文件范围" }
+            val maximum = if (encoding == "base64") 28_000 else 18_000
+            val count = byteLimit ?: maximum
+            require(count in 1..maximum) { "byte_limit 必须在 1..$maximum 之间" }
+            val bytes = ByteArray(minOf(count.toLong(), file.length() - start).toInt())
+            java.io.RandomAccessFile(file, "r").use { it.seek(start); it.readFully(bytes) }
+            val next = start + bytes.size
+            return ReadResult(pathResolver.normalize(path), "file", BinaryFileCodec.encode(bytes, encoding), null, null, null,
+                next < file.length() || start > 0, sha256 = sha256File(file), encoding = encoding, totalBytes = file.length(),
+                byteOffset = start, bytesRead = bytes.size, nextByteOffset = next, hasMore = next < file.length())
+        }
         offset?.let { require(it >= 1) { "offset 必须从 1 开始" } }
         require(limit in 1..MAX_READ_LINES) { "limit 必须在 1..$MAX_READ_LINES 之间" }
         tailLines?.let { require(it in 1..MAX_READ_LINES) { "tail_lines 必须在 1..$MAX_READ_LINES 之间" } }
@@ -160,9 +188,10 @@ class AndroidExecutionEnv(
         require(file.length() <= MAX_READ_FILE_BYTES) { "文件过大，不能直接读取：$path" }
         if (file.length() > STREAMING_READ_THRESHOLD_BYTES) {
             require(!hasLogFilters) { "大文件暂不支持日志筛选，请先分段读取原始内容" }
-            return readLargeTextFile(normalizedPath, file, offset, limit, tailLines)
+            return try { readLargeTextFile(normalizedPath, file, offset, limit, tailLines) }
+            catch (_: java.nio.charset.CharacterCodingException) { error("文件不是有效 UTF-8，请使用 encoding=base64 或 hex") }
         }
-        val text = file.readText(Charsets.UTF_8)
+        val text = BinaryFileCodec.utf8(file.readBytes())
         require(!text.contains('\u0000')) { "暂不支持读取二进制文件：$path" }
         val sourceLines = text.lines()
         val lines = if (hasLogFilters) {
@@ -200,7 +229,7 @@ class AndroidExecutionEnv(
             } else {
                 null
             },
-            sha256 = sha256(text.toByteArray()),
+            sha256 = sha256File(file),
         )
     }
 
@@ -214,7 +243,7 @@ class AndroidExecutionEnv(
         val selected = mutableListOf<String>()
         val tail = ArrayDeque<String>()
         var totalLines = 0
-        file.bufferedReader(Charsets.UTF_8).useLines { lines ->
+        java.io.InputStreamReader(file.inputStream(), BinaryFileCodec.decoder()).buffered().useLines { lines ->
             lines.forEach { line ->
                 require(!line.contains('\u0000')) { "暂不支持读取二进制文件：$normalizedPath" }
                 totalLines += 1
@@ -248,6 +277,7 @@ class AndroidExecutionEnv(
         )
     }
 
+    @Synchronized
     fun write(
         path: String,
         content: String,
@@ -255,45 +285,117 @@ class AndroidExecutionEnv(
         startLine: Int? = null,
         endLine: Int? = null,
         expectedSha256: String? = null,
+        encoding: String = "utf8",
     ): WriteResult {
+        BinaryFileCodec.requireEncoding(encoding)
         require(!CredentialPolicy.anyReference.containsMatchIn(path)) { "路径不能包含凭证引用" }
-        require(!CredentialPolicy.anyReference.containsMatchIn(content)) { "写入内容不能包含凭证引用" }
+        if (encoding == "base64") require(content.length <= (MAX_BINARY_FILE_BYTES + 2) / 3 * 4) { "二进制写入上限 8 MiB" }
+        if (encoding == "hex") require(content.length <= MAX_BINARY_FILE_BYTES * 2) { "二进制写入上限 8 MiB" }
+        val bytes = BinaryFileCodec.decode(content, encoding)
+        // Encoded input must not bypass the existing literal-reference write policy.
+        require(!CredentialPolicy.anyReference.containsMatchIn(bytes.toString(Charsets.UTF_8))) { "写入内容不能包含凭证引用；通过 Skill input 传入 HTTP" }
         val file = pathResolver.resolve(path, write = true)
-        file.parentFile?.mkdirs()
+        require(!file.isDirectory) { "写入目标不能是目录" }
         val normalizedMode = mode.lowercase()
-        require(normalizedMode != "patch" || file.exists()) { "patch 目标文件不存在：$path" }
-        val current = if (file.exists()) file.readText(Charsets.UTF_8) else ""
-        expectedSha256?.trim()?.takeIf { it.isNotEmpty() }?.let { expected ->
-            require(sha256(current.toByteArray()) == expected.lowercase()) {
-                "文件已变化：$path；请重新读取后再修改"
+        require(normalizedMode in setOf("create", "overwrite", "append", "patch")) { "不支持的写入模式：$mode" }
+        require(encoding == "utf8" || normalizedMode != "patch") { "二进制写入不支持 patch" }
+        require(normalizedMode == "patch" || (startLine == null && endLine == null)) { "行参数仅用于 patch" }
+        require(normalizedMode != "patch" || file.isFile) { "patch 目标文件不存在：$path" }
+        require(normalizedMode != "create" || !file.exists()) { "文件已存在：$path" }
+        expectedSha256?.let { expected ->
+            require(file.isFile && sha256File(file) == expected.trim().lowercase()) { "文件已变化：$path；请重新读取后再修改" }
+        }
+        if (encoding != "utf8") require(bytes.size.toLong() + (if (normalizedMode == "append") file.length() else 0) <= MAX_BINARY_FILE_BYTES) { "二进制写入上限 8 MiB" }
+        file.parentFile?.mkdirs()
+        val temporary = File(file.parentFile, ".${file.name}.${UUID.randomUUID()}.tmp")
+        try {
+            temporary.outputStream().use { output ->
+                when (normalizedMode) {
+                    "append" -> {
+                        if (file.exists()) {
+                            if (encoding == "utf8") BinaryFileCodec.utf8(file.readBytes())
+                            file.inputStream().use { it.copyTo(output) }
+                        }
+                        output.write(bytes)
+                    }
+                    "patch" -> output.write(TextPatchApplier.apply(BinaryFileCodec.utf8(file.readBytes()), content, startLine, endLine).toByteArray(Charsets.UTF_8))
+                    else -> output.write(bytes)
+                }
             }
-        }
-        val updated = when (normalizedMode) {
-            "overwrite" -> content
-            "append" -> current + content
-            "create" -> {
-                require(file.createNewFile()) { "文件已存在：$path" }
-                content
+            if (normalizedMode == "create") Files.move(temporary.toPath(), file.toPath())
+            else Files.move(temporary.toPath(), file.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        } finally { temporary.delete() }
+        val lines = if (encoding == "utf8") content.count { it == '\n' } + 1 else 0
+        val warning = if (lines > MAX_WRITE_LINES || bytes.size > MAX_WRITE_BYTES)
+            "本次写入已成功；下次建议每段不超过 50 行和 8 KiB，不要重复本次写入。" else null
+        return WriteResult(pathResolver.normalize(path), bytes.size, normalizedMode, sha256File(file), warning)
+    }
+
+    fun fileSha256(path: String, deadlineNanos: Long = Long.MAX_VALUE): String {
+        val file = pathResolver.resolve(path, write = false)
+        require(file.isFile && file.length() <= MAX_READ_FILE_BYTES) { "sha256 仅支持不超过 128 MiB 的文件" }
+        return sha256File(file, deadlineNanos)
+    }
+
+    fun zip(paths: List<String>, outputPath: String, maxBytes: Long, overwrite: Boolean, deadlineNanos: Long) =
+        zipArchives.zip(paths, outputPath, maxBytes, overwrite, deadlineNanos)
+
+    fun unzip(path: String, outputDir: String, maxBytes: Long, maxEntries: Int, filenameCharset: String, deadlineNanos: Long) =
+        zipArchives.unzip(path, outputDir, maxBytes, maxEntries, filenameCharset, deadlineNanos)
+
+    fun compress(
+        command: String, path: String?, base64: String?, outputPath: String?,
+        maxBytes: Long, previewChars: Int, overwrite: Boolean, deadlineNanos: Long,
+    ): kotlinx.serialization.json.JsonObject {
+        require(command in setOf("gunzip", "inflate", "gzip", "deflate")) { "未知压缩命令" }
+        require((path == null) != (base64 == null)) { "path 与 base64 必须二选一" }
+        require(maxBytes in 1..MAX_BINARY_FILE_BYTES) { "max_bytes 必须在 1..8388608 之间" }
+        require(previewChars in 0..2000) { "preview_chars 必须在 0..2000 之间" }
+        val deadline = minOf(deadlineNanos, System.nanoTime() + 120_000_000_000L)
+        check(System.nanoTime() < deadline) { "runtime_timeout: 执行预算已用尽" }
+        val destination = outputPath?.let { pathResolver.resolve(it, write = true) }
+        require(destination == null || (!destination.isDirectory && (overwrite || !destination.exists()))) { "输出文件已存在，覆盖需 overwrite=true" }
+        val inlineInput = if (path == null) File.createTempFile("compress-input-", ".tmp", appContext.cacheDir) else null
+        var temporary: File? = null
+        try {
+            val input = if (path != null) pathResolver.resolve(path, write = false) else inlineInput!!.also {
+                require(base64!!.length <= 40_000) { "内联 base64 输入过大，请使用 path" }
+                it.writeBytes(BinaryFileCodec.decode(base64, "base64"))
             }
-            "patch" -> TextPatchApplier.apply(current, content, startLine, endLine)
-            else -> error("不支持的写入模式：$mode")
-        }
-        if (normalizedMode != "create") writeTextAtomically(file, updated)
-        else file.writeText(updated, Charsets.UTF_8)
-        val bytes = content.toByteArray(Charsets.UTF_8).size
-        val lines = content.split('\n').size
-        val warning = if (lines > MAX_WRITE_LINES || bytes > MAX_WRITE_BYTES) {
-            "本次写入已成功，但内容为 $lines 行、$bytes 字节；下次建议分块写入，每段控制在 $MAX_WRITE_LINES 行和 $MAX_WRITE_BYTES 字节以内。"
-        } else {
-            null
-        }
-        return WriteResult(
-            path = pathResolver.normalize(path),
-            bytesWritten = bytes,
-            mode = normalizedMode,
-            sha256 = sha256(updated.toByteArray()),
-            warning = warning,
-        )
+            require(input.isFile && input.length() <= MAX_READ_FILE_BYTES) { "压缩输入仅支持不超过 128 MiB 的文件" }
+            require(input.canonicalFile != destination?.canonicalFile) { "输入输出不能是同一文件" }
+            destination?.parentFile?.mkdirs()
+            val output = File.createTempFile(".hanwo-compress-", ".tmp", destination?.parentFile ?: appContext.cacheDir)
+            temporary = output
+            val inlineLimit = minOf(28_000L, (38_000L - previewChars * 6) * 3 / 4)
+            val outputLimit = if (destination == null) minOf(maxBytes, inlineLimit) else maxBytes
+            val bytes = android.os.ParcelFileDescriptor.open(input, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { source ->
+                android.os.ParcelFileDescriptor.open(output, android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or android.os.ParcelFileDescriptor.MODE_TRUNCATE).use { target ->
+                    com.agent.voiceassistant.tools.runtime.NativeCompression.transform(source.fd, target.fd, command, outputLimit, deadline)
+                }
+            }
+            val hash = sha256File(output, deadline)
+            val inline = if (destination == null) BinaryFileCodec.encode(output.readBytes(), "base64") else null
+            val preview = if (previewChars == 0) null else {
+                val prefix = output.inputStream().use { stream -> ByteArray(minOf(output.length(), 8004L).toInt()).let { b -> val n = stream.read(b); if (n < 0) "" else b.copyOf(n).toString(Charsets.UTF_8).take(previewChars) } }
+                prefix
+            }
+            val result = kotlinx.serialization.json.buildJsonObject {
+                outputPath?.let { put("output_path", kotlinx.serialization.json.JsonPrimitive(pathResolver.normalize(it))) }
+                put("bytes", kotlinx.serialization.json.JsonPrimitive(bytes))
+                put("sha256", kotlinx.serialization.json.JsonPrimitive(hash))
+                inline?.let { put("base64", kotlinx.serialization.json.JsonPrimitive(it)) }
+                preview?.let { put("preview", kotlinx.serialization.json.JsonPrimitive(it)) }
+                put("has_more", kotlinx.serialization.json.JsonPrimitive(preview != null && bytes > preview.toByteArray(Charsets.UTF_8).size))
+            }
+            require(result.toString().length <= 40_000) { "压缩结果超出输出预算，请减少 preview_chars 或使用 output_path" }
+            check(System.nanoTime() < deadline && !Thread.currentThread().isInterrupted) { "runtime_timeout: 压缩结果发布前超时或取消" }
+            if (destination != null) {
+                if (overwrite) Files.move(output.toPath(), destination.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                else Files.move(output.toPath(), destination.toPath())
+            }
+            return result
+        } finally { inlineInput?.delete(); temporary?.delete() }
     }
 
     fun find(
@@ -579,13 +681,14 @@ class AndroidExecutionEnv(
         .digest(bytes)
         .joinToString("") { byte -> "%02x".format(byte) }
 
-    private fun sha256File(file: File): String {
+    private fun sha256File(file: File, deadlineNanos: Long = Long.MAX_VALUE): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
             val buffer = ByteArray(8 * 1024)
             while (true) {
                 val count = input.read(buffer)
                 if (count < 0) break
+                check(System.nanoTime() < deadlineNanos && !Thread.currentThread().isInterrupted) { "runtime_timeout: 文件摘要超时或已取消" }
                 digest.update(buffer, 0, count)
             }
         }
@@ -849,6 +952,7 @@ class AndroidExecutionEnv(
     private fun File.readLinesOrEmpty(): List<String> = runCatching { readLines() }.getOrDefault(emptyList())
 
     companion object {
+        private const val MAX_BINARY_FILE_BYTES = 8L * 1024 * 1024
         private const val DEFAULT_READ_LINES = 200
         private const val MAX_READ_LINES = 1_000
         private const val MAX_READ_FILE_BYTES = HttpResponseStore.MAX_FILE_BYTES

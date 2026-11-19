@@ -18,8 +18,8 @@ class RuntimeCommandRegistryPolicyTest {
 
     @Test
     fun auditedFileCommandsAreNotAvailableThroughRun() {
-        assertTrue(setOf("read", "write", "delete").all { it in RuntimeCommandRegistry.COMMANDS })
-        assertFalse(RuntimeCommandRegistry.RUN_COMMANDS.any { it in setOf("read", "write", "delete") })
+        assertTrue(setOf("read", "write", "delete", "zip", "unzip").all { it in RuntimeCommandRegistry.COMMANDS })
+        assertFalse(RuntimeCommandRegistry.RUN_COMMANDS.any { it in setOf("read", "write", "delete", "zip", "unzip") })
     }
 
     @Test

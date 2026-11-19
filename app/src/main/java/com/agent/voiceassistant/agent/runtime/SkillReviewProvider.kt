@@ -11,6 +11,7 @@ data class SkillReviewRequest(
     val runtime: String,
     val entry: String? = null,
     val permissions: Set<String> = emptySet(),
+    val permissionsDeclared: Boolean = false,
     val manifestVersion: Int = SkillReviewPolicy.MANIFEST_VERSION,
     val reviewPolicyVersion: Int = SkillReviewPolicy.VERSION,
     val candidateDigest: String,
@@ -31,6 +32,6 @@ object ManualSkillReviewProvider : SkillReviewProvider {
 }
 
 object SkillReviewPolicy {
-    const val MANIFEST_VERSION = 1
-    const val VERSION = 1
+    const val MANIFEST_VERSION = 2
+    const val VERSION = 2
 }

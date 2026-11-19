@@ -570,7 +570,7 @@ class MainToolRegistry(
 
     private fun readFile() = tool(
         name = TOOL_READ,
-        description = "读取虚拟文件系统中的一个或多个文本文件。只允许 /source、/logs 和 /workspace；目录列出和文件查找请使用 run。日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
+        description = "读取虚拟文件系统中的文本或二进制文件，encoding 默认 utf8。base64/hex 使用 byte_offset（从 0 开始）和 byte_limit 分页，不能混用行参数；二进制每次一个文件、上限 8 MiB。只允许 /source、/logs 和 /workspace；目录列出和文件查找请使用 run。日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
     ) {
         putJsonObject("path") {
             put("type", "string")
@@ -585,6 +585,9 @@ class MainToolRegistry(
                 put("type", "string")
             })
         }
+        putJsonObject("encoding") { put("type", "string"); put("enum", buildJsonArray { listOf("utf8", "base64", "hex").forEach { add(JsonPrimitive(it)) } }) }
+        putJsonObject("byte_offset") { put("type", "integer"); put("minimum", 0); put("description", "二进制起始字节，从 0 开始；续读使用 next_byte_offset") }
+        putJsonObject("byte_limit") { put("type", "integer"); put("minimum", 1); put("description", "base64 最多 28000 字节，hex 最多 18000 字节") }
         putJsonObject("offset") {
             put("type", "integer")
             put("minimum", 1)
@@ -628,7 +631,7 @@ class MainToolRegistry(
 
     private fun writeFile() = tool(
         name = TOOL_WRITE,
-        description = "在 /workspace 中创建、覆盖、追加或按行补丁 UTF-8 文本文件。大文本或诊断报告应优先分段写入：先 overwrite/create 首段，再用 append 续写；每段建议最多 50 行且不超过 8 KiB。即使一次写入超过建议值，工具仍会完成写入并返回警告；不得写入源码、日志或 Skill 目录。",
+        description = "在 /workspace 中创建、覆盖、追加或按行补丁文件。encoding 默认 utf8，也可 base64/hex 解码落盘（8 MiB 上限，不能 patch）。凭证引用不能写入文件，应经 Skill input 交给 http_request。大文本或诊断报告应优先分段写入：先 overwrite/create 首段，再用 append 续写；每段建议最多 50 行且不超过 8 KiB。即使一次写入超过建议值，工具仍会完成写入并返回警告；不得写入源码、日志或 Skill 目录。",
         required = listOf("path", "content"),
     ) {
         putJsonObject("path") {
@@ -639,6 +642,7 @@ class MainToolRegistry(
             put("type", "string")
             put("description", "写入文本。最佳实践是每段最多 50 行且不超过 8 KiB：第一段用 overwrite（新文件可用 create），后续用 append；超过建议值仍会写入成功，但结果会给出警告。")
         }
+        putJsonObject("encoding") { put("type", "string"); put("enum", buildJsonArray { listOf("utf8", "base64", "hex").forEach { add(JsonPrimitive(it)) } }) }
         putJsonObject("mode") {
             put("type", "string")
             put("enum", buildJsonArray {
@@ -689,7 +693,7 @@ class MainToolRegistry(
         }
         putJsonObject("args") {
             put("type", "object")
-            put("description", "list: path/offset/limit；find: path/query/max_results/max_depth；grep: path 或 paths、pattern（字面匹配）、ignore_case、max_results；stat/wc: path；sha256: value。参数可原样传给 Skill 中的 hanwo.同名命令(args)。")
+            put("description", "list: path/offset/limit；find: path/query（字面子串，不支持通配符）/max_results/max_depth；grep: path 或 paths、pattern（字面匹配）、ignore_case、max_results；stat/wc: path；sha256: value 或 path 二选一（按原始字节计算文件摘要）。参数可原样传给 Skill 中的 hanwo.同名命令(args)。")
         }
     }
 

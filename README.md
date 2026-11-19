@@ -15,6 +15,7 @@ Hanwo（喊我）是 Shroudway 的 Android 语音 Agent 主应用。它把手机
 - 可配置的模型服务
 - 对话文本中的凭证自动收纳，以及 HTTP 工具按引用使用凭证
 - HTTP 大响应自动缓存，以及流式下载到工作区
+- 工作区文件处理、ZIP 压缩与解压
 - Debug 调试 CLI
 - 可信 QuickJS Skill、内置运行时命令与聊天确认注册和变更
 
