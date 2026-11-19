@@ -2189,7 +2189,7 @@ class VoiceAgentService : Service() {
                 }
                 if (!toolRegistry.isReasoningEscalation(event.call)) {
                     when {
-                        toolRegistry.isSkillRead(event.call) -> store.recordEphemeralToolResult(
+                        !toolRegistry.shouldPersistToolCall(event.call) -> store.recordEphemeralToolResult(
                             event.turnId, event.call, event.result, event.success && !event.blocked,
                         )
                         else -> store.addToolResult(
@@ -2232,9 +2232,7 @@ class VoiceAgentService : Service() {
                     emptyList()
                 } else {
                     event.message.toolCalls.filter { call ->
-                        toolRegistry.isNativeTool(call.name) &&
-                            !toolRegistry.isSkillRead(call) &&
-                            !toolRegistry.isReasoningEscalation(call)
+                        toolRegistry.shouldPersistToolCall(call)
                     }
                 }
                 if (persistentCalls.isNotEmpty()) {

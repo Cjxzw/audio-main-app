@@ -2,6 +2,7 @@ package com.agent.voiceassistant.agent.runtime
 
 import com.agent.voiceassistant.agent.ExperimentalReplyParser
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.cloud.LlmHttpException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -703,6 +704,32 @@ class AgentLoopTest {
         assertEquals(1, arrayRuntime.requests.size)
     }
 
+    @Test fun `invalid local history ends without sending or awaiting recovery`() = runBlocking {
+        val runtime = FakeRuntime(ArrayDeque())
+        var completed = false
+        val result = AgentLoop(runtime).run(config(onTurnCompleted = { completed = true }).copy(
+            messages = listOf(CloudSpeechClient.LlmMessage("tool", "orphan", toolCallId = "missing")),
+        )) as AgentLoop.Outcome.Completed
+        assertFalse(result.successful)
+        assertTrue(result.finalText.contains("工具结果缺少对应调用"))
+        assertTrue(runtime.requests.isEmpty())
+        assertEquals(0, runtime.recoveryCalls)
+        assertTrue(completed)
+    }
+
+    @Test fun `http 400 and 422 finish once instead of waiting for continue`() = runBlocking {
+        for (status in listOf(400, 422)) {
+            val runtime = FakeRuntime(ArrayDeque(), modelError = LlmHttpException(status, "invalid tool protocol"))
+            var completed = false
+            val result = AgentLoop(runtime).run(config(onTurnCompleted = { completed = true })) as AgentLoop.Outcome.Completed
+            assertFalse(result.successful)
+            assertTrue(result.finalText.contains("HTTP $status"))
+            assertEquals(1, runtime.requests.size)
+            assertEquals(0, runtime.recoveryCalls)
+            assertTrue(completed)
+        }
+    }
+
     private fun config(
         maxToolRounds: Int = 2,
         onContextFinalized: (String, List<CloudSpeechClient.LlmMessage>) -> Unit = { _, _ -> },
@@ -739,6 +766,7 @@ class AgentLoopTest {
     private class FakeRuntime(
         private val responses: ArrayDeque<CloudSpeechClient.LlmMessage>,
         private val completions: ArrayDeque<CloudSpeechClient.ChatCompletion>? = null,
+        private val modelError: Throwable? = null,
         private val failedCallIds: Set<String> = emptySet(),
         private val parallelToolNames: Set<String> = emptySet(),
         private val toolDelayMs: Long = 0,
@@ -746,6 +774,11 @@ class AgentLoopTest {
             !it.content.isNullOrBlank()
         },
     ) : AgentLoop.Runtime {
+        var recoveryCalls = 0
+        override suspend fun awaitRecovery(reason: String, networkTimeout: Boolean): String {
+            recoveryCalls++
+            error("Unexpected recovery wait: $reason")
+        }
         val pendingNotices = mutableListOf<CloudSpeechClient.LlmMessage>()
         val acknowledgedNotices = mutableListOf<CloudSpeechClient.LlmMessage>()
         var afterTool: () -> Unit = {}
@@ -783,6 +816,7 @@ class AgentLoopTest {
             onStreamEvent: (CloudSpeechClient.ChatStreamEvent) -> Unit,
         ): AgentLoop.ModelTurn {
             requests += request
+            modelError?.let { throw it }
             val completion = completions?.removeFirstOrNull()
             val message = completion?.message ?: responses.removeFirst()
             message.reasoningContent?.let {

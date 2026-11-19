@@ -6,6 +6,8 @@ import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.cloud.ToolCallSafety
 import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.cloud.LlmTransportException
+import com.agent.voiceassistant.cloud.LlmHttpException
+import com.agent.voiceassistant.cloud.ToolMessageIntegrity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -252,6 +254,7 @@ class AgentLoop(
                         },
                     )
                     try {
+                        ToolMessageIntegrity.requireValid(request.messages)
                         val candidate = runtime.modelTurn(request, config.beforeSpeech) { streamEvent ->
                             when (streamEvent) {
                                 is CloudSpeechClient.ChatStreamEvent.ContentDelta -> {
@@ -333,6 +336,8 @@ class AgentLoop(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Throwable) {
+                        if (error is ToolMessageIntegrity.ProtocolException ||
+                            (error is LlmHttpException && error.statusCode in setOf(400, 422))) throw error
                         val networkError = error is NetworkTimeoutException || error is LlmTransportException
                         if (networkError && automaticallyRecover(error.message.orEmpty())) {
                             workingMessages += CloudSpeechClient.LlmMessage(
@@ -822,7 +827,14 @@ class AgentLoop(
                     error = error.message ?: error.javaClass.simpleName,
                 ),
             )
-            return finishLocalFailure("本回合未完成：${error.message ?: error.javaClass.simpleName}。请重新发送请求。")
+            val failureText = when {
+                error is ToolMessageIntegrity.ProtocolException ->
+                    "本回合已结束：${error.message}。请修正问题后重新发送请求。"
+                error is LlmHttpException && error.statusCode in setOf(400, 422) ->
+                    "本回合已结束：模型拒绝了请求格式或参数（HTTP ${error.statusCode}），继续重试不会修复此错误。请修正问题后重新发送请求。"
+                else -> "本回合未完成：${error.message ?: error.javaClass.simpleName}。请重新发送请求。"
+            }
+            return finishLocalFailure(failureText)
         }
     }
 

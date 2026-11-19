@@ -3,6 +3,7 @@ package com.agent.voiceassistant.agent.runtime
 import android.content.Context
 import android.util.AtomicFile
 import com.agent.voiceassistant.cloud.CloudSpeechClient
+import com.agent.voiceassistant.data.ToolHistoryRecovery
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -41,11 +42,15 @@ class ActiveTurnCheckpointStore(context: Context) {
     )
 
     private val file = AtomicFile(File(context.filesDir, "active-agent-turn.json"))
+    private val toolTraceDir = File(context.filesDir, "agent-runtime/tool-traces")
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
     fun load(): Snapshot? = synchronized(LOCK) {
         runCatching {
-            file.openRead().bufferedReader().use { json.decodeFromString<Snapshot>(it.readText()) }
+            val snapshot = file.openRead().bufferedReader().use { json.decodeFromString<Snapshot>(it.readText()) }
+            val messages = decode(snapshot.messages)
+            val repaired = ToolHistoryRecovery(toolTraceDir).repair(messages)
+            if (repaired == messages) snapshot else snapshot.copy(messages = encode(repaired)).also { save(it) }
         }.getOrNull()
     }
 

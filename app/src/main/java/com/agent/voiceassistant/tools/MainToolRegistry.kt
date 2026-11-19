@@ -87,7 +87,14 @@ class MainToolRegistry(
     fun isSkillRead(call: CloudSpeechClient.ToolCall): Boolean =
         call.name == TOOL_SKILL_USE && parseArguments(call.arguments).text("mode")?.lowercase() != "run"
 
-    fun isNativeTool(name: String): Boolean = name in NATIVE_TOOL_NAMES
+    private val nativeToolNames by lazy {
+        Profile.entries.flatMap { definitions(it, false) }.mapTo(hashSetOf()) { it.name }
+    }
+
+    fun isNativeTool(name: String): Boolean = name in nativeToolNames
+
+    fun shouldPersistToolCall(call: CloudSpeechClient.ToolCall): Boolean =
+        isNativeTool(call.name) && !isSkillRead(call) && !isReasoningEscalation(call)
 
     fun reasoningEscalationReason(call: CloudSpeechClient.ToolCall): String =
         (parseArguments(call.arguments)["reason"] as? JsonPrimitive)
@@ -784,14 +791,6 @@ class MainToolRegistry(
         const val TOOL_DELEGATE_TO_MAIN = "delegate_to_main"
         const val TOOL_REALTIME_HANGUP = "realtime_hangup"
 
-        val NATIVE_TOOL_NAMES = setOf(
-            TOOL_MEMORY_EDIT, TOOL_MEMORY_SEARCH, TOOL_WEB_SEARCH,
-            TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_HTTP_REQUEST, TOOL_RUN, TOOL_DESCRIBE_CREDENTIALS,
-            TOOL_SKILL_REGISTER,
-            TOOL_SKILL_USE, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,
-            TOOL_HUB_DISPATCH_TASK,
-            TOOL_MAIN_CONVERSATION_QUERY, TOOL_DELEGATE_TO_MAIN, TOOL_REALTIME_HANGUP,
-        )
         private const val MAX_DISPLAY_SUMMARY_CHARS = 48
 
         private val PARALLEL_SAFE_TOOL_NAMES = setOf(

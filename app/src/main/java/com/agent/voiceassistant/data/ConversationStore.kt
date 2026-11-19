@@ -24,6 +24,7 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 class ConversationStore(context: Context) {
@@ -63,7 +64,14 @@ class ConversationStore(context: Context) {
                 session.contextUsageTokens = tokens
                 true
             }
-            if (quarantined > 0 || recoveredUsage > 0) {
+            val repaired = if (!shared.historyIntegrityChecked) {
+                val recovery = ToolHistoryRecovery(toolTraceDir)
+                state.sessions.sumOf { repairPersistedToolHistory(it, recovery) }.also {
+                    shared.historyIntegrityChecked = true
+                }
+            } else 0
+            if (repaired > 0) Timber.w("ConversationStore: repaired $repaired tool history records")
+            if (quarantined > 0 || recoveredUsage > 0 || repaired > 0) {
                 persistLocked()
             }
         }
@@ -147,24 +155,61 @@ class ConversationStore(context: Context) {
     private fun llmHistoryLocked(
         session: ConversationSession,
         excludeMessageId: String?,
-    ): List<CloudSpeechClient.LlmMessage> =
-        session.messages
-            .filter { message ->
-                message.llmVisible ?: (message.role == "user" || message.role == "assistant")
-            }
-            .filter { it.role == "user" || it.role == "assistant" || it.role == "tool" }
-            .filterNot { it.id == excludeMessageId }
-            .map { message ->
-                CloudSpeechClient.LlmMessage(
-                    role = message.role,
-                    content = message.llmContent ?: message.content,
-                    toolCalls = message.toolCalls.map { call ->
-                        CloudSpeechClient.ToolCall(call.id, call.name, call.arguments)
-                    },
-                    toolCallId = message.toolCallId,
-                    attachmentPaths = message.attachments.map(StoredAttachment::virtualPath),
+    ): List<CloudSpeechClient.LlmMessage> = ToolHistoryRecovery(toolTraceDir).repair(
+        session.messages.filter { it.isModelHistory() && it.id != excludeMessageId }.map { it.toHistoryMessage() },
+    )
+
+    private fun StoredMessage.isModelHistory(): Boolean =
+        (llmVisible ?: (role == "user" || role == "assistant")) && role in setOf("user", "assistant", "tool")
+
+    private fun StoredMessage.toHistoryMessage() = CloudSpeechClient.LlmMessage(
+        role = role, content = llmContent ?: content,
+        toolCalls = toolCalls.map { CloudSpeechClient.ToolCall(it.id, it.name, it.arguments) },
+        toolCallId = toolCallId, attachmentPaths = attachments.map(StoredAttachment::virtualPath),
+    )
+
+    /** Keep every display/audit record; persist repaired model records without altering chat or activity. */
+    private fun repairPersistedToolHistory(session: ConversationSession, recovery: ToolHistoryRecovery): Int {
+        val byStoredId = session.messages.filter { it.isModelHistory() }.associate { it.id to it.toHistoryMessage() }
+        val originals = session.messages.mapNotNull { byStoredId[it.id] }
+        val repaired = recovery.repair(originals)
+        if (repaired == originals) return 0
+        val identity = IdentityHashMap<CloudSpeechClient.LlmMessage, Boolean>()
+        originals.forEach { identity[it] = true }
+        val merged = mutableListOf<StoredMessage>()
+        var cursor = 0
+        var changes = 0
+        fun appendNew(timestamp: Long) {
+            while (cursor < repaired.size && !identity.containsKey(repaired[cursor])) {
+                val message = repaired[cursor++]
+                merged += StoredMessage(
+                    id = UUID.randomUUID().toString(), role = message.role, content = message.content.orEmpty(), timestamp = timestamp,
+                    toolCalls = message.toolCalls.map { StoredToolCall(it.id, it.name, it.arguments) }, toolCallId = message.toolCallId,
+                    llmVisible = true, chatVisible = false,
+                    attachments = message.attachmentPaths.map { StoredAttachment(it) },
                 )
+                changes++
             }
+        }
+        session.messages.forEach { stored ->
+            val original = byStoredId[stored.id]
+            if (original == null) merged += stored else {
+                appendNew(stored.timestamp)
+                if (cursor < repaired.size && repaired[cursor] === original) {
+                    merged += stored
+                    cursor++
+                } else {
+                    merged += stored.copy(llmVisible = false)
+                    changes++
+                }
+            }
+        }
+        appendNew(session.updatedAt)
+        check(cursor == repaired.size) { "工具历史修复顺序异常" }
+        session.messages.clear()
+        session.messages.addAll(merged)
+        return changes
+    }
 
     fun addMessage(
         role: String,
@@ -373,11 +418,7 @@ class ConversationStore(context: Context) {
         timestamp: Long = System.currentTimeMillis(),
     ): StoredMessage {
         val rawContent = recordToolTrace(turnId, call, result, success, timestamp)
-        return addLlmMessageToConversation(
-            conversationId,
-            result.copy(content = ToolHistoryPolicy.compact(rawContent, turnId, call.id)),
-            timestamp,
-        )
+        return persistPairedToolResult(conversationId, call, result.copy(content = ToolHistoryPolicy.compact(rawContent, turnId, call.id)), timestamp)
     }
 
     private fun addLlmMessageToConversation(
@@ -622,10 +663,42 @@ class ConversationStore(context: Context) {
             "agent.tool.persisted_chars turn=$turnId id=${call.id} " +
                 "raw=${rawContent.length} stored=${compactContent.length}",
         )
-        return addLlmMessage(
-            message = result.copy(content = compactContent),
-            timestamp = timestamp,
+        return persistPairedToolResult(currentConversationId, call, result.copy(content = compactContent), timestamp)
+    }
+
+    private fun persistPairedToolResult(
+        conversationId: String,
+        call: CloudSpeechClient.ToolCall,
+        result: CloudSpeechClient.LlmMessage,
+        timestamp: Long,
+    ): StoredMessage = synchronized(lock) {
+        ToolCallSafety.requireValid(call)
+        require(result.role == "tool" && result.toolCallId == call.id) { "工具结果 ID 与调用不匹配" }
+        val stored = StoredMessage(
+            id = UUID.randomUUID().toString(), role = "tool", content = result.content.orEmpty(), timestamp = timestamp,
+            toolCallId = call.id, llmVisible = true, chatVisible = false,
         )
+        state.sessions.firstOrNull { it.id == conversationId }?.let { session ->
+            // Defensive fallback: result persistence can never introduce an orphan, even if an event was missed.
+            val history = session.messages.filter { it.isModelHistory() }
+            val headerIndex = history.indexOfLast { it.role != "tool" }
+            val hasPendingCall = headerIndex >= 0 && history[headerIndex].let { header ->
+                header.role == "assistant" && header.toolCalls.any {
+                    it.id == call.id && it.name == call.name && it.arguments == call.arguments
+                }
+            } && history.drop(headerIndex + 1).none { it.toolCallId == call.id }
+            if (!hasPendingCall) {
+                repairPersistedToolHistory(session, ToolHistoryRecovery(toolTraceDir))
+                session.messages += StoredMessage(
+                    id = UUID.randomUUID().toString(), role = "assistant", content = "", timestamp = timestamp,
+                    toolCalls = listOf(StoredToolCall(call.id, call.name, call.arguments)), llmVisible = true, chatVisible = false,
+                )
+            }
+            session.messages += stored
+            session.updatedAt = timestamp
+            persistLocked()
+        }
+        stored
     }
 
     fun addHarnessResult(
@@ -1398,7 +1471,7 @@ internal fun renderRuleLedger(
     append("规则解释：按版本顺序应用增量更新；同一规则以最新操作为准。规则由用户维护，模型只读；规则不得覆盖系统安全边界和工具权限。")
 }
 
-private data class SharedConversationState(var state: StoreState)
+private data class SharedConversationState(var state: StoreState, var historyIntegrityChecked: Boolean = false)
 
 internal object ToolHistoryPolicy {
     const val MAX_CURRENT_TURN_RESULT_CHARS = 22_000
