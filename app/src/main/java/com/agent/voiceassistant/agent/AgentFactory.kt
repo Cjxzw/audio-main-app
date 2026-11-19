@@ -14,7 +14,7 @@ import java.time.Duration
  * 设计：
  * - 使用 [MessageWindowChatMemory] 管理上下文（保留最近 20 条消息）
  * - 通过 [OpenAiChatModel] 接 StepFun（OpenAI 兼容 API）
- * - 工具对象通过 [AgentTools] 注入，包含天气/时间/任务委派等
+ * - 工具对象通过 [AgentTools] 注入，包含时间/任务委派等
  *
  * Android 兼容性注意：
  * - 只用核心模块（chatModel + tools + chatMemory）

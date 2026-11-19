@@ -1,5 +1,6 @@
 package com.agent.voiceassistant.agent.runtime
 
+import com.agent.voiceassistant.tools.runtime.RuntimeCommandRegistry
 import java.io.File
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.ByteBuffer
@@ -20,6 +21,14 @@ class SkillRegistry(
 ) {
     enum class Residency { TURN, CONVERSATION }
 
+    enum class Runtime { TEXT, QUICKJS, LEGACY_SHELL }
+
+    data class RuntimeMetadata(
+        val runtime: Runtime,
+        val entry: String?,
+        val permissions: Set<String>,
+    )
+
     data class Skill(
         val id: String,
         val name: String,
@@ -30,6 +39,9 @@ class SkillRegistry(
         val system: Boolean = false,
         val residency: Residency = Residency.CONVERSATION,
         val version: String = "",
+        val runtime: Runtime = Runtime.TEXT,
+        val entry: String? = null,
+        val permissions: Set<String> = emptySet(),
     )
 
     data class Registration(
@@ -53,6 +65,14 @@ class SkillRegistry(
     )
 
     data class ScriptResource(
+        val skill: Skill,
+        val resourceName: String,
+        val file: File,
+        val root: File,
+        val sha256: String,
+    )
+
+    data class QuickJsResource(
         val skill: Skill,
         val resourceName: String,
         val file: File,
@@ -94,7 +114,7 @@ class SkillRegistry(
         return buildString {
             appendLine("可用 Skill（只注入索引；需要使用时调用 skill_use）：")
             skills.forEach { skill ->
-                appendLine("- ${skill.name}: ${skill.description}（${skill.residency.name}）")
+                appendLine("- ${skill.name}: ${skill.description}（${skill.residency.name}，runtime=${skill.runtime.name.lowercase(Locale.ROOT)}${skill.entry?.let { ", entry=$it" } ?: ""}）")
             }
         }.trimEnd()
     }
@@ -162,7 +182,17 @@ class SkillRegistry(
         val root = File(if (current.enabled) skillsRoot else disabledSkillsRoot, current.id)
         val core = File(root, "SKILL.md")
         require(body.toByteArray().size <= MAX_CORE_BYTES) { "Skill 核心文件过大" }
-        core.writeText(renderSkill(name, description, body), Charsets.UTF_8)
+        val metadata = parseFrontMatter(core.readText(Charsets.UTF_8))
+        val next = renderSkill(
+            name,
+            description,
+            body,
+            runtime = metadata["runtime"],
+            entry = metadata["entry"],
+            permissions = metadata["permissions"],
+        )
+        validateCoreContent(current, next)
+        atomicWrite(core, next)
         writeIds(modifiedManifest, readIds(modifiedManifest) + current.id)
         return loadSkill(root, current.enabled) ?: error("Skill 更新后无法解析")
     }
@@ -175,7 +205,20 @@ class SkillRegistry(
         requireUniqueName(name, current.id)
         val root = skillRoot(current)
         val core = File(root, "SKILL.md")
-        atomicWrite(core, renderSkill(name, description, stripFrontMatter(core.readText(Charsets.UTF_8))))
+        val metadata = parseFrontMatter(core.readText(Charsets.UTF_8))
+        val next = renderSkill(
+            name,
+            description,
+            stripFrontMatter(core.readText(Charsets.UTF_8)),
+            runtime = metadata["runtime"],
+            entry = metadata["entry"],
+            permissions = metadata["permissions"],
+        )
+        validateCoreContent(current, next)
+        atomicWrite(
+            core,
+            next,
+        )
         markModified(current.id)
         return loadSkill(root, current.enabled) ?: error("Skill 更新后无法解析")
     }
@@ -260,6 +303,26 @@ class SkillRegistry(
         require(file.toPath().startsWith(root.toPath()) && file.isFile) { "Skill 脚本不存在" }
         require(!Files.isSymbolicLink(file.toPath())) { "不支持执行符号链接脚本" }
         return ScriptResource(skill, resource, file, root, sha256(file.readBytes()))
+    }
+
+    fun quickJsScript(skillName: String, resourceName: String? = null): QuickJsResource {
+        val normalized = normalizeName(skillName)
+        val skill = listAll().singleOrNull { normalizeName(it.name) == normalized }
+            ?: error("没有找到名称为 '" + skillName + "' 的 Skill")
+        require(skill.enabled) { "Skill 已停用：" + skill.name }
+        require(skill.runtime == Runtime.QUICKJS) { "Skill 不是 QuickJS Skill：" + skill.name }
+        val resource = (resourceName ?: skill.entry ?: "main.js").trim().replace('\\', '/')
+        require(resource == skill.entry) { "QuickJS Skill 只能执行声明的 entry：${skill.entry}" }
+        require(resource.isNotBlank() && !resource.startsWith('/') && ".." !in resource.split('/')) { "脚本必须使用 Skill 内的相对路径" }
+        require(resource.lowercase(Locale.ROOT).endsWith(".js") || resource.lowercase(Locale.ROOT).endsWith(".mjs")) {
+            "QuickJS Skill 入口必须是 .js 或 .mjs"
+        }
+        val root = skillRoot(skill).canonicalFile
+        val file = File(root, resource).canonicalFile
+        require(file.toPath().startsWith(root.toPath()) && file.isFile) { "QuickJS Skill 入口不存在" }
+        require(!Files.isSymbolicLink(file.toPath())) { "不支持执行符号链接脚本" }
+        require(hasQuickJsMain(file.readText(Charsets.UTF_8))) { "QuickJS Skill 入口必须定义 main(input)" }
+        return QuickJsResource(skill, resource, file, root, sha256(file.readBytes()))
     }
 
     fun exportTo(id: String, target: File): Skill {
@@ -438,7 +501,7 @@ class SkillRegistry(
         require(files.size <= MAX_FILES) { "Skill 文件过多，最多 $MAX_FILES 个" }
         require(files.none { Files.isSymbolicLink(it.toPath()) }) { "Skill 不允许包含符号链接" }
         require(files.sumOf(File::length) <= MAX_TOTAL_BYTES) { "Skill 总大小超过限制" }
-        require(files.none { it.extension.lowercase(Locale.ROOT) in setOf("py", "jar", "class", "dex", "so", "exe", "bat", "cmd", "ps1") }) { "当前只支持 sh 脚本运行时" }
+        require(files.none { it.extension.lowercase(Locale.ROOT) in setOf("py", "jar", "class", "dex", "so", "exe", "bat", "cmd", "ps1") }) { "当前只支持文本和 QuickJS Skill 资源" }
         files.forEach { file ->
             require(file.length() <= MAX_FILE_BYTES) { "文件过大：${file.name}" }
             val bytes = file.readBytes()
@@ -454,6 +517,8 @@ class SkillRegistry(
         require(requestedCore.toPath().startsWith(sourceRoot.canonicalFile.toPath()) && requestedCore.isFile) {
             "核心文件不存在或路径越界：$coreFile"
         }
+        val sourceMetadata = parseFrontMatter(requestedCore.readText(Charsets.UTF_8))
+        validateRuntimePackage(sourceRoot, sourceMetadata)
         val id = uniqueId(slug(name).ifBlank { slug(source.nameWithoutExtension) }.ifBlank { "skill" })
         val target = File(skillsRoot, id)
         require(!target.exists()) { "Skill 已存在：$id" }
@@ -467,7 +532,17 @@ class SkillRegistry(
         val movedCore = File(target, requestedCore.relativeTo(sourceRoot).path)
         val standardCore = File(target, "SKILL.md")
         val body = stripFrontMatter(movedCore.readText(Charsets.UTF_8))
-        standardCore.writeText(renderSkill(name, description, body), Charsets.UTF_8)
+        standardCore.writeText(
+            renderSkill(
+                name,
+                description,
+                body,
+                runtime = sourceMetadata["runtime"],
+                entry = sourceMetadata["entry"],
+                permissions = sourceMetadata["permissions"],
+            ),
+            Charsets.UTF_8,
+        )
         if (movedCore != standardCore) movedCore.delete()
         removeDeletedTombstone(id)
         val skill = loadSkill(target, enabled = true) ?: error("Skill 注册后无法解析")
@@ -475,30 +550,46 @@ class SkillRegistry(
     }
 
     private fun loadSkill(directory: File, enabled: Boolean, system: Boolean = false): Skill? {
-        val file = File(directory, "SKILL.md")
-        if (!file.isFile) return null
-        val text = runCatching { file.readText(Charsets.UTF_8) }.getOrNull() ?: return null
-        val metadata = parseFrontMatter(text)
-        val name = metadata["name"]?.takeIf(String::isNotBlank) ?: directory.name
-        val description = metadata["description"]?.takeIf(String::isNotBlank)
-            ?: stripFrontMatter(text).lineSequence().firstOrNull { it.isNotBlank() }?.removePrefix("#")?.trim()
-            ?: "按需加载的本地工作流"
-        return Skill(
-            id = directory.name,
-            name = name.take(80),
-            description = description.take(300),
-            virtualPath = "/skills/${directory.name}/SKILL.md",
-            enabled = enabled,
-            system = system,
-            residency = if (system) Residency.TURN else Residency.CONVERSATION,
-            version = skillVersion(directory),
-        )
+        return runCatching {
+            val file = File(directory, "SKILL.md")
+            if (!file.isFile) return@runCatching null
+            val text = file.readText(Charsets.UTF_8)
+            val metadata = parseFrontMatter(text)
+            val runtimeMetadata = resolveRuntimeMetadata(directory, metadata)
+            val name = metadata["name"]?.takeIf(String::isNotBlank) ?: directory.name
+            val description = metadata["description"]?.takeIf(String::isNotBlank)
+                ?: stripFrontMatter(text).lineSequence().firstOrNull { it.isNotBlank() }?.removePrefix("#")?.trim()
+                ?: "按需加载的本地工作流"
+            Skill(
+                id = directory.name,
+                name = name.take(80),
+                description = description.take(300),
+                virtualPath = "/skills/${directory.name}/SKILL.md",
+                enabled = enabled,
+                system = system,
+                residency = if (system) Residency.TURN else Residency.CONVERSATION,
+                version = skillVersion(directory),
+                runtime = runtimeMetadata.runtime,
+                entry = runtimeMetadata.entry,
+                permissions = runtimeMetadata.permissions,
+            )
+        }.getOrNull()
     }
 
-    private fun renderSkill(name: String, description: String, body: String): String = buildString {
+    private fun renderSkill(
+        name: String,
+        description: String,
+        body: String,
+        runtime: String? = null,
+        entry: String? = null,
+        permissions: String? = null,
+    ): String = buildString {
         appendLine("---")
         appendLine("name: ${name.trim().take(80)}")
         appendLine("description: ${description.trim().replace('\n', ' ').take(300)}")
+        runtime?.trim()?.takeIf(String::isNotBlank)?.let { appendLine("runtime: " + it.take(32)) }
+        entry?.trim()?.takeIf(String::isNotBlank)?.let { appendLine("entry: " + it.take(160)) }
+        permissions?.trim()?.takeIf(String::isNotBlank)?.let { appendLine("permissions: " + it.take(500)) }
         appendLine("---")
         appendLine()
         append(body.trim())
@@ -522,7 +613,7 @@ class SkillRegistry(
             if (index <= 0) return@mapNotNull null
             val key = line.substring(0, index).trim()
             val value = line.substring(index + 1).trim().trim('"', '\'')
-            if (key in setOf("name", "description")) key to value else null
+            if (key in setOf("name", "description", "runtime", "entry", "permissions")) key to value else null
         }.toMap()
     }
 
@@ -548,7 +639,73 @@ class SkillRegistry(
         val metadata = parseFrontMatter(content)
         val name = metadata["name"]?.takeIf(String::isNotBlank) ?: skill.id
         requireUniqueName(name, skill.id)
+        validateRuntimePackage(skillRoot(skill), metadata)
     }
+
+    private fun resolveRuntimeMetadata(directory: File, metadata: Map<String, String>): RuntimeMetadata {
+        val explicitRuntime = metadata["runtime"]?.lowercase(Locale.ROOT)
+        val runtime = when (explicitRuntime) {
+            null, "" -> when {
+                File(directory, "main.js").isFile -> Runtime.QUICKJS
+                directory.walkTopDown().any { it.isFile && it.extension.equals("sh", ignoreCase = true) } -> Runtime.LEGACY_SHELL
+                else -> Runtime.TEXT
+            }
+            "quickjs", "qjs" -> Runtime.QUICKJS
+            "shell", "sh", "legacy_shell" -> Runtime.LEGACY_SHELL
+            "text" -> Runtime.TEXT
+            else -> error("不支持的 Skill runtime：${metadata["runtime"]}")
+        }
+        val entry = metadata["entry"]?.trim()?.takeIf(String::isNotBlank)
+            ?: when (runtime) {
+                Runtime.QUICKJS -> "main.js"
+                Runtime.LEGACY_SHELL -> directory.walkTopDown().firstOrNull { it.isFile && it.extension.equals("sh", ignoreCase = true) }
+                    ?.relativeTo(directory)?.invariantSeparatorsPath
+                Runtime.TEXT -> null
+            }
+        val permissions = metadata["permissions"]
+            ?.split(',', ' ', '\n', '\r', '\t')
+            ?.map(String::trim)
+            ?.filter(String::isNotBlank)
+            ?.toSet()
+            .orEmpty()
+        val unknownPermissions = permissions - RuntimeCommandRegistry.COMMANDS
+        require(unknownPermissions.isEmpty()) {
+            "Skill permissions 包含未知运行时命令：${unknownPermissions.joinToString()}"
+        }
+        when (runtime) {
+            Runtime.QUICKJS -> {
+                val normalized = requireEntry(directory, entry, setOf("js", "mjs"), "QuickJS")
+                require(hasQuickJsMain(normalized.readText(Charsets.UTF_8))) { "QuickJS Skill 入口必须定义 main(input)" }
+            }
+            Runtime.LEGACY_SHELL -> requireEntry(directory, entry, setOf("sh"), "Shell")
+            Runtime.TEXT -> require(entry == null) { "文本 Skill 不能声明 entry" }
+        }
+        return RuntimeMetadata(runtime, entry, permissions)
+    }
+
+    private fun validateRuntimePackage(directory: File, metadata: Map<String, String>) {
+        resolveRuntimeMetadata(directory, metadata)
+    }
+
+    private fun requireEntry(directory: File, entry: String?, extensions: Set<String>, label: String): File {
+        val normalized = entry?.trim()?.replace('\\', '/')
+            ?: error("$label Skill 缺少 entry")
+        require(normalized.isNotBlank() && !normalized.startsWith('/') && ".." !in normalized.split('/')) {
+            "$label Skill entry 路径无效"
+        }
+        val file = File(directory, normalized).canonicalFile
+        require(file.toPath().startsWith(directory.canonicalFile.toPath()) && file.isFile) {
+            "$label Skill entry 不存在：$normalized"
+        }
+        require(!Files.isSymbolicLink(file.toPath())) { "$label Skill entry 不支持符号链接" }
+        require(file.extension.lowercase(Locale.ROOT) in extensions) { "$label Skill entry 扩展名无效" }
+        require(isEditableText(file)) { "$label Skill entry 必须是 UTF-8 文本" }
+        return file
+    }
+
+    private fun hasQuickJsMain(source: String): Boolean = Regex(
+        "(?m)\\bfunction\\s+main\\s*\\(|\\b(?:const|let|var)\\s+main\\s*=|\\bglobalThis\\.main\\s*=",
+    ).containsMatchIn(source)
 
     private fun normalizeName(value: String): String = Normalizer.normalize(
         value.trim().replace(Regex("\\s+"), " "),

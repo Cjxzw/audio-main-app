@@ -18,7 +18,7 @@ SPEC.loader.exec_module(hanwo_dev)
 class HanwoDevTest(unittest.TestCase):
     def test_skill_commands_reuse_tool_entry_and_have_no_approval_bypass(self):
         parser = hanwo_dev.build_parser()
-        args = parser.parse_args(["skills", "run", "检查服务器", "scripts/check.sh", "--timeout-seconds", "15"])
+        args = parser.parse_args(["skills", "run", "检查服务器", "main.js", "--timeout-seconds", "15"])
         command, arguments, timeout = hanwo_dev.bridge_command(args)
         self.assertEqual("skills.tool", command)
         self.assertEqual("skill.use", arguments["operation"])

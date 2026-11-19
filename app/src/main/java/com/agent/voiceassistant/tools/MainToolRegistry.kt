@@ -4,10 +4,9 @@ import com.agent.voiceassistant.agent.AgentAction
 import com.agent.voiceassistant.cloud.CloudSpeechClient
 import com.agent.voiceassistant.hub.HubRuntime
 import com.agent.voiceassistant.tasks.AsyncTaskCoordinator
-import com.agent.voiceassistant.tasks.SongGenerationExecutor
 import com.agent.voiceassistant.tasks.TaskPriority
 import com.agent.voiceassistant.tasks.TaskRepository
-import com.agent.voiceassistant.tasks.TaskSubmission
+import com.agent.voiceassistant.tools.runtime.RuntimeCommandRegistry
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -65,37 +64,25 @@ class MainToolRegistry(
         return listOf(
             memoryEdit(),
             memorySearch(),
-            locationRefresh(),
-            locationReverseGeocode(),
-            weatherCurrent(),
             webSearch(),
             readFile(),
             writeFile(),
             workspaceDelete(),
-            execCommand(),
             httpRequest(),
+            runCommand(),
             describeCredentials(),
-            codeGraphSearch(),
-            codeGraphExplain(),
             skillRegister(),
             skillEdit(),
             skillUse(),
-            voiceReply(),
-            singSong(),
             taskStatus(),
             cancelTask(),
-            agentSleep(),
             hubDispatchTask(),
         )
     }
 
     fun isReasoningEscalation(call: CloudSpeechClient.ToolCall): Boolean = false
 
-    fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean =
-        call.name == TOOL_VOICE_REPLY || call.name == TOOL_AGENT_SLEEP
-
-    fun isAgentSleep(call: CloudSpeechClient.ToolCall): Boolean =
-        call.name == TOOL_AGENT_SLEEP
+    fun isTerminalPresentation(call: CloudSpeechClient.ToolCall): Boolean = false
 
     fun isSkillRead(call: CloudSpeechClient.ToolCall): Boolean =
         call.name == TOOL_SKILL_USE && parseArguments(call.arguments).text("mode")?.lowercase() != "run"
@@ -111,13 +98,8 @@ class MainToolRegistry(
             ?: "模型判断当前问题需要深入分析"
 
     fun canExecuteInParallel(call: CloudSpeechClient.ToolCall): Boolean = when (call.name) {
-        TOOL_HTTP_REQUEST -> {
-            val method = (parseArguments(call.arguments)["method"] as? JsonPrimitive)
-                ?.content
-                ?.uppercase()
-                ?: "GET"
-            method == "GET" || method == "HEAD"
-        }
+        TOOL_HTTP_REQUEST -> false
+        TOOL_RUN -> false
         else -> call.name in PARALLEL_SAFE_TOOL_NAMES
     }
 
@@ -150,18 +132,12 @@ class MainToolRegistry(
         val legacyAction = when (call.name) {
             TOOL_MEMORY_EDIT -> "memory.edit"
             TOOL_MEMORY_SEARCH -> "memory.search"
-            TOOL_LOCATION_REFRESH -> "location.refresh"
-            TOOL_LOCATION_REVERSE_GEOCODE -> "location.reverse_geocode"
-            TOOL_WEATHER_CURRENT -> "weather.get_current"
             TOOL_WEB_SEARCH -> "web.search"
             TOOL_SKILL_USE -> "skill.use"
             TOOL_READ -> "read"
             TOOL_WRITE -> "write"
-            TOOL_WORKSPACE_DELETE -> "workspace.delete"
-            TOOL_EXEC -> "exec"
+            TOOL_WORKSPACE_DELETE -> "delete"
             TOOL_HTTP_REQUEST -> "http_request"
-            TOOL_CODE_GRAPH_SEARCH -> "code.graph.search"
-            TOOL_CODE_GRAPH_EXPLAIN -> "code.graph.explain"
             TOOL_SKILL_CREATE -> "skill.create"
             TOOL_SKILL_EDIT -> "skill.edit"
             TOOL_SKILL_REGISTER -> "skill.register"
@@ -300,35 +276,6 @@ class MainToolRegistry(
         )
         val context = taskContext()
         return when (call.name) {
-            TOOL_SING_SONG -> {
-                val lyrics = payload.text("lyrics")
-                    ?: return LocalToolExecutor.ToolResult(call.name, "唱歌任务创建失败", "sing_song 缺少 lyrics。", true, false)
-                require(lyrics.length <= 2_000) { "歌词不能超过 2000 字" }
-                val title = payload.text("title") ?: "未命名歌曲"
-                val taskPayload = buildJsonObject {
-                    payload.forEach { (key, value) -> put(key, value) }
-                    put("_silent_audio", context.silentAudio)
-                }
-                val task = coordinator.submit(
-                    TaskSubmission(
-                        taskType = SongGenerationExecutor.TYPE,
-                        title = "演唱《$title》",
-                        executorId = "local:song-generator",
-                        executorName = "手机本地唱歌执行器",
-                        conversationId = context.conversationId,
-                        sourceTurnId = context.sourceTurnId,
-                        priority = if (payload.text("urgent")?.toBooleanStrictOrNull() == true) TaskPriority.URGENT else TaskPriority.NORMAL,
-                        inputJson = taskPayload.toString(),
-                        idempotencyKey = "tool:${call.id}",
-                    ),
-                )
-                LocalToolExecutor.ToolResult(
-                    actionType = call.name,
-                    displayText = "歌曲正在准备 · ${task.taskId.takeLast(8)}",
-                    contextText = "唱歌任务已创建。task_id=${task.taskId}，status=${task.status.lowercase()}。请立即告诉用户：歌手正在开嗓，请稍后。不要等待歌曲生成，也不要再次调用 sing_song。",
-                    shouldAskLlm = true,
-                )
-            }
             TOOL_TASK_STATUS -> {
                 val task = payload.text("task_id")?.let { coordinator.get(it) }
                     ?: coordinator.latestActive(context.conversationId)
@@ -361,9 +308,6 @@ class MainToolRegistry(
     fun displayName(toolName: String): String = when (toolName) {
         TOOL_MEMORY_EDIT -> "编辑记忆"
         TOOL_MEMORY_SEARCH -> "查询记忆"
-        TOOL_LOCATION_REFRESH -> "刷新定位"
-        TOOL_LOCATION_REVERSE_GEOCODE -> "解析当前位置"
-        TOOL_WEATHER_CURRENT -> "查询天气"
         TOOL_WEB_SEARCH -> "网络搜索"
         TOOL_SKILL_USE -> "使用 Skill"
         TOOL_SKILL_CREATE -> "创建 Skill"
@@ -371,15 +315,10 @@ class MainToolRegistry(
         TOOL_READ -> "读取文件"
         TOOL_WRITE -> "写入文件"
         TOOL_WORKSPACE_DELETE -> "移入回收站"
-        TOOL_EXEC -> "执行命令"
+        TOOL_RUN -> "运行受控命令"
         TOOL_HTTP_REQUEST -> "发送网络请求"
         TOOL_DESCRIBE_CREDENTIALS -> "查询凭证"
-        TOOL_CODE_GRAPH_SEARCH -> "查询代码图谱"
-        TOOL_CODE_GRAPH_EXPLAIN -> "解释代码符号"
         TOOL_SKILL_REGISTER -> "注册 Skill"
-        TOOL_AGENT_SLEEP -> "进入休眠"
-        TOOL_VOICE_REPLY -> "个性化播报"
-        TOOL_SING_SONG -> "准备歌曲"
         TOOL_TASK_STATUS -> "查询任务"
         TOOL_CANCEL_TASK -> "取消任务"
         TOOL_HUB_DISPATCH_TASK -> "下发远程任务"
@@ -394,11 +333,6 @@ class MainToolRegistry(
         val value = when (call.name) {
             TOOL_MEMORY_EDIT -> payload.text("memory_id")?.let { "${payload.text("mode") ?: "编辑"} ${it.take(12)}" }
             TOOL_MEMORY_SEARCH -> payload.text("query")
-            TOOL_LOCATION_REFRESH -> "获取缓存"
-            TOOL_LOCATION_REVERSE_GEOCODE -> "解析地址"
-            TOOL_WEATHER_CURRENT -> listOfNotNull(payload.text("location"), payload.text("date"))
-                .joinToString(" · ")
-                .ifBlank { "当前位置" }
             TOOL_WEB_SEARCH -> payload.text("query")
             TOOL_SKILL_USE -> payload.text("skill_name")
             TOOL_SKILL_CREATE, TOOL_SKILL_EDIT -> payload.text("skill_name")
@@ -406,15 +340,9 @@ class MainToolRegistry(
                 ?: (payload["paths"] as? JsonArray)?.size?.let { "$it 个项目" }
             TOOL_WRITE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
             TOOL_WORKSPACE_DELETE -> payload.text("path")?.trimEnd('/')?.substringAfterLast('/')
-            TOOL_EXEC -> (payload["argv"] as? JsonArray)
-                ?.firstOrNull()
-                ?.let { it as? JsonPrimitive }
-                ?.content
+            TOOL_RUN -> payload.text("command")
             TOOL_HTTP_REQUEST -> payload.text("download_to") ?: payload.text("url")
-            TOOL_CODE_GRAPH_SEARCH -> payload.text("query")
-            TOOL_CODE_GRAPH_EXPLAIN -> payload.text("symbol")
             TOOL_SKILL_REGISTER -> payload.text("name")
-            TOOL_SING_SONG -> payload.text("title") ?: "未命名歌曲"
             TOOL_TASK_STATUS, TOOL_CANCEL_TASK -> payload.text("task_id")
             TOOL_MAIN_CONVERSATION_QUERY -> payload.text("keyword") ?: "最近对话"
             TOOL_DELEGATE_TO_MAIN -> payload.text("content")
@@ -429,9 +357,7 @@ class MainToolRegistry(
 
     fun countsTowardAutomaticReasoning(call: CloudSpeechClient.ToolCall): Boolean =
             call.name != TOOL_HUB_DISPATCH_TASK &&
-            call.name != TOOL_PROTOCOL_REPAIR &&
-            call.name != TOOL_AGENT_SLEEP &&
-            call.name != TOOL_VOICE_REPLY
+            call.name != TOOL_PROTOCOL_REPAIR
 
     private fun parseArguments(raw: String): JsonObject {
         if (raw.isBlank()) return JsonObject(emptyMap())
@@ -474,22 +400,22 @@ class MainToolRegistry(
 
     private fun skillUse() = tool(
         name = TOOL_SKILL_USE,
-        description = "按名称加载或运行一个已启用 Skill。默认 mode=load，只读取 SKILL.md 或指定文本资源；mode=run 时必须明确指定 Skill 内的 .sh 文件，进入脚本执行器。脚本可直接使用 /workspace、/source、/logs 路径并支持凭证引用。",
+        description = "按名称加载或运行一个已启用 Skill。默认 mode=load，只读取 SKILL.md 或指定文本资源；mode=run 时必须明确指定 Skill 声明的 QuickJS entry。脚本通过 hanwo.同名命令(args) 使用白名单运行时命令，不启动系统 Shell。",
         required = listOf("skill_name"),
     ) {
         putJsonObject("skill_name") { put("type", "string") }
         putJsonObject("mode") {
             put("type", "string")
             put("enum", buildJsonArray { add(JsonPrimitive("load")); add(JsonPrimitive("run")) })
-            put("description", "load 读取资源；run 执行 Skill 内指定的 .sh 脚本")
+            put("description", "load 读取资源；run 执行 Skill 声明的 QuickJS entry")
         }
         putJsonObject("resource_name") {
             put("type", "string")
-            put("description", "Skill 内相对路径；run 模式必须是 .sh，例如 scripts/check-server.sh")
+            put("description", "Skill 内相对路径；run 模式必须匹配 SKILL.md 的 entry，例如 main.js")
         }
         putJsonObject("input") {
             put("type", "string")
-            put("description", "run 模式传给脚本 stdin 的 JSON 或文本")
+            put("description", "run 模式传给 QuickJS main(input) 的 JSON 字符串")
         }
         putJsonObject("timeout_seconds") {
             put("type", "integer")
@@ -500,7 +426,7 @@ class MainToolRegistry(
 
     private fun skillRegister() = tool(
         name = TOOL_SKILL_REGISTER,
-        description = "将 /workspace 中准备好的 Skill 候选提交注册请求。Skill 可以包含 SKILL.md、文本资源和 .sh 脚本；脚本 Skill 注册或变更必须等待用户在聊天中批准后才生效。已有待处理事项时不得创建新的注册或变更请求。",
+        description = "将 /workspace 中准备好的 Skill 候选提交注册请求。Skill 可以包含 SKILL.md、文本资源和 QuickJS entry；运行时、入口和权限会在审批摘要中记录，注册或变更必须等待用户在聊天中批准后才生效。已有待处理事项时不得创建新的注册或变更请求。",
         required = listOf("source_path", "name", "description", "core_file", "compatibility_notes", "reviewed_files"),
     ) {
         putJsonObject("source_path") {
@@ -612,30 +538,6 @@ class MainToolRegistry(
         description = "主动挂断当前 Realtime 实时语音通话。仅当用户明确要求结束通话、挂断或离开时调用；调用后立即关闭 Realtime 音频管线。",
     ) {}
 
-    private fun locationRefresh() = tool(
-        name = TOOL_LOCATION_REFRESH,
-        description = "获取手机当前位置缓存，并在允许时后台发起一次刷新。返回经纬度、精度、来源、定位时间和缓存状态；已有缓存时不等待刷新。启动或新话题也会自动后台刷新，成功后 5 分钟内不会重复请求系统定位。",
-    ) {}
-
-    private fun locationReverseGeocode() = tool(
-        name = TOOL_LOCATION_REVERSE_GEOCODE,
-        description = "将当前位置缓存中的经纬度解析为人类可读地址。只有用户询问街道、地址或当前位置名称时调用；天气、距离和地图类任务直接使用 location_refresh 返回的经纬度，不要先调用本工具。",
-    ) {}
-
-    private fun weatherCurrent() = tool(
-        name = TOOL_WEATHER_CURRENT,
-        description = "查询指定日期的天气预报和逐小时变化。未指定地点时使用手机当前位置；日期可填今天、明天、后天或 YYYY-MM-DD。",
-    ) {
-        putJsonObject("location") {
-            put("type", "string")
-            put("description", "用户指定的城市或地点，可省略")
-        }
-        putJsonObject("date") {
-            put("type", "string")
-            put("description", "目标日期：今天、明天、后天或 YYYY-MM-DD；省略时查询今天")
-        }
-    }
-
     private fun webSearch() = tool(
         name = TOOL_WEB_SEARCH,
         description = "仅用于公开网络信息的快速查询与简短事实核实，适合一次或少量查询即可完成的即时问答。多来源调研、系统性研究、竞品分析、编码及其他重型任务不得通过本工具自行展开，应调用 hub_dispatch_task 委派给远程执行器。禁止在查询中加入私人信息。",
@@ -649,63 +551,6 @@ class MainToolRegistry(
             put("type", "integer")
             put("minimum", 1)
             put("maximum", 10)
-        }
-    }
-
-    private fun voiceReply() = tool(
-        name = TOOL_VOICE_REPLY,
-        description = "终止型个性化语音回复。仅在用户明确要求临时更换音色、模仿特殊说话风格或设计新音色时使用。只支持讲话，不支持唱歌；唱歌必须调用 sing_song。调用即作为本回合最终答复，普通正文必须为空。",
-        required = listOf("text", "mode"),
-    ) {
-        putJsonObject("text") {
-            put("type", "string")
-            put("description", "本回合完整最终回复；不得在普通正文中重复输出")
-        }
-        putJsonObject("mode") {
-            put("type", "string")
-            put("enum", buildJsonArray { add(JsonPrimitive("preset")); add(JsonPrimitive("design")) })
-        }
-        putJsonObject("voice") {
-            put("type", "string")
-            put("enum", buildJsonArray {
-                listOf("冰糖", "茉莉", "苏打", "白桦").forEach { add(JsonPrimitive(it)) }
-            })
-            put("description", "preset 模式的内置音色，省略时使用冰糖")
-        }
-        putJsonObject("style_prompt") {
-            put("type", "string")
-            put("description", "preset 模式的语气、节奏、情绪要求")
-        }
-        putJsonObject("voice_prompt") {
-            put("type", "string")
-            put("description", "design 模式必填，描述目标音色、年龄感、音调和说话风格")
-        }
-    }
-
-    private fun singSong() = tool(
-        name = TOOL_SING_SONG,
-        description = "创建异步唱歌任务。仅当用户当前消息明确要求唱歌或演唱时调用。工具会立即返回 task_id，不等待音频生成；收到成功结果后告诉用户‘歌手正在开嗓，请稍后’，然后正常结束当前回合。朗诵歌词、普通配音或背景音乐请求不得调用。",
-        required = listOf("lyrics"),
-    ) {
-        putJsonObject("lyrics") {
-            put("type", "string")
-            put("description", "需要演唱的完整歌词，最多 2000 字")
-        }
-        putJsonObject("voice") {
-            put("type", "string")
-            put("enum", buildJsonArray { listOf("冰糖", "茉莉", "苏打", "白桦").forEach { add(JsonPrimitive(it)) } })
-        }
-        putJsonObject("style_prompt") {
-            put("type", "string")
-            put("description", "曲风、节奏和情绪要求")
-        }
-        putJsonObject("title") {
-            put("type", "string")
-            put("description", "歌曲标题")
-        }
-        putJsonObject("urgent") {
-            put("type", "boolean")
-            put("description", "仅当用户明确要求立即处理时为 true；不能用于绕过用户说话保护")
         }
     }
 
@@ -723,14 +568,9 @@ class MainToolRegistry(
         putJsonObject("task_id") { put("type", "string") }
     }
 
-    private fun agentSleep() = tool(
-        name = TOOL_AGENT_SLEEP,
-        description = "终止型休眠操作。仅当用户当前明确要求助手离开、结束交互或进入休眠时调用，例如‘退下吧’、‘没事了’、‘休眠’、‘你走吧’、‘再见’、‘滚蛋’及语义明确的同类表达。用户只是讨论、引用、询问这些词语，或意图不明确时不得调用。调用时正文必须为空，必须单独调用，成功后 App 立即执行完整休眠流程。",
-    ) {}
-
     private fun readFile() = tool(
         name = TOOL_READ,
-        description = "读取虚拟文件系统中的一个或多个文本文件，也可列出目录。只允许 /source、/logs 和 /workspace；Skill 目录不属于通用虚拟文件系统。日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
+        description = "读取虚拟文件系统中的一个或多个文本文件。只允许 /source、/logs 和 /workspace；目录列出和文件查找请使用 run。日志优先使用 tail_lines，大文件使用 offset 和 limit 分段读取。",
     ) {
         putJsonObject("path") {
             put("type", "string")
@@ -797,7 +637,7 @@ class MainToolRegistry(
         }
         putJsonObject("content") {
             put("type", "string")
-            put("description", "写入文本。最佳实践是每段最多 50 行且不超过 8 KiB：第一段用 overwrite（新文件可用 create），后续用 append；超过建议值仍会写入成功，但结果会给出警告。多数已有文件复制请用 exec 的 cp argv。")
+            put("description", "写入文本。最佳实践是每段最多 50 行且不超过 8 KiB：第一段用 overwrite（新文件可用 create），后续用 append；超过建议值仍会写入成功，但结果会给出警告。")
         }
         putJsonObject("mode") {
             put("type", "string")
@@ -826,7 +666,7 @@ class MainToolRegistry(
 
     private fun workspaceDelete() = tool(
         name = TOOL_WORKSPACE_DELETE,
-        description = "删除 /workspace 中的文件或目录。Agent 删除内容时必须使用本工具，内容会移入用户可恢复的回收站并保留 30 天；不要通过 exec 的 rm、rmdir、unlink 或 find -delete 绕过回收站。",
+        description = "删除 /workspace 中的文件或目录。Agent 删除内容时必须使用本工具，内容会移入用户可恢复的回收站并保留 30 天；不要绕过回收站。",
         required = listOf("path"),
     ) {
         putJsonObject("path") {
@@ -835,30 +675,27 @@ class MainToolRegistry(
         }
     }
 
-    private fun execCommand() = tool(
-        name = TOOL_EXEC,
-        description = "在 App 自身 UID 沙箱中执行一次性程序。使用 cwd 和 argv；文件路径只允许 /source、/logs 或 /workspace。无 shell、无环境变量、无管道语法；不能访问 Skill 目录。",
-        required = listOf("argv"),
+    private fun runCommand() = tool(
+        name = TOOL_RUN,
+        description = "执行一个 App 内置的受控运行时命令。只能传 command 和 JSON args，不能传 Shell、程序路径、管道、脚本或任意系统命令。复杂流程应注册为 QuickJS Skill。",
+        required = listOf("command"),
     ) {
-        putJsonObject("argv") {
-            put("type", "array")
-            put("description", "程序和参数数组。例如 [\"cp\", \"/source/README.md\", \"/workspace/README.md\"]。兼容被 JSON 二次序列化的一层数组字符串；仍然不接受 shell command 字符串。")
-            put("items", buildJsonObject { put("type", "string") })
-        }
-        putJsonObject("timeout_seconds") {
-            put("type", "integer")
-            put("minimum", 1)
-            put("maximum", 120)
-        }
-        putJsonObject("cwd") {
+        putJsonObject("command") {
             put("type", "string")
-            put("description", "虚拟工作目录，默认 /workspace；只能是 /source、/logs 或 /workspace 下的绝对虚拟路径")
+            put("enum", buildJsonArray {
+                RuntimeCommandRegistry.RUN_COMMANDS
+                    .forEach { add(JsonPrimitive(it)) }
+            })
+        }
+        putJsonObject("args") {
+            put("type", "object")
+            put("description", "list: path/offset/limit；find: path/query/max_results/max_depth；grep: path 或 paths、pattern（字面匹配）、ignore_case、max_results；stat/wc: path；sha256: value。参数可原样传给 Skill 中的 hanwo.同名命令(args)。")
         }
     }
 
     private fun describeCredentials() = tool(
         name = TOOL_DESCRIBE_CREDENTIALS,
-        description = "查找可用凭证，只返回名称、键名、稳定引用、允许 URL 和到期时间，不返回真实值。用户消息已有引用可直接用于 http_request，无需重复查询。",
+        description = "查找可用凭证，只返回名称、键名、稳定引用、允许 URL 和到期时间，不返回真实值。用户消息已有引用可直接用于顶层 http_request 或 QuickJS Skill 的 http_request，无需重复查询。",
     ) {
         putJsonObject("query") { put("type", "string"); put("description", "按凭证名称、UID 或键名过滤，空白列出前若干条") }
         putJsonObject("limit") { put("type", "integer"); put("minimum", 1); put("maximum", 20) }
@@ -903,33 +740,6 @@ class MainToolRegistry(
         }
     }
 
-    private fun codeGraphSearch() = tool(
-        name = TOOL_CODE_GRAPH_SEARCH,
-        description = "查询随 APK 分发的 Graphify 代码图谱，用于定位源码符号、文件关系和调用线索。图谱只用于导航，最终结论必须核对源码或日志。",
-        required = listOf("query"),
-    ) {
-        putJsonObject("query") {
-            put("type", "string")
-            put("description", "代码问题、类名、方法名或功能关键词")
-        }
-        putJsonObject("limit") {
-            put("type", "integer")
-            put("minimum", 1)
-            put("maximum", 12)
-        }
-    }
-
-    private fun codeGraphExplain() = tool(
-        name = TOOL_CODE_GRAPH_EXPLAIN,
-        description = "解释某个源码符号在 Graphify 图谱中的位置和关联节点；解释后仍需读取精确源码。",
-        required = listOf("symbol"),
-    ) {
-        putJsonObject("symbol") {
-            put("type", "string")
-            put("description", "类名、对象名、函数名或文件名")
-        }
-    }
-
     private fun tool(
         name: String,
         description: String,
@@ -951,25 +761,17 @@ class MainToolRegistry(
     companion object {
         const val TOOL_MEMORY_EDIT = "memory_edit"
         const val TOOL_MEMORY_SEARCH = "memory_search"
-        const val TOOL_LOCATION_REFRESH = "location_refresh"
-        const val TOOL_LOCATION_REVERSE_GEOCODE = "location_reverse_geocode"
-        const val TOOL_WEATHER_CURRENT = "weather_get_current"
         const val TOOL_WEB_SEARCH = "web_search"
         const val TOOL_READ = "read"
         const val TOOL_WRITE = "write"
-        const val TOOL_WORKSPACE_DELETE = "workspace_delete"
-        const val TOOL_EXEC = "exec"
+        const val TOOL_WORKSPACE_DELETE = "delete"
+        const val TOOL_RUN = "run"
         const val TOOL_DESCRIBE_CREDENTIALS = "describe_credentials"
         const val TOOL_HTTP_REQUEST = "http_request"
-        const val TOOL_CODE_GRAPH_SEARCH = "code_graph_search"
-        const val TOOL_CODE_GRAPH_EXPLAIN = "code_graph_explain"
         const val TOOL_SKILL_REGISTER = "skill_register"
         const val TOOL_SKILL_USE = "skill_use"
         const val TOOL_SKILL_CREATE = "skill_create"
         const val TOOL_SKILL_EDIT = "skill_edit"
-        const val TOOL_AGENT_SLEEP = "agent_sleep"
-        const val TOOL_VOICE_REPLY = "voice_reply"
-        const val TOOL_SING_SONG = "sing_song"
         const val TOOL_TASK_STATUS = "task_status"
         const val TOOL_CANCEL_TASK = "cancel_task"
         const val TOOL_HUB_DISPATCH_TASK = "hub_dispatch_task"
@@ -979,12 +781,10 @@ class MainToolRegistry(
         const val TOOL_REALTIME_HANGUP = "realtime_hangup"
 
         val NATIVE_TOOL_NAMES = setOf(
-            TOOL_MEMORY_EDIT, TOOL_MEMORY_SEARCH, TOOL_LOCATION_REFRESH,
-            TOOL_LOCATION_REVERSE_GEOCODE, TOOL_WEATHER_CURRENT, TOOL_WEB_SEARCH,
-            TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_EXEC, TOOL_HTTP_REQUEST, TOOL_DESCRIBE_CREDENTIALS,
-            TOOL_CODE_GRAPH_SEARCH, TOOL_CODE_GRAPH_EXPLAIN, TOOL_SKILL_REGISTER,
-            TOOL_SKILL_USE, TOOL_AGENT_SLEEP,
-            TOOL_VOICE_REPLY, TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,
+            TOOL_MEMORY_EDIT, TOOL_MEMORY_SEARCH, TOOL_WEB_SEARCH,
+            TOOL_READ, TOOL_WRITE, TOOL_WORKSPACE_DELETE, TOOL_HTTP_REQUEST, TOOL_RUN, TOOL_DESCRIBE_CREDENTIALS,
+            TOOL_SKILL_REGISTER,
+            TOOL_SKILL_USE, TOOL_TASK_STATUS, TOOL_CANCEL_TASK,
             TOOL_HUB_DISPATCH_TASK,
             TOOL_MAIN_CONVERSATION_QUERY, TOOL_DELEGATE_TO_MAIN, TOOL_REALTIME_HANGUP,
         )
@@ -994,11 +794,9 @@ class MainToolRegistry(
             TOOL_MEMORY_SEARCH,
             TOOL_WEB_SEARCH,
             TOOL_READ,
-            TOOL_CODE_GRAPH_SEARCH,
-            TOOL_CODE_GRAPH_EXPLAIN,
         )
 
-        private val ASYNC_TASK_TOOL_NAMES = setOf(TOOL_SING_SONG, TOOL_TASK_STATUS, TOOL_CANCEL_TASK)
+        private val ASYNC_TASK_TOOL_NAMES = setOf(TOOL_TASK_STATUS, TOOL_CANCEL_TASK)
 
     }
 }

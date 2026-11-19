@@ -87,6 +87,8 @@ class DebugBridgeReceiver : BroadcastReceiver() {
                 put("pending", pending?.let { kotlinx.serialization.json.Json.encodeToJsonElement(com.agent.voiceassistant.agent.runtime.SkillApprovalStore.Request.serializer(), it) } ?: kotlinx.serialization.json.JsonNull)
                 put("skills", buildJsonArray { registry.listAll().forEach { skill -> add(buildJsonObject {
                     put("id", skill.id); put("name", skill.name); put("enabled", skill.enabled); put("version", skill.version)
+                    put("runtime", skill.runtime.name.lowercase()); skill.entry?.let { put("entry", it) }
+                    put("permissions", buildJsonArray { skill.permissions.sorted().forEach { add(it) } })
                     put("resources", buildJsonArray { registry.files(skill.id).forEach { add(it.relativePath) } })
                 }) } })
                 put("path_bridge_available", File(context.applicationInfo.nativeLibraryDir, "libhanwo_paths.so").isFile)
@@ -99,10 +101,10 @@ class DebugBridgeReceiver : BroadcastReceiver() {
             val env = AndroidExecutionEnv(context)
             val store = ConversationStore(context)
             val result = runBlocking { com.agent.voiceassistant.tools.LocalToolExecutor(
-                store, com.agent.voiceassistant.tools.LocationProvider(context, store), executionEnv = env,
+                store, executionEnv = env,
                 skillRegistry = skillRegistry(env), skillApprovals = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(context),
             ).execute(com.agent.voiceassistant.agent.AgentAction(operation, payload, payload.toString())) }
-            success(request, "skill_tool", result.displayText, startedAt, buildJsonObject {
+            response(request.request_id, result.success, if (result.success) "skill_tool" else "skill_tool_failed", result.displayText, startedAt, buildJsonObject {
                 put("success", result.success); put("result", result.contextText)
             })
         }

@@ -131,7 +131,6 @@ class CredentialVaultInstrumentedTest {
             assertTrue(response.body.contains(token))
             assertFalse(response.body.contains("dummy"))
             assertTrue(runCatching { env.write("/workspace/test.txt", token) }.isFailure)
-            assertTrue(runCatching { env.exec(listOf("echo", token)) }.isFailure)
         }
     }
 }

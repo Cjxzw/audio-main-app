@@ -16,10 +16,14 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.buffer
+import okio.source
 import java.io.File
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicBoolean
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.util.UUID
@@ -61,13 +65,23 @@ class AndroidExecutionEnv(
         val warning: String? = null,
     )
 
-    data class ExecResult(
-        val command: String,
-        val cwd: String,
-        val exitCode: Int?,
-        val output: String,
-        val timedOut: Boolean,
+    data class FindResult(
+        val root: String,
+        val query: String,
+        val matches: List<String>,
         val truncated: Boolean,
+    )
+
+    data class GrepMatch(
+        val path: String,
+        val line: Int,
+        val text: String,
+    )
+
+    data class GrepResult(
+        val matches: List<GrepMatch>,
+        val truncated: Boolean,
+        val filesScanned: Int,
     )
 
     data class ScriptResult(
@@ -243,6 +257,7 @@ class AndroidExecutionEnv(
         expectedSha256: String? = null,
     ): WriteResult {
         require(!CredentialPolicy.anyReference.containsMatchIn(path)) { "路径不能包含凭证引用" }
+        require(!CredentialPolicy.anyReference.containsMatchIn(content)) { "写入内容不能包含凭证引用" }
         val file = pathResolver.resolve(path, write = true)
         file.parentFile?.mkdirs()
         val normalizedMode = mode.lowercase()
@@ -281,75 +296,149 @@ class AndroidExecutionEnv(
         )
     }
 
-    fun trashWorkspacePath(path: String, conversationId: String? = null): WorkspaceTrashRepository.TrashEntry =
-        workspaceTrash.moveAgentPathToTrash(path, conversationId = conversationId)
+    fun find(
+        path: String = "/workspace",
+        query: String,
+        maxResults: Int = DEFAULT_FIND_RESULTS,
+        maxDepth: Int = DEFAULT_FIND_DEPTH,
+    ): FindResult {
+        val normalizedRoot = pathResolver.normalize(path)
+        val root = pathResolver.resolve(normalizedRoot, write = false)
+        require(root.isDirectory) { "查找根路径不是目录：$path" }
+        val normalizedQuery = query.trim()
+        require(normalizedQuery.isNotEmpty()) { "find 缺少 query" }
+        require(normalizedQuery.length <= MAX_FIND_QUERY_CHARS) { "find query 过长" }
+        require(maxResults in 1..MAX_FIND_RESULTS) { "max_results 必须在 1..$MAX_FIND_RESULTS 之间" }
+        require(maxDepth in 0..MAX_FIND_DEPTH) { "max_depth 必须在 0..$MAX_FIND_DEPTH 之间" }
 
-    suspend fun exec(
-        argv: List<String>,
-        timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
-        cwd: String = "/workspace",
-    ): ExecResult {
-        require(!CredentialPolicy.anyReference.containsMatchIn(argv.joinToString(" ") + cwd)) { "exec 不展开凭证引用，请使用 http_request" }
-        require(argv.isNotEmpty()) { "argv 不能为空" }
-        require(argv.size <= MAX_EXEC_ARGV_ITEMS) { "argv 项目过多" }
-        require(argv.none { it.length > MAX_EXEC_ARG_CHARS }) { "argv 参数过长" }
-        require(argv.none { argument -> argument.replace('\\', '/').split('/').contains("..") }) {
-            "exec 参数不能通过 .. 离开已授权虚拟目录"
-        }
-        val displayCommand = argv.joinToString(" ") { argument ->
-            if (argument.any(Char::isWhitespace)) "\"${argument.replace("\"", "\\\"")}\"" else argument
-        }
-        require(!WorkspaceDeletePolicy.attemptsDirectDeletion(argv)) {
-            "exec 不允许直接删除文件；请使用 workspace_delete，以便将 Agent 删除的内容移入回收站"
-        }
-        require(!WorkspaceDeletePolicy.attemptsShellExecution(argv)) {
-            "exec 不允许启动 shell 或多命令解释器；请使用 argv 调用单个程序"
-        }
-        val timeout = timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS)
-        val normalizedCwd = pathResolver.normalize(cwd)
-        val physicalCwd = pathResolver.resolve(normalizedCwd, write = false)
-        require(physicalCwd.isDirectory) { "cwd 不是目录：$cwd" }
-        val resolvedArgv = argv.map(::resolveExecArgument)
-        return withContext(Dispatchers.IO) {
-            val process = ProcessBuilder(resolvedArgv)
-                .directory(physicalCwd)
-                .redirectErrorStream(true)
-                .also { builder ->
-                    // Do not pass app/debug environment values into arbitrary programs.
-                    builder.environment().clear()
-                    builder.environment()["PATH"] = "/system/bin:/system/xbin"
+        val matches = mutableListOf<String>()
+        val collectionLimit = maxResults + 1
+        val rootCanonical = root.canonicalFile.toPath()
+
+        fun visit(directory: File, virtualPath: String, depth: Int) {
+            if (matches.size >= collectionLimit) return
+            directory.listFiles().orEmpty()
+                .sortedBy { it.name.lowercase() }
+                .forEach { entry ->
+                    if (matches.size >= collectionLimit) return@forEach
+                    val canonical = runCatching { entry.canonicalFile.toPath() }.getOrNull() ?: return@forEach
+                    if (!canonical.startsWith(rootCanonical)) return@forEach
+                    val entryPath = "$virtualPath/${entry.name}".replace(Regex("/+"), "/")
+                    if (entry.name.contains(normalizedQuery, ignoreCase = true)) {
+                        matches += entryPath
+                    }
+                    if (entry.isDirectory && depth < maxDepth) {
+                        visit(entry, entryPath, depth + 1)
+                    }
                 }
-                .start()
-            // exec has no stdin contract; close it so commands such as cat cannot wait forever.
-            process.outputStream.close()
-            try {
-                coroutineScope {
-                    val output = async(Dispatchers.IO) { readProcessOutput(process) }
-                    val completed = withTimeoutOrNull(timeout * 1_000L) {
-                        while (process.isAlive) delay(40)
-                        true
-                    } ?: false
-                    if (!completed) process.destroyForcibly()
-                    val captured = output.await()
-                    ExecResult(
-                        command = displayCommand,
-                        cwd = normalizedCwd,
-                        exitCode = if (completed) process.exitValue() else null,
-                        output = captured.first,
-                        timedOut = !completed,
-                        truncated = captured.second,
-                    )
+        }
+
+        visit(root, normalizedRoot, 0)
+        return FindResult(
+            root = normalizedRoot,
+            query = normalizedQuery,
+            matches = matches.take(maxResults),
+            truncated = matches.size > maxResults,
+        )
+    }
+
+    fun grep(
+        paths: List<String>,
+        pattern: String,
+        ignoreCase: Boolean = false,
+        maxResults: Int = DEFAULT_GREP_RESULTS,
+    ): GrepResult {
+        require(paths.isNotEmpty()) { "grep 缺少 path 或 paths" }
+        require(paths.size <= MAX_GREP_PATHS) { "paths 最多包含 $MAX_GREP_PATHS 项" }
+        require(pattern.isNotEmpty()) { "grep 缺少 pattern" }
+        require(pattern.length <= MAX_GREP_PATTERN_CHARS) { "grep pattern 过长" }
+        require(maxResults in 1..MAX_GREP_RESULTS) { "max_results 必须在 1..$MAX_GREP_RESULTS 之间" }
+        val matches = mutableListOf<GrepMatch>()
+        var truncated = false
+        var filesScanned = 0
+        var entriesScanned = 0
+        var bytesRemaining = MAX_GREP_SCAN_BYTES
+        var outputChars = 0
+
+        scan@ for (normalizedPath in paths.map(pathResolver::normalize).distinct()) {
+            val root = pathResolver.resolve(normalizedPath, write = false)
+            require(root.exists()) { "路径不存在：$normalizedPath" }
+            val entries = root.walkTopDown().onEnter { !Files.isSymbolicLink(it.toPath()) }
+            for (file in entries) {
+                if (++entriesScanned > MAX_GREP_ENTRIES || bytesRemaining <= 0) {
+                    truncated = true
+                    break@scan
                 }
-            } finally {
-                if (process.isAlive) process.destroyForcibly()
+                if (!file.isFile || Files.isSymbolicLink(file.toPath())) continue
+                val fileBudget = minOf(bytesRemaining, MAX_GREP_FILE_BYTES)
+                val bytes = file.readBoundedBytes(fileBudget)
+                if (bytes == null) {
+                    truncated = true
+                    bytesRemaining -= fileBudget
+                    continue
+                }
+                bytesRemaining -= bytes.size
+                if (0.toByte() in bytes) continue
+                filesScanned += 1
+                val relative = file.relativeTo(root).invariantSeparatorsPath
+                val virtualPath = if (relative.isEmpty()) normalizedPath else "$normalizedPath/$relative"
+                for ((index, line) in bytes.toString(Charsets.UTF_8).lineSequence().withIndex()) {
+                    if (!line.contains(pattern, ignoreCase = ignoreCase)) continue
+                    val text = line.take(MAX_GREP_LINE_CHARS)
+                    if (matches.size >= maxResults || outputChars + text.length + virtualPath.length > MAX_READ_OUTPUT_CHARS) {
+                        truncated = true
+                        break@scan
+                    }
+                    matches += GrepMatch(virtualPath, index + 1, text)
+                    outputChars += text.length + virtualPath.length
+                    if (text.length < line.length) truncated = true
+                }
             }
         }
+        return GrepResult(matches, truncated, filesScanned)
     }
+
+    fun stat(path: String): FileMetadata {
+        val normalizedPath = pathResolver.normalize(path)
+        val file = pathResolver.resolve(normalizedPath, write = false)
+        require(file.exists()) { "路径不存在：$normalizedPath" }
+        return FileMetadata(normalizedPath, file.isDirectory, file.takeIf(File::isFile)?.length(), file.lastModified())
+    }
+
+    fun countText(path: String): TextCounts {
+        val file = pathResolver.resolve(path, write = false)
+        require(file.isFile) { "wc 只接受文件路径" }
+        val bytes = file.readBoundedBytes(MAX_GREP_FILE_BYTES) ?: error("wc 只接受最多 1 MiB 的文本文件")
+        require(0.toByte() !in bytes) { "wc 不支持二进制文件" }
+        val text = bytes.toString(Charsets.UTF_8)
+        var words = 0
+        var inWord = false
+        for (character in text) {
+            val isWord = !character.isWhitespace()
+            if (isWord && !inWord) words++
+            inWord = isWord
+        }
+        return TextCounts(text.count { it == '\n' }, words, bytes.size)
+    }
+
+    data class FileMetadata(val path: String, val directory: Boolean, val bytes: Long?, val modifiedAt: Long)
+
+    data class TextCounts(val lines: Int, val words: Int, val bytes: Int)
+
+    private fun File.readBoundedBytes(maxBytes: Int): ByteArray? {
+        if (length() > maxBytes) return null
+        return source().buffer().use { input ->
+            if (input.request(maxBytes.toLong() + 1L)) null else input.readByteArray()
+        }
+    }
+
+    fun trashWorkspacePath(path: String, conversationId: String? = null): WorkspaceTrashRepository.TrashEntry =
+        workspaceTrash.moveAgentPathToTrash(path, conversationId = conversationId)
 
     suspend fun runSkillScript(
         script: SkillRegistry.ScriptResource,
         input: String? = null,
-        timeoutSeconds: Int = DEFAULT_EXEC_TIMEOUT_SECONDS,
+        timeoutSeconds: Int = DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     ): ScriptResult = withContext(Dispatchers.IO) {
         val runRoot = File(appContext.cacheDir, "skill-runs/${UUID.randomUUID()}").canonicalFile
         val copiedSkill = File(runRoot, "skill").canonicalFile
@@ -391,7 +480,8 @@ class AndroidExecutionEnv(
             try {
                 return@withContext withContext(Dispatchers.IO) {
                     coroutineScope {
-                        val output = async(Dispatchers.IO) { readScriptOutput(process) }
+                        val stopping = AtomicBoolean(false)
+                        val output = async(Dispatchers.IO) { readScriptOutput(process, stopping) }
                         val writer = async(Dispatchers.IO) {
                               try {
                                   process.outputStream.bufferedWriter(Charsets.UTF_8).use { stream ->
@@ -401,12 +491,15 @@ class AndroidExecutionEnv(
                                   // A script may exit without consuming stdin; retain its output and exit code.
                               }
                         }
-                        val completed = withTimeoutOrNull(timeoutSeconds.coerceIn(1, MAX_EXEC_TIMEOUT_SECONDS) * 1_000L) {
+                        val completed = withTimeoutOrNull(timeoutSeconds.coerceIn(1, MAX_SCRIPT_TIMEOUT_SECONDS) * 1_000L) {
                             while (process.isAlive) delay(40)
                             writer.await()
                             true
                         } ?: false
-                        if (!completed) process.destroyForcibly()
+                        if (!completed) {
+                            stopping.set(true)
+                            process.destroyForcibly()
+                        }
                         val captured = output.await()
                         ScriptResult(
                             skillName = script.skill.name,
@@ -447,22 +540,27 @@ class AndroidExecutionEnv(
         return visit(parsed).toString()
     }
 
-    private suspend fun readScriptOutput(process: Process): Pair<String, Boolean> {
+    private suspend fun readScriptOutput(process: Process, stopping: AtomicBoolean): Pair<String, Boolean> {
         val bytes = ByteArrayOutputStream()
         val buffer = ByteArray(8192)
         var truncated = false
-        while (true) {
-            val available = process.inputStream.available()
-            if (available == 0) {
-                if (!process.isAlive) break
-                delay(20)
-                continue
+        val input = process.inputStream
+        try {
+            while (true) {
+                val available = input.available()
+                if (available == 0) {
+                    if (!process.isAlive || stopping.get()) break
+                    delay(20)
+                    continue
+                }
+                val count = input.read(buffer, 0, minOf(buffer.size, available))
+                if (count < 0) break
+                val retained = minOf(count, (MAX_PROCESS_OUTPUT_CHARS - bytes.size()).coerceAtLeast(0))
+                bytes.write(buffer, 0, retained)
+                if (retained < count) truncated = true
             }
-            val count = process.inputStream.read(buffer, 0, minOf(buffer.size, available))
-            if (count < 0) break
-            val retained = minOf(count, (MAX_EXEC_OUTPUT_CHARS - bytes.size()).coerceAtLeast(0))
-            bytes.write(buffer, 0, retained)
-            if (retained < count) truncated = true
+        } catch (error: IOException) {
+            if (!stopping.get()) throw error
         }
         return bytes.toString("UTF-8") to truncated
     }
@@ -475,11 +573,6 @@ class AndroidExecutionEnv(
         } finally {
             if (temporary.exists()) temporary.delete()
         }
-    }
-
-    private fun resolveExecArgument(argument: String): String {
-        if (!argument.startsWith('/')) return argument
-        return pathResolver.resolve(argument, write = false).absolutePath
     }
 
     private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
@@ -752,29 +845,6 @@ class AndroidExecutionEnv(
         if (file.isDirectory) file.listFiles().orEmpty().forEach(::makeWritable)
     }
 
-    private fun readProcessOutput(process: Process): Pair<String, Boolean> {
-        val output = ByteArrayOutputStream(MAX_EXEC_OUTPUT_CHARS)
-        val buffer = ByteArray(8 * 1024)
-        var totalBytes = 0
-        var truncated = false
-        process.inputStream.use { input ->
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                val remaining = MAX_EXEC_OUTPUT_CHARS - totalBytes
-                if (remaining > 0) {
-                    val keep = minOf(count, remaining)
-                    output.write(buffer, 0, keep)
-                    if (keep < count) truncated = true
-                } else {
-                    truncated = true
-                }
-                totalBytes += count
-            }
-        }
-        return output.toString(Charsets.UTF_8.name()).trimEnd() to truncated
-    }
-
     private fun File.readTextOrNull(): String? = runCatching { readText() }.getOrNull()
     private fun File.readLinesOrEmpty(): List<String> = runCatching { readLines() }.getOrDefault(emptyList())
 
@@ -786,11 +856,22 @@ class AndroidExecutionEnv(
         private const val MAX_READ_OUTPUT_CHARS = 40_000
         private const val MAX_WRITE_BYTES = 8 * 1024
         private const val MAX_WRITE_LINES = 50
-        private const val DEFAULT_EXEC_TIMEOUT_SECONDS = 30
-        private const val MAX_EXEC_TIMEOUT_SECONDS = 120
-        private const val MAX_EXEC_ARGV_ITEMS = 64
-        private const val MAX_EXEC_ARG_CHARS = 4_000
-        private const val MAX_EXEC_OUTPUT_CHARS = 40_000
+        private const val DEFAULT_FIND_RESULTS = 50
+        private const val MAX_FIND_RESULTS = 200
+        private const val DEFAULT_FIND_DEPTH = 8
+        private const val MAX_FIND_DEPTH = 16
+        private const val MAX_FIND_QUERY_CHARS = 120
+        private const val DEFAULT_GREP_RESULTS = 100
+        private const val MAX_GREP_RESULTS = 500
+        private const val MAX_GREP_PATHS = 10
+        private const val MAX_GREP_PATTERN_CHARS = 256
+        private const val MAX_GREP_LINE_CHARS = 4_000
+        private const val MAX_GREP_ENTRIES = 5_000
+        private const val MAX_GREP_FILE_BYTES = 1_024 * 1_024
+        private const val MAX_GREP_SCAN_BYTES = 8 * MAX_GREP_FILE_BYTES
+        private const val DEFAULT_SCRIPT_TIMEOUT_SECONDS = 30
+        private const val MAX_SCRIPT_TIMEOUT_SECONDS = 120
+        private const val MAX_PROCESS_OUTPUT_CHARS = 40_000
         private val HTTP_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
     }
 }

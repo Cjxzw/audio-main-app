@@ -23,14 +23,6 @@ class AgentTools(
     private val taskDispatcher: TaskDispatcher
 ) {
 
-    @Tool("查询指定城市的天气，返回简短的天气信息")
-    fun getWeather(@P("城市名称") city: String): String {
-        Timber.i("Tool: getWeather(city=$city)")
-        // MVP 阶段返回固定示例，后续接入真实天气 API
-        val today = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date())
-        return "今天 $today $city 多云，气温 22-30°C，建议出行带伞"
-    }
-
     @Tool("查询当前时间")
     fun getCurrentTime(): String {
         val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date())

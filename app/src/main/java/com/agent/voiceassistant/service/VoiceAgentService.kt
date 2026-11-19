@@ -63,9 +63,6 @@ import com.agent.voiceassistant.cloud.NetworkTimeoutException
 import com.agent.voiceassistant.cloud.SpeechSegmenter
 import com.agent.voiceassistant.cloud.SimpleVadRecorder
 import com.agent.voiceassistant.cloud.StreamingSpeechExtractor
-import com.agent.voiceassistant.cloud.VoiceReplyDirective
-import com.agent.voiceassistant.cloud.VoiceReplyDirectiveParser
-import com.agent.voiceassistant.cloud.VoiceReplyMode
 import com.agent.voiceassistant.cloud.VoiceReplyOptions
 import com.agent.voiceassistant.data.ConversationStore
 import com.agent.voiceassistant.data.ConversationDomain
@@ -87,7 +84,6 @@ import com.agent.voiceassistant.settings.SpeechPreferences
 import com.agent.voiceassistant.settings.AppCapabilityResolver
 import com.agent.voiceassistant.tools.LocalToolExecutor
 import com.agent.voiceassistant.tools.AndroidExecutionEnv
-import com.agent.voiceassistant.tools.CodeGraphIndex
 import com.agent.voiceassistant.tools.LocationProvider
 import com.agent.voiceassistant.tools.MainToolRegistry
 import com.agent.voiceassistant.hub.HubConnectionState
@@ -229,11 +225,6 @@ class VoiceAgentService : Service() {
             "debug",
             "stack trace",
         )
-        private val PERSONALIZED_VOICE_HINTS = listOf(
-            "唱歌", "唱一", "唱首", "换个声音", "换一种声音", "换个音色", "音色",
-            "模仿", "搞怪语气", "特殊语气", "配音", "声音设计",
-        )
-
         const val ACTION_START = "com.agent.voiceassistant.START"
         const val ACTION_BOOTSTRAP = "com.agent.voiceassistant.BOOTSTRAP"
         const val ACTION_STOP = "com.agent.voiceassistant.STOP"
@@ -519,9 +510,7 @@ class VoiceAgentService : Service() {
         toolRegistry = MainToolRegistry(
             LocalToolExecutor(
                 store = store,
-                locationProvider = locationProvider,
                 executionEnv = executionEnv,
-                codeGraph = CodeGraphIndex(this),
                 skillRegistry = skillRegistry,
                 skillApprovals = com.agent.voiceassistant.agent.runtime.SkillApprovals.get(this),
             ),
@@ -1652,7 +1641,7 @@ class VoiceAgentService : Service() {
                                 MainToolRegistry.Profile.STANDALONE
                             },
                             allowReasoningEscalation = allowReasoningEscalation,
-                        ).filterNot { definition -> definition.name == MainToolRegistry.TOOL_VOICE_REPLY }
+                        )
                     } else {
                         emptyList()
                     }
@@ -1747,24 +1736,11 @@ class VoiceAgentService : Service() {
                     callId: String,
                 ): CloudSpeechClient.ToolCall? {
                     val name = when (call.name) {
-                        "weather", "weather.get_current" -> MainToolRegistry.TOOL_WEATHER_CURRENT
                         "delegate", "dispatch_task" -> MainToolRegistry.TOOL_HUB_DISPATCH_TASK
                         else -> call.name
                     }
-                    val arguments = if (
-                        name == MainToolRegistry.TOOL_WEATHER_CURRENT &&
-                        call.arguments["city"] != null &&
-                        call.arguments["location"] == null
-                    ) {
-                        kotlinx.serialization.json.JsonObject(
-                            call.arguments.filterKeys { it != "city" } +
-                                ("location" to requireNotNull(call.arguments["city"])),
-                        )
-                    } else {
-                        call.arguments
-                    }
                     return name.takeIf(toolRegistry::isNativeTool)?.let {
-                        CloudSpeechClient.ToolCall(callId, it, arguments.toString())
+                        CloudSpeechClient.ToolCall(callId, it, call.arguments.toString())
                     }
                 }
 
@@ -1774,110 +1750,16 @@ class VoiceAgentService : Service() {
                 override suspend fun executeTerminalPresentation(
                     call: CloudSpeechClient.ToolCall,
                 ): AgentLoop.TerminalExecution {
-                    if (toolRegistry.isAgentSleep(call)) {
-                        val finalText = "好的，我先休眠了。"
-                        store.addMessage("assistant", finalText)
-                        EventBus.emitChatMessage(ChatMessage(ChatRole.BOT, finalText))
-                        emitLog("语义休眠：用户明确结束交互")
-                        DiagLog.i("agent.semantic_sleep", "toolCallId=${call.id}", showInUi = true)
-                        sleepAgent(cancelConversationLoop = false)
-                        return AgentLoop.TerminalExecution(
-                            result = AgentLoop.ToolExecution(
-                                message = CloudSpeechClient.LlmMessage(
-                                    role = "tool",
-                                    content = "助手已进入休眠",
-                                    toolCallId = call.id,
-                                ),
-                                succeeded = true,
+                    return AgentLoop.TerminalExecution(
+                        result = AgentLoop.ToolExecution(
+                            message = CloudSpeechClient.LlmMessage(
+                                role = "tool",
+                                content = "当前没有可执行的终止型展示工具：${call.name}",
+                                toolCallId = call.id,
                             ),
-                            finalText = finalText,
-                            playedSpeech = false,
-                        )
-                    }
-                    if (!speakReplies || speechClient == null) {
-                        val directive = runCatching { VoiceReplyDirectiveParser.parse(call.arguments) }
-                            .getOrElse { error ->
-                                return AgentLoop.TerminalExecution(
-                                    result = AgentLoop.ToolExecution(
-                                        message = CloudSpeechClient.LlmMessage(
-                                            role = "tool",
-                                            content = "个性化回复参数无效：${error.message}",
-                                            toolCallId = call.id,
-                                        ),
-                                        succeeded = false,
-                                    ),
-                                    finalText = "",
-                                    playedSpeech = false,
-                                )
-                            }
-                        store.addMessage(
-                            role = "assistant",
-                            content = directive.text,
-                            presentation = ChatPresentation.PERSONALIZED_VOICE,
-                        )
-                        EventBus.emitChatMessage(
-                            ChatMessage(
-                                role = ChatRole.BOT,
-                                text = directive.text,
-                                presentation = ChatPresentation.PERSONALIZED_VOICE,
-                            ),
-                        )
-                        return AgentLoop.TerminalExecution(
-                            result = AgentLoop.ToolExecution(
-                                message = CloudSpeechClient.LlmMessage(
-                                    role = "tool",
-                                    content = "已按当前设置仅显示文字",
-                                    toolCallId = call.id,
-                                ),
-                                succeeded = true,
-                            ),
-                            finalText = directive.text,
-                            playedSpeech = false,
-                        )
-                    }
-                    return runCatching {
-                        val directive = VoiceReplyDirectiveParser.parse(call.arguments)
-                        awaitReasoningFeedback()
-                        beforeSpeech()
-                        playVoiceReply(speechClient, directive)
-                        store.addMessage(
-                            role = "assistant",
-                            content = directive.text,
-                            presentation = ChatPresentation.PERSONALIZED_VOICE,
-                        )
-                        EventBus.emitChatMessage(
-                            ChatMessage(
-                                role = ChatRole.BOT,
-                                text = directive.text,
-                                presentation = ChatPresentation.PERSONALIZED_VOICE,
-                            ),
-                        )
-                        emitLog("个性化播报: ${directive.text}")
-                        AgentLoop.TerminalExecution(
-                            result = AgentLoop.ToolExecution(
-                                message = CloudSpeechClient.LlmMessage(
-                                    role = "tool",
-                                    content = "个性化播报已完成",
-                                    toolCallId = call.id,
-                                ),
-                                succeeded = true,
-                            ),
-                            finalText = directive.text,
-                            playedSpeech = true,
-                        )
-                    }.getOrElse { error ->
-                        Timber.w(error, "voice_reply rejected")
-                        AgentLoop.TerminalExecution(
-                            result = AgentLoop.ToolExecution(
-                                message = CloudSpeechClient.LlmMessage(
-                                    role = "tool",
-                                    content = "voice_reply 调用失败：${error.message}。请修正参数并重新调用；不要输出普通正文。",
-                                    toolCallId = call.id,
-                                ),
-                                succeeded = false,
-                            ),
-                        )
-                    }
+                            succeeded = false,
+                        ),
+                    )
                 }
 
                 override fun isReasoningEscalation(call: CloudSpeechClient.ToolCall) =
@@ -1913,8 +1795,7 @@ class VoiceAgentService : Service() {
                     if (!ExperimentConfig.ENABLE_INTENT_ROUTING) return ToolGateDecision()
                     if (intentRouteConsumed) return ToolGateDecision()
                     val localCalls = calls.filter { call ->
-                        !toolRegistry.isAgentSleep(call) &&
-                            !toolRegistry.isTerminalPresentation(call) &&
+                        !toolRegistry.isTerminalPresentation(call) &&
                             !isDelegation(call) &&
                             toolRegistry.countsTowardAutomaticReasoning(call)
                     }
@@ -2352,7 +2233,7 @@ class VoiceAgentService : Service() {
                 } else {
                     event.message.toolCalls.filter { call ->
                         toolRegistry.isNativeTool(call.name) &&
-                            call.name != MainToolRegistry.TOOL_SKILL_USE &&
+                            !toolRegistry.isSkillRead(call) &&
                             !toolRegistry.isReasoningEscalation(call)
                     }
                 }
@@ -3197,12 +3078,6 @@ class VoiceAgentService : Service() {
         // Deep reasoning and post-tool final answers are still user-visible text.
         // Reasoning deltas and native tool calls are parsed separately and never enter this path.
         val latestUserText = request.messages.lastOrNull { it.role == "user" }?.content.orEmpty()
-        if (
-            request.tools.any { it.name == MainToolRegistry.TOOL_VOICE_REPLY } &&
-            PERSONALIZED_VOICE_HINTS.any(latestUserText::contains)
-        ) {
-            return false
-        }
         if (request.thinkingMode == CloudSpeechClient.ThinkingMode.ENABLED) return true
         if (request.messages.any { it.role == "tool" }) return true
         val recentText = request.messages
@@ -4051,28 +3926,6 @@ class VoiceAgentService : Service() {
         }
         if (audio != null) {
             playAudio(audio)
-        }
-    }
-
-    private suspend fun playVoiceReply(
-        client: CloudSpeechClient,
-        directive: VoiceReplyDirective,
-    ) {
-        try {
-            if (directive.options.mode == VoiceReplyMode.PRESET) {
-                val playback = StreamingTtsPlaybackSession(client)
-                try {
-                    val streamed = playback.playSentence(directive.text, directive.options)
-                    if (!streamed) {
-                        playAudio(client.synthesizeSpeech(directive.text, directive.options))
-                    }
-                } finally {
-                    playback.finish()
-                }
-            } else {
-                playAudio(client.synthesizeSpeech(directive.text, directive.options))
-            }
-        } finally {
         }
     }
 

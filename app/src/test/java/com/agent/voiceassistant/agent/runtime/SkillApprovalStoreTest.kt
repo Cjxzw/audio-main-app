@@ -71,6 +71,24 @@ class SkillApprovalStoreTest {
         assertEquals("printf ok", f.registry.use("shell", "run.sh").content)
         assertEquals("run.sh", f.registry.script("shell", "run.sh").resourceName)
     }
+
+    @Test fun `quickjs approval records runtime entry and permissions`() {
+        val f = Fixture()
+        val source = f.workspace.resolve("quick-flow").apply { mkdirs() }
+        source.resolve("SKILL.md").writeText(
+            "---\nname: quick flow\ndescription: quickjs\nruntime: quickjs\nentry: main.js\npermissions: read, sha256\n---\n# quick",
+        )
+        source.resolve("main.js").writeText("function main(input) { return input; }")
+        val request = f.approvals.propose("skill.register", buildJsonObject {
+            put("source_path", "/workspace/quick-flow"); put("name", "quick flow"); put("description", "quickjs")
+            put("core_file", "SKILL.md"); put("reviewed_files", buildJsonArray { add("SKILL.md"); add("main.js") })
+        }, "origin")
+
+        assertEquals("quickjs", request.runtime)
+        assertEquals("main.js", request.entry)
+        assertEquals(setOf("read", "sha256"), request.permissions)
+        assertEquals(request.digest, f.approvals.reviewRequest(request).candidateDigest)
+    }
     @Test fun `concurrent proposals reserve only one slot`() {
         val f = Fixture()
         val executor = Executors.newFixedThreadPool(2)

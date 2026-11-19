@@ -1,6 +1,6 @@
 ---
 name: HTTP 工具与凭证
-description: 指导如何使用完整的 http_request 工具调用 API，并指导用户配置、编辑和删除加密凭证 profile。
+description: 指导如何使用顶层 http_request 工具调用 API，并指导用户配置、编辑和删除加密凭证 profile。
 ---
 
 # HTTP 工具与凭证
@@ -8,11 +8,11 @@ description: 指导如何使用完整的 http_request 工具调用 API，并指�
 ## 适用范围
 
 本 Skill 用于调用 API、调试 HTTP/HTTPS 接口，以及指导用户配置本机凭证。
-当前 Skill 不执行脚本。调用 API 时必须把完整的 method、URL、headers 和 body 转换为 `http_request` 工具参数。
+当前 Skill 不执行脚本。调用 API 时必须把完整的 method、URL、headers 和 body 放入顶层 `http_request` 工具参数。
 
 ## http_request 参数
 
-`http_request` 支持以下字段：
+顶层 `http_request` 工具支持以下字段：
 
 - `method`：GET、HEAD、POST、PUT、PATCH 或 DELETE。
 - `url`：完整 HTTP/HTTPS URL。使用凭证 profile 时，必须匹配该 profile 的允许 URL 前缀。
@@ -37,7 +37,7 @@ description: 指导如何使用完整的 http_request 工具调用 API，并指�
 {{credential.metaso.token}}
 ```
 
-App 只会在本机发送请求前展开引用。模型、聊天记录、Skill 内容和工具结果中不得出现展开后的真实值。
+App 只会在本机发送请求前展开引用；可信 Skill 和服务器回显是否包含明文由用户自行判断，App 不额外替换业务响应。
 
 ## 完整调用示例
 
@@ -82,7 +82,7 @@ curl --location 'https://metaso.cn/api/v1/chat/completions' \
 }
 ```
 
-不要执行 curl，也不要把 curl 当作工具参数传递。应将其转换为完整的 `http_request` 调用。
+不要执行 curl，也不要把 curl 当作工具参数传递。使用顶层 `http_request`；固化时可将同一组参数原样传给 QuickJS 的 `hanwo.http_request(args)`。
 
 ## URL 安全规则
 

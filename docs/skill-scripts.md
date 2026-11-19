@@ -1,6 +1,6 @@
 # Skill 脚本与聊天确认
 
-Skill 是用户自行判断可信的资源包；支持 `SKILL.md`、文本附件和 `.sh`。脚本以 App UID 执行，可嵌套 shell、调用设备现有命令、访问该 UID 可访问的数据。系统不扫描脚本行为，也不对脚本结果做凭证脱敏。
+Skill 是用户自行判断可信的资源包；支持 `SKILL.md`、文本附件和 QuickJS 入口脚本。QuickJS 代码在 App 内部运行，只能通过宿主提供的白名单命令访问文件、HTTP、工作区和摘要能力。系统不扫描脚本业务行为，也不对脚本结果做额外凭证脱敏。
 
 ## 编写与提交
 
@@ -15,50 +15,73 @@ LLM 在 `/workspace` 准备文件。`skill_register` 提交新包，`skill_edit`
 ## 读取和运行
 
 ```json
-{"skill_name":"检查服务器","mode":"load","resource_name":"scripts/check.sh"}
+{"skill_name":"提取错误日志","mode":"load","resource_name":"main.js"}
 ```
 
 以上仅阅读脚本。真正执行需要：
 
 ```json
-{"skill_name":"检查服务器","mode":"run","resource_name":"scripts/check.sh","input":"{\"server\":\"example.test\"}","timeout_seconds":30}
+{"skill_name":"提取错误日志","mode":"run","resource_name":"main.js","input":"{\"path\":\"/workspace/app.log\"}","timeout_seconds":30}
 ```
 
-`run` 只能指定已启用 Skill 中的 `.sh`，入口不接受任意工作区或手机物理路径。普通 `exec` 的 shell 禁令保留。脚本内部可调用其他脚本。运行前复制 Skill 包到 App cache 的独立目录并检查版本，工作目录为包根目录；附属脚本可用 `sh ./scripts/child.sh`。原 Skill 之后发生更新，不改变这次运行的副本。
+`skill_use(mode=run)` 只能指定已启用 Skill 在 `SKILL.md` 中声明的 `.js` 或 `.mjs` 入口，不能执行任意工作区或手机物理路径。QuickJS Skill 必须定义 `main(input)`；运行前校验 Skill 版本和入口哈希。脚本通过 `hanwo.同名命令(args)` 调用宿主能力，也兼容 `hanwo.call(command, args)`；`hanwo.emit(text)` 输出阶段信息。每次运行使用独立 QuickJS Runtime。
 
-输入经 stdin 传入；stdout/stderr 合并返回，保留退出码、超时和截断状态。默认 120 秒，最大 120 秒，返回输出最多约 40 KB；没有后台 daemon 的生命周期保证。失败停止后续业务步骤由脚本自身的显式检查实现，执行器不会替脚本推断 HTTP 业务状态。
+输入作为 JSON 传入 `main(input)`；返回值必须是可序列化 JSON。默认超时 30 秒，最大 120 秒，内存上限默认 8 MiB、最大 64 MiB，`hanwo.emit` 输出最多约 40 KB。宿主命令失败会抛出异常，未捕获的异常会终止脚本。
 
-## 虚拟路径
+`SKILL.md` 可以声明 `runtime: quickjs`、`entry: main.js` 和以逗号分隔的 `permissions`。权限声明只允许上述内置命令；未声明时兼容为全部内置命令。注册审批请求会记录运行时、入口、权限、清单版本、审查策略版本和候选哈希，当前仍由用户在聊天中人工批准；安全 LLM 审查接口已预留但未自动接入。
 
-脚本直接使用 `/workspace`、`/source`、`/logs`；变量拼接、shell 重定向和继承环境的子脚本同样使用这些路径。例如：
+## 运行时命令
 
-```sh
-set -eu
-root=/workspace
-mkdir -p "$root/results"
-printf '%s\n' 'hello' > "$root/results/output.txt"
-sh ./scripts/child.sh
-cat /workspace/results/output.txt
+顶层 `read`、`write`、`delete`、`http_request` 和 `describe_credentials` 对应 `hanwo.read(args)`、`hanwo.write(args)` 等同名脚本函数。参数原样传入，脚本收到宿主返回值，而不是聊天展示文本。HTTP 共用 URL 白名单、凭证引用、响应截断和下载策略；直接调用时不经过 `run`，便于单独审计。
+
+`run({command, args})` 每次只执行一个命令，固化时用 `hanwo[command](args)`，或直接写 `hanwo.grep(args)`。命令和脚本函数共用参数：
+
+| 命令 | 用途与参数 |
+| --- | --- |
+| `list` | 列目录：`path`（默认 `/workspace`）、`offset`、`limit` |
+| `find` | 按文件或目录名称搜索：`path`、`query`、`max_results`、`max_depth` |
+| `grep` | 从文件或目录查找字面文本：`path` 或 `paths`、`pattern`、`ignore_case`、`max_results`；返回虚拟路径、行号和匹配文本。不执行宿主正则；达到扫描或输出上限时返回 `truncated` |
+| `stat` | 查看文件或目录类型、大小与修改时间：`path` |
+| `wc` | 统计最多 1 MiB 的文本文件中换行符、词与字节数：`path` |
+| `sha256` | 计算 UTF-8 字符串的摘要：`value` |
+
+路径仅限 `/source`、`/logs`、`/workspace`。`cat`、`head`、`tail` 的文本读取场景走 `read`（`offset`、`limit`、`tail_lines`），写入和回收站删除走 `write`、`delete`；排序、去重、正则和 JSON 处理可在 Skill 中用 JavaScript。不是完整 Shell 兼容层，不接受管道、重定向、任意系统程序，也不依赖外部运行时。
+
+## 完整脚本示例
+
+这个 Skill 搜索 `ERROR` 并生成工作区报告。`SKILL.md` 可声明 `entry: main.js`、`permissions: grep, write`。把输入 `path` 指向已有日志文件：
+
+```javascript
+function main(input) {
+    const result = hanwo.grep({path: input.path, pattern: "ERROR", max_results: 20});
+    const report = hanwo.write({
+        path: "/workspace/errors.txt",
+        content: result.matches.map(match => `${match.line}: ${match.text.slice(0, 80)}`).join("\n"),
+        mode: "overwrite"
+    });
+    return {path: report.path, matches: result.matches.length, truncated: result.truncated};
+}
 ```
 
-实现是 APK 内置 `libhanwo_paths.so`，通过 `LD_PRELOAD` 给 shell 和动态链接的子程序映射文件系统调用路径。**不替换脚本中的路径字符串**，所以 JSON、URL、注释、输出中的 `/workspace` 不会被改写。
-
-它是路径别名支持，不是隔离容器。静态链接程序、直接调用 Linux syscall 或主动清除 `LD_PRELOAD` 的程序不在该映射覆盖范围；它们可用 `HANWO_WORKSPACE`、`HANWO_SOURCE`、`HANWO_LOGS` 物理根环境变量。`HANWO_SKILL_ROOT` 是本次包快照。`pwd` 或 `realpath` 可能返回物理路径。
-
-运行时是设备的 `/system/bin/sh`，不附带完整 Linux、Python、Node、curl 或 jq；需要先确认脚本依赖在设备上存在。
+固化前可先用 `run` 的 `{"command":"grep","args":{"path":"/workspace/app.log","pattern":"ERROR","max_results":20}}` 试跑。脚本把 `command` 变成函数名，`args` 无需改名或重新编码。
 
 ## 凭证引用
 
-工作区文件与 Skill 允许保存引用，不应保存真值。`.sh` 的 shell 参数/变量和 stdin 支持新版 `{{cred:UID.FIELD}}`、旧版 `{{credential.profile.key}}`。
+QuickJS Skill 可把新版 `{{cred:UID.FIELD}}` 或旧版 `{{credential.profile.key}}` 作为 HTTP Header/body 字符串传给 `http_request`，不要把凭证真值写入脚本。普通 `write` 拒绝包含凭证引用的文件内容；脚本可以在执行时从输入接收引用。
 
-```sh
-token='{{cred:credential-id.field-id}}'
-# 后续可以把 "$token" 交给设备上可用的 HTTP 客户端。
+```javascript
+function main(input) {
+    return hanwo.http_request({
+        method: "GET",
+        url: input.url,
+        headers: {Authorization: "Bearer " + input.credential_ref}
+    });
+}
 ```
 
-脚本启动前检查引用是否存在和到期，把值放入子进程环境，再按 shell 引号上下文展开，避免值里的引号或 `$()` 改变程序。JSON stdin 按字符串节点替换并重新编码，普通文本 stdin 按文本替换。建议将引用写在普通 shell 参数/赋值中；不把引用放在 here-document、注释或动态生成的代码里。引用出现在注释中不展开。
+宿主在 HTTP 命令执行前检查引用是否存在和到期，并在请求 Header/body 中展开；JSON 字符串引用会重新编码，避免凭证内容破坏 JSON 结构。引用出现在脚本注释或普通返回值中不会被 App 主动替换。
 
-可信脚本可获得真实值；此模式不检查 HTTP URL 白名单，不保证结果、日志或子进程隐藏真值。现有 `http_request` 的 URL 白名单与脱敏行为保持自身逻辑。
+QuickJS Skill 不直接获得凭证真值；应把凭证引用交给 `http_request`，由宿主沿用现有 URL 白名单和请求策略。Skill 仍被视为用户信任资源，服务器回显和脚本主动输出不由 App 额外兜底。
 
 ## 调试入口
 
@@ -66,13 +89,13 @@ token='{{cred:credential-id.field-id}}'
 python tools/hanwo_dev.py skills status
 python tools/hanwo_dev.py skills propose register --payload-file registration.json
 python tools/hanwo_dev.py skills propose edit --payload-file change.json
-python tools/hanwo_dev.py --timeout 50 skills run 检查服务器 scripts/check.sh --timeout-seconds 30
+python tools/hanwo_dev.py --timeout 50 skills run 提取错误日志 main.js --input-file input.json --timeout-seconds 30
 ```
 
 CLI 复用正式 `LocalToolExecutor`，提交提案仍需聊天 UI 批准，没有 CLI 批准命令。设备测试：
 
 ```powershell
-adb shell am instrument -w -e class com.agent.voiceassistant.tools.SkillScriptInstrumentedTest com.agent.voiceassistant.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e class com.agent.voiceassistant.tools.QuickJsRuntimeInstrumentedTest com.agent.voiceassistant.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
-该测试使用临时 Skill 包与测试凭证，覆盖路径、变量拼接、嵌套 shell、引用、非零退出和超时；不调用真实业务服务器。
+QuickJS 仪器测试覆盖宿主命令调用、读写、JSON 返回、阶段输出和超时中断；不调用真实业务服务器。旧 Shell 兼容测试仍保留，表示迁移期间的内部兼容路径，不再作为 Agent 对外工具协议。

@@ -3,6 +3,7 @@ package com.agent.voiceassistant.agent.runtime
 import java.io.File
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
@@ -16,6 +17,11 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
         val operation: String,
         val skillId: String,
         val name: String,
+        val runtime: String = "text",
+        val entry: String? = null,
+        val permissions: Set<String> = emptySet(),
+        val manifestVersion: Int = SkillReviewPolicy.MANIFEST_VERSION,
+        val reviewPolicyVersion: Int = SkillReviewPolicy.VERSION,
         val expectedVersion: String? = null,
         val candidate: String,
         val digest: String,
@@ -104,12 +110,28 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
                 appendLine("操作：${text("operation").ifBlank { operation }}")
                 appendLine("候选目录：/workspace/.skill-proposals/$id")
                 if (existing != null) appendLine("原版本：${existing.version}")
+                appendLine("运行时：${prepared.runtime.name.lowercase(Locale.ROOT)}")
+                prepared.entry?.let { appendLine("入口：$it") }
+                appendLine("权限：${prepared.permissions.ifEmpty { setOf("全部内置运行时命令") }.joinToString()}")
+                appendLine("清单版本：${SkillReviewPolicy.MANIFEST_VERSION}；审查策略版本：${SkillReviewPolicy.VERSION}")
                 appendLine("文件：\n${files.joinToString("\n")}")
-                appendLine("${if (files.any { it.endsWith(".sh") }) "包含可信 Shell 脚本" else "文本 Skill"}；批准后生效")
+                appendLine("批准后生效")
                 append("候选哈希：${hashTree(candidate)}")
             }
-            val request = Request(id, conversationId, operation, targetId, prepared.name, existing?.version,
-                candidate.canonicalPath, hashTree(candidate), summary)
+            val request = Request(
+                id = id,
+                conversationId = conversationId,
+                operation = operation,
+                skillId = targetId,
+                name = prepared.name,
+                runtime = prepared.runtime.name.lowercase(Locale.ROOT),
+                entry = prepared.entry,
+                permissions = prepared.permissions,
+                expectedVersion = existing?.version,
+                candidate = candidate.canonicalPath,
+                digest = hashTree(candidate),
+                summary = summary,
+            )
             save(state.copy(pending = request))
             return request
         } catch (error: Exception) { candidate.deleteRecursively(); throw error }
@@ -141,6 +163,19 @@ class SkillApprovalStore(private val root: File, private val workspace: File, pr
 
     @Synchronized fun outcomes() = state.outcomes.toList()
     @Synchronized fun acknowledge(id: String, status: String) = save(state.copy(outcomes = state.outcomes.filterNot { it.requestId == id && it.status == status }))
+
+    fun reviewRequest(request: Request): SkillReviewRequest = SkillReviewRequest(
+        requestId = request.id,
+        operation = request.operation,
+        skillId = request.skillId,
+        name = request.name,
+        runtime = request.runtime,
+        entry = request.entry,
+        permissions = request.permissions,
+        manifestVersion = request.manifestVersion,
+        reviewPolicyVersion = request.reviewPolicyVersion,
+        candidateDigest = request.digest,
+    )
 
     private fun finish(request: Request, status: String, message: String): Outcome {
         val outcome = Outcome(request.id, request.conversationId, status, message)

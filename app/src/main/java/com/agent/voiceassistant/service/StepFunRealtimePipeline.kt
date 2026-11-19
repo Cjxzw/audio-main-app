@@ -629,7 +629,7 @@ class StepFunRealtimePipeline(
         }
         val call = CloudSpeechClient.ToolCall(event.callId, event.name, event.arguments)
         DiagLog.i("realtime.tool.call", "name=${call.name} callId=${call.id} argsChars=${call.arguments.length}")
-        if (call.name == MainToolRegistry.TOOL_AGENT_SLEEP || call.name == MainToolRegistry.TOOL_REALTIME_HANGUP) {
+        if (call.name == MainToolRegistry.TOOL_REALTIME_HANGUP) {
             recordTerminalToolCall(call)
             requestModelHangup()
             return

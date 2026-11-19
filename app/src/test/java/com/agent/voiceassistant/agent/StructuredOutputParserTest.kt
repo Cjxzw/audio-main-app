@@ -10,7 +10,7 @@ class StructuredOutputParserTest {
     fun `detects pseudo xml tool call`() {
         val raw = """
             <tool_call>
-            <function=exec><parameter=command>pwd</parameter></function>
+            <function=run><parameter=command>grep</parameter></function>
             </tool_call>
         """.trimIndent()
 
@@ -22,7 +22,7 @@ class StructuredOutputParserTest {
     fun `detects tool json but not ordinary json`() {
         assertTrue(
             StructuredOutputParser.containsToolProtocol(
-                """{"name":"exec","arguments":{"command":"pwd"}}""",
+                """{"name":"run","arguments":{"command":"grep"}}""",
             ),
         )
         assertFalse(
@@ -45,7 +45,7 @@ class StructuredOutputParserTest {
         val raw = """
             这是接口示例：
             ```xml
-            <tool_call><function=exec></function></tool_call>
+            <tool_call><function=run></function></tool_call>
             ```
         """.trimIndent()
 
@@ -75,11 +75,12 @@ class StructuredOutputParserTest {
 
     @Test
     fun `preserves structured json parameter values in xml`() {
-        val raw = "<tool_call><function=exec><parameter=argv>[\"cp\",\"/source/a\",\"/workspace/a\"]</parameter></function></tool_call>"
+        val raw = "<tool_call><function=run><parameter=command>grep</parameter><parameter=args>{\"pattern\":\"x\"}</parameter></function></tool_call>"
 
         val call = StructuredOutputParser.parseBodyToolCalls(raw).single()
 
-        assertEquals("[\"cp\",\"/source/a\",\"/workspace/a\"]", call.arguments["argv"].toString())
+        assertEquals("grep", call.arguments["command"]?.toString()?.trim('"'))
+        assertEquals("{\"pattern\":\"x\"}", call.arguments["args"].toString())
     }
 
     @Test

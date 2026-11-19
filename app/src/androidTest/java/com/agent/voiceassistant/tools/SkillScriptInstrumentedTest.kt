@@ -48,8 +48,11 @@ class SkillScriptInstrumentedTest {
             assertFalse(failure.output.contains("must not run"))
             val earlyExit = env.runSkillScript(registry.script(skill.name, "fail.sh"), input = "x".repeat(1024 * 1024), timeoutSeconds = 5)
             assertEquals(earlyExit.output, 42, earlyExit.exitCode)
-            File(root, "timeout.sh").writeText("sleep 5")
-            assertTrue(env.runSkillScript(registry.script(skill.name, "timeout.sh"), timeoutSeconds = 1).timedOut)
+            File(root, "timeout.sh").writeText("printf 'before timeout'; exec sleep 5")
+            val timeout = env.runSkillScript(registry.script(skill.name, "timeout.sh"), timeoutSeconds = 1)
+            assertTrue(timeout.timedOut)
+            assertNull(timeout.exitCode)
+            assertEquals("before timeout", timeout.output)
         } finally {
             vault.delete(credential.id)
             File(env.workspaceRoot, outputName).delete()

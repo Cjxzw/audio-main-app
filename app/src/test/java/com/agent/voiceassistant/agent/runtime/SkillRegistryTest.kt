@@ -101,6 +101,94 @@ class SkillRegistryTest {
     }
 
     @Test
+    fun `registration validates quickjs entry and permissions`() {
+        val runtime = Files.createTempDirectory("skill-quickjs").toFile()
+        val workspace = runtime.resolve("workspace").apply { mkdirs() }
+        val candidate = workspace.resolve("quick-flow").apply { mkdirs() }
+        candidate.resolve("SKILL.md").writeText(
+            """
+            ---
+            name: quick flow
+            description: quickjs flow
+            runtime: quickjs
+            entry: main.js
+            permissions: read, http_request
+            ---
+            # QuickJS
+            """.trimIndent(),
+        )
+        candidate.resolve("main.js").writeText("function main(input) { return {ok: true}; }")
+        val registry = SkillRegistry(runtime.resolve("skills"))
+
+        val result = registry.registerFromWorkspace(
+            workspace,
+            "/workspace/quick-flow",
+            "quick flow",
+            "quickjs flow",
+            "SKILL.md",
+            "quickjs",
+            listOf("SKILL.md", "main.js"),
+        )
+
+        assertEquals(SkillRegistry.Runtime.QUICKJS, result.skill.runtime)
+        assertEquals("main.js", result.skill.entry)
+        assertEquals(setOf("read", "http_request"), result.skill.permissions)
+        assertEquals("main.js", registry.quickJsScript("quick flow").resourceName)
+    }
+
+    @Test
+    fun `registration rejects invalid quickjs metadata`() {
+        val runtime = Files.createTempDirectory("skill-quickjs-invalid").toFile()
+        val workspace = runtime.resolve("workspace").apply { mkdirs() }
+        val candidate = workspace.resolve("invalid").apply { mkdirs() }
+        candidate.resolve("SKILL.md").writeText(
+            """
+            ---
+            name: invalid
+            description: invalid quickjs
+            runtime: quickjs
+            entry: main.js
+            permissions: exec
+            ---
+            # Invalid
+            """.trimIndent(),
+        )
+        candidate.resolve("main.js").writeText("const value = 1;")
+        val registry = SkillRegistry(runtime.resolve("skills"))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            registry.registerFromWorkspace(
+                workspace,
+                "/workspace/invalid",
+                "invalid",
+                "invalid quickjs",
+                "SKILL.md",
+                "invalid",
+                listOf("SKILL.md", "main.js"),
+            )
+        }
+    }
+
+    @Test
+    fun `metadata edits preserve quickjs runtime`() {
+        val runtime = Files.createTempDirectory("skill-quickjs-edit").toFile()
+        val root = runtime.resolve("skills").apply { mkdirs() }
+        val skill = root.resolve("flow").apply { mkdirs() }
+        skill.resolve("SKILL.md").writeText(
+            "---\nname: flow\ndescription: first\nruntime: quickjs\nentry: main.js\npermissions: read\n---\n# Flow",
+        )
+        skill.resolve("main.js").writeText("function main(input) { return input; }")
+        val registry = SkillRegistry(root)
+
+        registry.updateMetadata("flow", "renamed flow", "second")
+
+        val updated = registry.listAll().single()
+        assertEquals(SkillRegistry.Runtime.QUICKJS, updated.runtime)
+        assertEquals("main.js", updated.entry)
+        assertEquals(setOf("read"), updated.permissions)
+    }
+
+    @Test
     fun `lists and edits skill text files while preserving metadata`() {
         val runtime = Files.createTempDirectory("skill-editor").toFile()
         val root = runtime.resolve("skills").apply { mkdirs() }
